@@ -341,6 +341,11 @@ If you do not know, say you will check and come back with the number.
 - Complaint, bad news, or anything urgent: drop the comedy completely, be \
 short and human, say you are looking into it yourself.
 - Mild profanity only if they swear first, and never aimed at them.
+- There are things you will not write - jokes about atrocities, real \
+victims, or aimed at a group of people. Refuse in your own voice: one short \
+line, in THEIR language, dry, no lecture and no apology, then let the \
+conversation move on. "Не мой жанр." is a refusal. "I'm sorry, but I can't \
+comply with that." is a form letter, and nobody talks like that.
 """
 
 PERSONA = os.environ.get("PERSONA", DEFAULT_PERSONA)
@@ -769,10 +774,12 @@ def replacement_models(p: Provider, error_text: str) -> List[str]:
 
 
 def looks_like_model_error(status: int, text: str) -> bool:
-    if status not in (400, 402, 404, 410, 422):
+    if status not in (400, 402, 404, 410, 422, 429):
         return False
     if status == 402:
         return True                     # this model is paid; a smaller one may not be
+    if status == 429 and "upstream" in text.lower():
+        return True                     # this particular model is throttled, others aren't
     t = text.lower()
     return any(w in t for w in ("model", "not found", "decommission", "slug",
                                 "end of life", "gone", "retired"))
@@ -1343,23 +1350,51 @@ def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) ->
     return None
 
 
+def parse_json_loose(raw: str) -> Optional[dict]:
+    """Models wrap JSON in prose, fences and apologies. Dig it out anyway."""
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    # Last resort: the only thing that matters is yes or no.
+    low = raw.lower()
+    if '"speak"' in low or "speak" in low:
+        if re.search(r"speak\W{0,4}(true|yes)", low):
+            return {"speak": True, "reason": "parsed from loose output"}
+        if re.search(r"speak\W{0,4}(false|no)", low):
+            return {"speak": False, "reason": "parsed from loose output"}
+    return None
+
+
+JUDGE_JSON_HINT = ('\n\nAnswer with JSON and nothing else - no prose, no code '
+                   'fences: {"speak": true, "reason": "a few words"}')
+
+
 def judge_via(p: Provider, question: str) -> Optional[dict]:
     """Run the speak/stay-quiet decision on one provider. None = it failed."""
     if p.name != "gemini":
-        raw = openai_chat(
-            p,
-            JUDGE_PROMPT + '\n\nAnswer with JSON only: '
-                           '{"speak": true|false, "reason": "a few words"}',
-            [{"role": "user", "content": question}],
-            max_tokens=300, json_mode=True, timeout=20,
-        )
-        if not raw:
-            return None
-        try:
-            return json.loads(raw)
-        except Exception:
-            log.warning("  judge: %s did not return JSON", p.name)
-            return None
+        # Strict JSON mode is the good path, but several free models cannot
+        # honour it and answer 400. Falling back to plain text plus a tolerant
+        # parser is far better than losing the judge entirely.
+        for strict in (True, False):
+            raw = openai_chat(
+                p, JUDGE_PROMPT + JUDGE_JSON_HINT,
+                [{"role": "user", "content": question}],
+                max_tokens=300, json_mode=strict, timeout=20,
+            )
+            if not raw:
+                continue
+            verdict = parse_json_loose(raw)
+            if verdict is not None:
+                return verdict
+            log.warning("  judge: %s gave unparseable output", p.name)
+        return None
 
     model = judge_model()
     url = f"{GEMINI_API}/models/{model}:generateContent"
