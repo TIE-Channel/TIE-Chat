@@ -80,9 +80,9 @@ READ_CAP = float(os.environ.get("READ_CAP", "40"))        # hard ceiling
 
 # Typing simulation. An instant reply is the single most obvious tell, so the
 # bot spends roughly as long "typing" as a person would need for that text.
-# 2.5 chars/sec is measured, not guessed: 105 characters in 42 seconds, which
-# is about 23 words per minute - two fingers, on a phone, unhurried.
-TYPING_CPS = float(os.environ.get("TYPING_CPS", "3.33"))  # characters per second
+# 5 chars/sec is about 45 words per minute - someone typing on a phone without
+# hunting for the keys, but not racing either.
+TYPING_CPS = float(os.environ.get("TYPING_CPS", "5"))     # characters per second
 TYPING_MIN = float(os.environ.get("TYPING_MIN", "2"))     # never faster than this
 TYPING_MAX = float(os.environ.get("TYPING_MAX", "45"))    # never slower than this
 
