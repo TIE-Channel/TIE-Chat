@@ -708,7 +708,7 @@ def suggested_by_error(text: str, provider: str = "") -> Optional[str]:
     return slug
 
 
-def discover_models(p: Provider, limit: int = 6) -> List[str]:
+def discover_models(p: Provider, limit: int = 8) -> List[str]:
     """Best chat models this provider advertises, best first.
 
     A catalogue entry is not a promise: free keys are routinely refused models
@@ -725,6 +725,12 @@ def discover_models(p: Provider, limit: int = 6) -> List[str]:
     return [i for score, i in ranked if score > 0][:limit]
 
 
+def model_size(name: str) -> int:
+    """Parameter count in billions, or a large number when it isn't stated."""
+    m = re.search(r"(\d+)\s*b\b", name.lower())
+    return int(m.group(1)) if m else 999
+
+
 def replacement_models(p: Provider, error_text: str) -> List[str]:
     """What to try instead of p.model, best first."""
     out = []
@@ -737,8 +743,10 @@ def replacement_models(p: Provider, error_text: str) -> List[str]:
 
 
 def looks_like_model_error(status: int, text: str) -> bool:
-    if status not in (400, 404, 410, 422):
+    if status not in (400, 402, 404, 410, 422):
         return False
+    if status == 402:
+        return True                     # this model is paid; a smaller one may not be
     t = text.lower()
     return any(w in t for w in ("model", "not found", "decommission", "slug",
                                 "end of life", "gone", "retired"))
@@ -791,14 +799,20 @@ def openai_chat(
         if looks_like_model_error(r.status_code, r.text) and not p.searched:
             p.searched = True
             dead = p.model
-            for alt in replacement_models(p, r.text):
-                log.warning("  -> %s: %s is gone, trying %s", p.name, dead, alt)
+            queue = replacement_models(p, r.text)
+            if r.status_code == 402:
+                queue.sort(key=model_size)      # free tiers give away the small ones
+            while queue:
+                alt = queue.pop(0)
+                log.warning("  -> %s: %s unusable, trying %s", p.name, dead, alt)
                 p.model = alt
+                before = time.time()
                 answer = openai_chat(p, system, messages, max_tokens, json_mode, timeout)
                 if answer:
                     log.warning("  -> %s now on %s (set %s_MODEL to keep it)",
                                 p.name, alt, p.name.upper())
                     return answer
+                del before
             p.model = dead
         return None
     try:
@@ -1551,7 +1565,10 @@ def probe_provider(p: Provider) -> tuple:
     # ask the provider what it actually serves.
     if looks_like_model_error(r.status_code, r.text):
         candidates = replacement_models(p, r.text)
+        if r.status_code == 402:
+            candidates.sort(key=model_size)
         failures = []
+        saw_payment = r.status_code == 402
         for alt in candidates:
             try:
                 r2 = session.post(
@@ -1570,6 +1587,10 @@ def probe_provider(p: Provider) -> tuple:
                         f"{alt}  (was {dead}; pin it with {p.name.upper()}_MODEL)",
                         time.time() - started)
             failures.append((alt, r2.status_code, http_error(r2)))
+            if r2.status_code == 402 and not saw_payment:
+                saw_payment = True
+                # Everything from here on: cheapest first.
+                candidates.sort(key=model_size)
 
         if not failures:
             return False, detail + " - and it lists no usable chat model", took
@@ -1580,6 +1601,10 @@ def probe_provider(p: Provider) -> tuple:
         if codes <= {401, 403}:
             verdict = ("the key itself is being refused (%s) - check it is "
                        "active and has inference permission" % failures[0][2])
+        elif codes <= {402}:
+            verdict = ("every model this key can see is paid - the free tier "
+                       "covers smaller ones, set %s_MODEL by hand from the "
+                       "provider's free list" % p.name.upper())
         elif codes == {404} or codes == {404, 410}:
             verdict = ("this key has access to none of them: "
                        + ", ".join(a for a, _, _ in failures[:4]))

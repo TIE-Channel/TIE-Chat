@@ -55,9 +55,9 @@ for a card:
 |---|---|---|
 | `GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | best quality of the free ones |
 | `GROQ_API_KEY` | [console.groq.com/keys](https://console.groq.com/keys) | ~30 req/min, extremely fast |
-| `CEREBRAS_API_KEY` | [cloud.cerebras.ai](https://cloud.cerebras.ai) | ~30 req/min, ~1M tokens/day |
+| `CEREBRAS_API_KEY` | [cloud.cerebras.ai](https://cloud.cerebras.ai) | free tier covers the *small* models only |
 | `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) | one key, many `:free` models |
-| `MISTRAL_API_KEY` | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | needs a phone number — see note |
+| `MISTRAL_API_KEY` | [console.mistral.ai](https://console.mistral.ai) | needs SMS verification; ~1 req/sec |
 | `NVIDIA_API_KEY` | [build.nvidia.com](https://build.nvidia.com) | NVIDIA NIM, ~80 models |
 | `HF_TOKEN` | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) | Hugging Face Inference Providers |
 
@@ -66,12 +66,17 @@ for a card:
 set the bot ignores it and says so at startup. Revoke that token — it buys you
 nothing and a classic PAT usually carries repo access.
 
-**Mistral is the fiddly one.** "You don't have access to this application"
-means the account exists but the free tier isn't switched on yet: Mistral gates
-it behind **phone (SMS) verification**, and you then have to activate the free
-**Experiment** plan in the console before the API Keys page will open. No card,
-but a real phone number. If you'd rather not hand one over, skip it — the other
-five need nothing but an email, and any two of them already make the bot
+**Mistral is the fiddly one.** There is no separate free plan to subscribe to —
+free mode is simply the default state of a new account. What gates it is
+**activating Studio**, which needs email *and* **phone (SMS) verification**.
+Until that is done the console shows "You don't have access to this
+application" and a valid-looking key answers `429 rate_limited` on the very
+first request.
+
+Free mode is also genuinely tight — on the order of one request per second —
+so treat Mistral as an emergency spare, not a workhorse. No card is needed, but
+a real phone number is. If you'd rather not hand one over, skip it: the others
+need nothing but an email, and any two of them already make the bot
 effectively outage-proof.
 
 Order is `AI_ORDER`, default `gemini,groq,cerebras,openrouter,nvidia,huggingface,mistral`.
@@ -92,8 +97,10 @@ useful one, then asks `/models` what is actually being served and ranks the
 candidates — deliberately skipping the guard, whisper, embedding and moderation
 models that litter those catalogues, and on OpenRouter keeping only `:free`
 slugs. It tries them in order, because a listed model is not a promise: free
-keys are routinely refused models the catalogue advertises. The first one that
-answers is kept for the session and logged:
+keys are routinely refused models the catalogue advertises. A `402 Payment
+required` is treated the same way, except the remaining candidates are then
+tried smallest first — free tiers give away the small models and charge for the
+large ones. The first model that answers is kept for the session and logged:
 
 ```
 -> groq: llama-3.1-8b-instant is gone, switching to llama-3.3-70b-versatile
