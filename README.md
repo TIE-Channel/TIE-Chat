@@ -361,6 +361,12 @@ Other knobs, all optional (see `.env.example`):
 | `GEMINI_MODEL` | `gemini-3.8-flash` | falls back to a working flash model if your key can't use it |
 | `GROQ_MODEL` etc. | see table above | per-provider model override |
 | `HISTORY_TURNS` | `20` | messages of context kept per chat |
+| `UPSTASH_REDIS_REST_URL` / `_TOKEN` | — | Upstash Redis; takes priority over the file |
+| `REDIS_PREFIX` | `tgbot` | key prefix, so one database can serve several bots |
+| `HISTORY_TTL_DAYS` | `30` | forget a chat nobody has touched in this long; 0 = never |
+| `HISTORY_FILE` | `history.json` | fallback file; empty = memory only |
+| `HISTORY_SAVE_EVERY` | `20` | seconds between saves (a burst is batched into one write) |
+| `HISTORY_MAX_CHATS` | `300` | liveliest chats kept in the file |
 | `REPLY_COOLDOWN` | `2` | seconds between replies in one chat |
 | `IGNORE_USER_IDS` | — | user IDs that never get an auto-reply |
 | `QUOTE_REPLIES` | `false` | `true` makes replies quote the customer's message instead of arriving as plain ones |

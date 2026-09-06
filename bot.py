@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import signal
 import sys
 import threading
 import time
@@ -78,6 +79,21 @@ GROUP_AUTO_LEAVE = os.environ.get("GROUP_AUTO_LEAVE", "").strip().lower() in (
 IGNORE_USER_IDS = {
     int(x) for x in os.environ.get("IGNORE_USER_IDS", "").replace(" ", "").split(",") if x
 }
+
+# Where conversation history is kept between restarts.
+#
+# Upstash Redis first, if configured: it is the only option that survives a
+# redeploy on a host with an ephemeral filesystem, which is most free hosts.
+# Otherwise a local file - fine on a VPS or a mounted volume.
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+REDIS_PREFIX = os.environ.get("REDIS_PREFIX", "tgbot").strip()
+# Forget a chat nobody has touched in this many days (0 = never).
+HISTORY_TTL_DAYS = int(os.environ.get("HISTORY_TTL_DAYS", "30"))
+
+HISTORY_FILE = os.environ.get("HISTORY_FILE", "history.json").strip()
+HISTORY_SAVE_EVERY = int(os.environ.get("HISTORY_SAVE_EVERY", "20"))   # seconds
+HISTORY_MAX_CHATS = int(os.environ.get("HISTORY_MAX_CHATS", "300"))
 
 # Timezone the persona lives in - used to tell the model today's date.
 BOT_TZ = os.environ.get("BOT_TZ", "Europe/Berlin").strip()
@@ -187,11 +203,13 @@ GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 # --------------------------------------------------------------------------
 
 class Provider:
-    __slots__ = ("name", "base", "key", "model", "searched", "fails", "parked_until")
+    __slots__ = ("name", "base", "key", "model", "searched", "fails",
+                 "parked_until", "no_json")
 
     def __init__(self, name: str, base: str, key: str, model: str) -> None:
         self.name, self.base, self.key, self.model = name, base, key, model
         self.searched = False        # have we already hunted for a live model?
+        self.no_json = False         # strict JSON mode is broken here
         self.fails = 0               # consecutive failures
         self.parked_until = 0.0      # skip it entirely until this time
 
@@ -412,6 +430,160 @@ judge_calls: Dict[str, Deque[float]] = defaultdict(deque)
 
 # chat_id -> (is one of ours, when we checked)
 group_ok_cache: Dict[int, tuple] = {}
+
+# key -> when this chat last had anything said in it, for pruning on save
+history_seen: Dict[str, float] = {}
+history_dirty = threading.Event()
+_history_lock = threading.Lock()
+
+
+# Chats changed since the last save - only these are written to Redis.
+dirty_keys: set = set()
+
+
+def remember(key: str, role: str, text: str) -> None:
+    """Append a turn and mark the transcript as needing a save."""
+    history[key].append({"role": role, "text": text})
+    history_seen[key] = time.time()
+    with _history_lock:
+        dirty_keys.add(key)
+    history_dirty.set()
+
+
+def redis_on() -> bool:
+    return bool(UPSTASH_URL and UPSTASH_TOKEN)
+
+
+def redis_pipeline(commands: List[list]) -> Optional[list]:
+    """Send a batch of Redis commands over Upstash's REST API."""
+    if not commands:
+        return []
+    try:
+        r = session.post(
+            f"{UPSTASH_URL}/pipeline",
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            json=commands, timeout=20,
+        )
+    except Exception as exc:
+        log.warning("redis unreachable: %s", exc)
+        return None
+    if r.status_code != 200:
+        log.warning("redis %s: %s", r.status_code, r.text[:140].replace("\n", " "))
+        return None
+    try:
+        return [step.get("result") for step in r.json()]
+    except Exception as exc:
+        log.warning("redis gave unusable output: %s", exc)
+        return None
+
+
+def load_from_redis() -> bool:
+    index = f"{REDIS_PREFIX}:chats"
+    # The index is a sorted set scored by last activity, so this is "the N most
+    # recently active chats" in one call.
+    got = redis_pipeline([["ZREVRANGE", index, "0", str(HISTORY_MAX_CHATS - 1)]])
+    if got is None:
+        return False
+    keys = got[0] or []
+    if not keys:
+        log.info("redis connected, no history stored yet")
+        return True
+
+    got = redis_pipeline([["MGET"] + [f"{REDIS_PREFIX}:hist:{k}" for k in keys]])
+    if got is None:
+        return False
+    loaded = 0
+    for key, blob in zip(keys, got[0] or []):
+        if not blob:
+            continue
+        try:
+            turns = json.loads(blob)
+        except Exception:
+            continue
+        history[key] = deque(turns[-HISTORY_TURNS:], maxlen=HISTORY_TURNS)
+        history_seen[key] = time.time()
+        loaded += 1
+    log.info("loaded %d chat(s) from redis", loaded)
+    return True
+
+
+def save_to_redis(keys: List[str]) -> bool:
+    now = time.time()          # sub-second, so same-second chats still order
+    index = f"{REDIS_PREFIX}:chats"
+    cmds: List[list] = []
+    for k in keys:
+        turns = list(history[k])
+        if not turns:
+            continue
+        blob = json.dumps(turns, ensure_ascii=False)
+        cmd = ["SET", f"{REDIS_PREFIX}:hist:{k}", blob]
+        if HISTORY_TTL_DAYS:
+            cmd += ["EX", str(HISTORY_TTL_DAYS * 86400)]
+        cmds.append(cmd)
+        cmds.append(["ZADD", index, f"{now:.3f}", k])
+    if not cmds:
+        return True
+    # Keep the index from growing forever: drop all but the newest N.
+    cmds.append(["ZREMRANGEBYRANK", index, "0", str(-HISTORY_MAX_CHATS - 1)])
+    return redis_pipeline(cmds) is not None
+
+
+def load_history() -> None:
+    if redis_on() and load_from_redis():
+        return
+    if not HISTORY_FILE or not os.path.exists(HISTORY_FILE):
+        return
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        log.warning("could not read %s (%s) - starting with no history",
+                    HISTORY_FILE, exc)
+        return
+    chats = data.get("chats") or {}
+    for key, entry in chats.items():
+        turns = entry.get("turns") or []
+        history[key] = deque(turns[-HISTORY_TURNS:], maxlen=HISTORY_TURNS)
+        history_seen[key] = float(entry.get("seen") or 0)
+    log.info("loaded %d chat(s) from %s", len(chats), HISTORY_FILE)
+
+
+def save_history() -> None:
+    """Persist the transcript: Redis when configured, otherwise a local file."""
+    if redis_on():
+        with _history_lock:
+            keys = list(dirty_keys)
+            dirty_keys.clear()
+        if keys and not save_to_redis(keys):
+            with _history_lock:      # failed - try again on the next tick
+                dirty_keys.update(keys)
+        return
+
+    if not HISTORY_FILE:
+        return
+    with _history_lock:
+        keys = sorted(history, key=lambda k: history_seen.get(k, 0), reverse=True)
+        keys = keys[:HISTORY_MAX_CHATS]
+        payload = {
+            "saved": time.time(),
+            "chats": {k: {"seen": history_seen.get(k, 0), "turns": list(history[k])}
+                      for k in keys if history[k]},
+        }
+        tmp = f"{HISTORY_FILE}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, HISTORY_FILE)      # atomic: never a half-written file
+        except Exception as exc:
+            log.warning("could not save history: %s", exc)
+
+
+def history_saver() -> None:
+    while True:
+        history_dirty.wait()
+        time.sleep(HISTORY_SAVE_EVERY)         # batch a burst into one write
+        history_dirty.clear()
+        save_history()
 
 # business_connection_id -> last time we re-queried the bot's rights
 last_rights_check: Dict[str, float] = {}
@@ -718,6 +890,10 @@ def score_model(name: str, provider: str) -> int:
             score += weight
     if any(good in n for good in ("instruct", "chat", "versatile", "instant", "-it")):
         score += 2
+    # Chain-of-thought models spend ten seconds and 900 characters on a one-line
+    # reply, and burn the judge's token budget before reaching a verdict.
+    if any(slow in n for slow in ("reasoning", "thinking", "-r1", "deepthink")):
+        score -= 4
 
     size = re.search(r"(\d+)\s*b\b", n)
     if size:                            # 7B-90B is the sweet spot for a free tier
@@ -826,6 +1002,14 @@ def openai_chat(
         return None
 
     if r.status_code != 200:
+        if json_mode and r.status_code == 400 and "json" in r.text.lower():
+            # This model cannot honour response_format. Note it once and stop
+            # paying for the lesson on every future call.
+            if not p.no_json:
+                log.warning("  -> %s cannot do strict JSON mode, using plain text",
+                            p.name)
+            p.no_json = True
+            return None
         log.warning("  -> %s %s: %s", p.name, r.status_code,
                     r.text[:140].replace("\n", " "))
         # A dead model name is fixable without you: find a live one and retry.
@@ -837,7 +1021,7 @@ def openai_chat(
                 queue.sort(key=model_size)      # free tiers give away the small ones
             while queue:
                 alt = queue.pop(0)
-                log.warning("  -> %s: %s unusable, trying %s", p.name, dead, alt)
+                log.warning("  -> %s: %s unusable, trying %s", p.name, p.model, alt)
                 p.model = alt
                 before = time.time()
                 answer = openai_chat(p, system, messages, max_tokens, json_mode, timeout)
@@ -1105,13 +1289,13 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
     if owner_id is not None and sender.get("id") == owner_id:
         # This is you writing to the customer - record it as context, don't reply.
         if text:
-            history[f"{connection_id}:{chat_id}"].append({"role": "model", "text": text})
+            remember(f"{connection_id}:{chat_id}", "model", text)
         return skip("sent by you (the business owner), kept as context")
     if owner_id is None and sender.get("id") != chat_id:
         # Fallback heuristic: in a private chat the customer's own id equals the
         # chat id, so anything else is the owner's outgoing message.
         if text:
-            history[f"{connection_id}:{chat_id}"].append({"role": "model", "text": text})
+            remember(f"{connection_id}:{chat_id}", "model", text)
         return skip("looks like your own outgoing message, kept as context")
 
     if sender.get("is_bot"):
@@ -1155,8 +1339,8 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
                          msg.get("message_id"), cancel, time.time() - started):
         return
 
-    history[key].append({"role": "user", "text": user_text})
-    history[key].append({"role": "model", "text": answer})
+    remember(key, "user", user_text)
+    remember(key, "model", answer)
     last_reply_at[key] = time.time()
 
     with _pending_guard:
@@ -1382,7 +1566,8 @@ def judge_via(p: Provider, question: str) -> Optional[dict]:
         # Strict JSON mode is the good path, but several free models cannot
         # honour it and answer 400. Falling back to plain text plus a tolerant
         # parser is far better than losing the judge entirely.
-        for strict in (True, False):
+        modes = (False,) if p.no_json else (True, False)
+        for strict in modes:
             raw = openai_chat(
                 p, JUDGE_PROMPT + JUDGE_JSON_HINT,
                 [{"role": "user", "content": question}],
@@ -1505,7 +1690,7 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     # Everything said in the room is remembered, so that when we do speak we
     # know what the conversation has been about.
-    history[key].append({"role": "user", "text": f"{display_name(sender)}: {clean}"})
+    remember(key, "user", f"{display_name(sender)}: {clean}")
 
     reason = group_trigger(msg, text, key)
     if not reason:
@@ -1534,7 +1719,7 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
         send_reply(None, chat_id, answer, None)
         log.info("  -> replied: %r", answer[:60])
 
-    history[key].append({"role": "model", "text": answer})
+    remember(key, "model", answer)
     last_reply_at[key] = time.time()
     if not reason.startswith(("mentioned", "replying")):
         last_interjection[key] = time.time()
@@ -1941,6 +2126,14 @@ def main() -> None:
     if any(p.name == "gemini" for p in PROVIDERS):
         pick_working_model()
 
+    load_history()
+    if redis_on() or HISTORY_FILE:
+        threading.Thread(target=history_saver, daemon=True).start()
+        where = f"redis ({UPSTASH_URL.split('//')[-1]})" if redis_on() else HISTORY_FILE
+        log.info("history persisted to %s every %ds", where, HISTORY_SAVE_EVERY)
+        # Render and Docker stop a container with SIGTERM; write before dying.
+        signal.signal(signal.SIGTERM, lambda *_: (save_history(), sys.exit(0)))
+
     # Keep the backlog. On a host that sleeps, the messages that arrived while
     # the instance was down are queued here - dropping them means the customer
     # is silently ignored. MAX_MESSAGE_AGE filters out anything truly stale.
@@ -1965,4 +2158,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
+        save_history()
         log.info("bye")
