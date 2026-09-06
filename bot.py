@@ -708,7 +708,7 @@ def suggested_by_error(text: str, provider: str = "") -> Optional[str]:
     return slug
 
 
-def discover_models(p: Provider, limit: int = 4) -> List[str]:
+def discover_models(p: Provider, limit: int = 6) -> List[str]:
     """Best chat models this provider advertises, best first.
 
     A catalogue entry is not a promise: free keys are routinely refused models
@@ -1551,9 +1551,8 @@ def probe_provider(p: Provider) -> tuple:
     # ask the provider what it actually serves.
     if looks_like_model_error(r.status_code, r.text):
         candidates = replacement_models(p, r.text)
-        tried = []
+        failures = []
         for alt in candidates:
-            tried.append(alt)
             try:
                 r2 = session.post(
                     f"{p.base}/chat/completions", headers=headers,
@@ -1561,7 +1560,8 @@ def probe_provider(p: Provider) -> tuple:
                           "messages": [{"role": "user", "content": "Reply with OK"}]},
                     timeout=25,
                 )
-            except Exception:
+            except Exception as exc:
+                failures.append((alt, 0, str(exc)[:60]))
                 continue
             if r2.status_code == 200:
                 dead, p.model = p.model, alt
@@ -1569,10 +1569,23 @@ def probe_provider(p: Provider) -> tuple:
                 return (True,
                         f"{alt}  (was {dead}; pin it with {p.name.upper()}_MODEL)",
                         time.time() - started)
-        if tried:
-            detail += f" - none of these worked either: {', '.join(tried)}"
+            failures.append((alt, r2.status_code, http_error(r2)))
+
+        if not failures:
+            return False, detail + " - and it lists no usable chat model", took
+
+        codes = {code for _, code, _ in failures}
+        # If every alternative is refused the same way, the model was never the
+        # problem - say what the real one is instead of listing dead names.
+        if codes <= {401, 403}:
+            verdict = ("the key itself is being refused (%s) - check it is "
+                       "active and has inference permission" % failures[0][2])
+        elif codes == {404} or codes == {404, 410}:
+            verdict = ("this key has access to none of them: "
+                       + ", ".join(a for a, _, _ in failures[:4]))
         else:
-            detail += " - and it lists no usable chat model"
+            verdict = "; ".join(f"{a} -> {m}" for a, _, m in failures[:2])
+        return False, f"{detail} - tried {len(failures)} alternatives, {verdict}", took
     return False, detail, took
 
 
