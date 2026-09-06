@@ -267,6 +267,9 @@ RETIRED = {"github": "GitHub Models was retired on 30 July 2026"}
 # in a row a provider is skipped for a while, then given another chance.
 PARK_AFTER_FAILURES = int(os.environ.get("PARK_AFTER_FAILURES", "3"))
 PARK_MINUTES = int(os.environ.get("PARK_MINUTES", "10"))
+# A single model hitting its own rate limit rests this long; the ladder simply
+# steps down to the next one meanwhile.
+MODEL_COOLDOWN = int(os.environ.get("MODEL_COOLDOWN", "600"))
 
 AI_ORDER = [
     n.strip().lower()
@@ -892,6 +895,43 @@ NOT_A_CHAT_MODEL = (
 )
 
 
+# Rough intelligence ranking. It is a heuristic on names, because that is all
+# a provider gives us, but it reliably separates a 70B instruct model from an
+# 8B one - which is the difference between a good line and a bad one.
+QUALITY_FAMILY = (
+    ("gemini-3.8", 120), ("gemini-3.7", 112), ("gemini-3.6", 105),
+    ("gemini-3.5", 98), ("gemini", 90),
+    ("gpt-5", 120), ("gpt-4", 95), ("gpt-oss", 55),
+    ("llama-4", 95), ("llama-3.3", 85), ("llama-3", 70), ("llama", 60),
+    ("deepseek", 85), ("qwen3", 75), ("qwen", 65),
+    ("mistral-large", 90), ("mistral", 60), ("magistral", 70),
+    ("nemotron", 60), ("gemma", 50), ("phi", 35),
+)
+
+
+def model_quality(name: str) -> int:
+    """How good is this model likely to be at holding a sharp conversation?"""
+    n = name.lower()
+    q = 0
+    for family, weight in QUALITY_FAMILY:
+        if family in n:
+            q += weight
+            break
+    size = model_size(n)
+    q += min(size, 200) if size != 999 else 35      # unnamed size: assume mid
+    for small, penalty in (("lite", 35), ("mini", 30), ("nano", 40),
+                           ("small", 25), ("tiny", 50), ("instant", 20),
+                           ("flash", 8), ("scout", 15)):
+        if small in n:
+            q -= penalty
+    # Chain-of-thought models are slow and wordy for a one-line persona.
+    if any(x in n for x in ("reasoning", "thinking", "-r1", "deepthink")):
+        q -= 45
+    if any(x in n for x in ("instruct", "chat", "-it", "versatile")):
+        q += 10
+    return q
+
+
 def score_model(name: str, provider: str) -> int:
     """How suitable is this model id for holding a conversation?"""
     n = name.lower()
@@ -1017,6 +1057,53 @@ def trim_reply(text: str) -> str:
     return (head[:cut + 1] if cut > REPLY_MAX_CHARS // 3 else head).strip()
 
 
+class Candidate:
+    """One (provider, model) rung of the ladder."""
+
+    __slots__ = ("provider", "model", "quality", "dead", "cool_until", "bad_judge")
+
+    def __init__(self, provider: Provider, model: str) -> None:
+        self.provider = provider
+        self.model = model
+        self.quality = model_quality(model)
+        self.dead = False           # gone for good: 404 / 402 / 410
+        self.cool_until = 0.0       # rate limited: come back later
+        self.bad_judge = False      # cannot produce a usable verdict
+
+    @property
+    def usable(self) -> bool:
+        return (not self.dead and time.time() >= self.cool_until
+                and not self.provider.parked)
+
+    def __repr__(self) -> str:
+        return f"{self.provider.name}/{self.model}({self.quality})"
+
+
+LADDER: List[Candidate] = []
+
+
+def build_ladder() -> None:
+    """Ask every provider what it serves, then rank the lot by quality.
+
+    The point is to answer with the best model available anywhere, not with
+    whatever the first provider happens to offer. When the clever ones are out
+    of quota the bot walks down the rungs on its own.
+    """
+    global LADDER
+    rungs: List[Candidate] = []
+    for p in PROVIDERS:
+        if p.name == "gemini":
+            models = list(MODEL_CANDIDATES or [GEMINI_MODEL])
+        else:
+            models = [p.model] if p.model else []
+            models += [m for m in discover_models(p, limit=6) if m not in models]
+        for m in models:
+            rungs.append(Candidate(p, m))
+    LADDER = sorted(rungs, key=lambda c: -c.quality)
+    log.info("model ladder (%d rungs): %s", len(LADDER),
+             ", ".join(f"{c.provider.name}/{c.model}" for c in LADDER[:6]))
+
+
 def openai_turns(key: str, user_text: Optional[str]) -> List[dict]:
     msgs = [
         {"role": "user" if h["role"] == "user" else "assistant", "content": h["text"]}
@@ -1027,17 +1114,18 @@ def openai_turns(key: str, user_text: Optional[str]) -> List[dict]:
     return msgs
 
 
-def openai_chat(
+def openai_call(
     p: Provider,
+    model: str,
     system: str,
     messages: List[dict],
     max_tokens: int,
     json_mode: bool = False,
     timeout: Optional[int] = None,
-) -> Optional[str]:
-    """One call to any OpenAI-compatible endpoint. None means it did not work."""
+) -> tuple:
+    """One call to an OpenAI-compatible endpoint. Returns (text|None, status)."""
     body: Dict[str, Any] = {
-        "model": p.model,
+        "model": model,
         "messages": [{"role": "system", "content": system}] + messages,
         "temperature": 0.2 if json_mode else TEMPERATURE,
         "max_tokens": max_tokens,
@@ -1058,66 +1146,113 @@ def openai_chat(
         r = session.post(f"{p.base}/chat/completions", headers=headers, json=body,
                          timeout=timeout or GEMINI_TIMEOUT)
     except Exception as exc:
-        log.warning("  -> %s failed after %.0fs: %s", p.name, time.time() - started, exc)
-        return None
+        log.warning("  -> %s/%s failed after %.0fs: %s",
+                    p.name, model, time.time() - started, exc)
+        return None, 0
 
     if r.status_code != 200:
         if (r.status_code == 400 and "reasoning_format" in r.text
                 and not p.no_reasoning_param):
             p.no_reasoning_param = True
             log.info("  -> %s rejects reasoning_format, retrying without it", p.name)
-            return openai_chat(p, system, messages, max_tokens, json_mode, timeout)
+            return openai_call(p, model, system, messages, max_tokens, json_mode, timeout)
         if json_mode and r.status_code == 400 and "json" in r.text.lower():
-            # This model cannot honour response_format. Note it once and stop
-            # paying for the lesson on every future call.
             if not p.no_json:
-                log.warning("  -> %s cannot do strict JSON mode, using plain text",
-                            p.name)
+                log.warning("  -> %s cannot do strict JSON mode, using plain text", p.name)
             p.no_json = True
-            return None
-        log.warning("  -> %s %s: %s", p.name, r.status_code,
-                    r.text[:140].replace("\n", " "))
-        # A dead model name is fixable without you: find a live one and retry.
-        if looks_like_model_error(r.status_code, r.text) and not p.searched:
-            p.searched = True
-            dead = p.model
-            queue = replacement_models(p, r.text)
-            if r.status_code == 402:
-                queue.sort(key=model_size)      # free tiers give away the small ones
-            while queue:
-                alt = queue.pop(0)
-                log.warning("  -> %s: %s unusable, trying %s", p.name, p.model, alt)
-                p.model = alt
-                before = time.time()
-                answer = openai_chat(p, system, messages, max_tokens, json_mode, timeout)
-                if answer:
-                    log.warning("  -> %s now on %s (set %s_MODEL to keep it)",
-                                p.name, alt, p.name.upper())
-                    return answer
-                del before
-            p.model = dead
-        return None
+            return None, r.status_code
+        log.warning("  -> %s/%s %s: %s", p.name, model, r.status_code,
+                    r.text[:120].replace("\n", " "))
+        return None, r.status_code
+
     try:
         text = r.json()["choices"][0]["message"]["content"]
     except Exception as exc:
         log.warning("  -> %s gave unusable output: %s", p.name, exc)
-        return None
+        return None, 0
+
     raw_len = len(text or "")
     text = strip_thinking(text or "")
     if raw_len and not text:
-        log.warning("  -> %s sent %d chars of pure reasoning and no answer",
-                    p.name, raw_len)
-        return None
+        log.warning("  -> %s/%s sent %d chars of pure reasoning and no answer",
+                    p.name, model, raw_len)
+        return None, 0
     if len(text) < raw_len:
-        log.info("  -> stripped %d chars of <think> from %s",
-                 raw_len - len(text), p.name)
+        log.info("  -> stripped %d chars of <think>", raw_len - len(text))
     if not text:
         log.warning("  -> %s returned an empty message", p.name)
-        return None
+        return None, 0
     if not json_mode:
         text = trim_reply(text)
-    log.info("  -> %s 200 in %.1fs, %d chars", p.name, time.time() - started, len(text))
+    log.info("  -> %s/%s 200 in %.1fs, %d chars",
+             p.name, model, time.time() - started, len(text))
+    return text, 200
+
+
+def openai_chat(p: Provider, system: str, messages: List[dict], max_tokens: int,
+                json_mode: bool = False, timeout: Optional[int] = None,
+                model: Optional[str] = None) -> Optional[str]:
+    """Thin wrapper for callers that only care whether it worked."""
+    text, _ = openai_call(p, model or p.model, system, messages,
+                          max_tokens, json_mode, timeout)
     return text
+
+
+def gemini_call(model: str, system: str, contents: List[dict],
+                max_tokens: int, thinking: bool = True) -> tuple:
+    """One Gemini generateContent call. Returns (text|None, status)."""
+    gen: Dict[str, Any] = {"temperature": TEMPERATURE, "maxOutputTokens": max_tokens}
+    if thinking and THINKING_LEVEL:
+        gen["thinkingConfig"] = {"thinkingLevel": THINKING_LEVEL}
+    started = time.time()
+    try:
+        r = session.post(
+            f"{GEMINI_API}/models/{model}:generateContent",
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json={"system_instruction": {"parts": [{"text": system}]},
+                  "contents": contents, "generationConfig": gen},
+            timeout=GEMINI_TIMEOUT,
+        )
+    except Exception as exc:
+        log.warning("  -> gemini/%s failed: %s", model, exc)
+        return None, 0
+
+    if r.status_code == 400 and thinking and "think" in r.text.lower():
+        return gemini_call(model, system, contents, max_tokens, thinking=False)
+    if r.status_code != 200:
+        log.warning("  -> gemini/%s %s: %s", model, r.status_code,
+                    r.text[:120].replace("\n", " "))
+        return None, r.status_code
+
+    data = r.json()
+    cands = data.get("candidates") or []
+    if not cands:
+        log.warning("  -> gemini: no candidates (%s)", data.get("promptFeedback"))
+        return None, 0
+    cand = cands[0]
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(x.get("text", "") for x in parts if not x.get("thought")).strip()
+    if not text:
+        reason = cand.get("finishReason")
+        log.warning("  -> gemini/%s produced no text (finishReason=%s)", model, reason)
+        if reason == "MAX_TOKENS" and max_tokens < 4096:
+            return gemini_call(model, system, contents, 4096, thinking=False)
+        return None, 0
+    log.info("  -> gemini/%s 200 in %.1fs, %d chars",
+             model, time.time() - started, len(text))
+    return trim_reply(text), 200
+
+
+def note_failure(c: Candidate, status: int) -> None:
+    """Retire or rest a rung, so the next message does not repeat the mistake."""
+    if status in (400, 402, 404, 410, 422):
+        c.dead = True
+        log.info("  -> retiring %s", c)
+    elif status == 429:
+        c.cool_until = time.time() + MODEL_COOLDOWN
+        log.info("  -> %s rate limited, resting it %d min", c, MODEL_COOLDOWN // 60)
+    else:
+        c.cool_until = time.time() + 60
 
 
 def ask_ai(
@@ -1126,191 +1261,41 @@ def ask_ai(
     extra_system: str = "",
     cancel: Optional[threading.Event] = None,
 ) -> Optional[str]:
-    """Ask the providers in order; the first one that answers wins."""
-    if not PROVIDERS:
-        log.error("no AI providers configured - set at least one API key")
+    """Answer with the best model still available, walking down the ladder."""
+    if not LADDER:
+        log.error("no models available at all")
         return None
 
     system = PERSONA + SYSTEM_SUFFIX + extra_system + now_line()
-    live = [p for p in PROVIDERS if not p.parked]
-    if not live:                       # everyone is parked - try them anyway
-        live = PROVIDERS
-        for p in live:
-            p.parked_until = 0.0
-
-    for p in live:
-        if cancel is not None and cancel.is_set():
-            return None
-        if p.name == "gemini":
-            text = ask_gemini(key, user_text, extra_system, cancel)
-        else:
-            text = openai_chat(p, system, openai_turns(key, user_text),
-                               MAX_OUTPUT_TOKENS)
-        if text:
-            p.revive()
-            if p is not live[0]:
-                log.warning("  -> answered by %s (the ones before it were busy)", p.name)
-            return text
-        p.park()
-        log.warning("  -> %s could not answer, moving on", p.name)
-    log.error("  -> every provider failed")
-    return None
-
-
-def ask_gemini(
-    key: str,
-    user_text: Optional[str],
-    extra_system: str = "",
-    cancel: Optional[threading.Event] = None,
-) -> Optional[str]:
-    """Send the chat history plus the new message to Gemini, return the reply.
-
-    Gemini 3 models think by default, and maxOutputTokens caps thinking AND
-    the visible answer together. Left alone, the model spends the whole budget
-    reasoning and hands back a candidate with no text at all. A short chat reply
-    needs no deep reasoning, so we ask for the lowest thinking level and keep a
-    budget large enough that it can never be starved.
-    """
-    contents: List[dict] = [
-        {"role": h["role"], "parts": [{"text": h["text"]}]} for h in history[key]
-    ]
+    gem_contents = [{"role": h["role"], "parts": [{"text": h["text"]}]}
+                    for h in history[key]]
     if user_text is not None:
-        contents.append({"role": "user", "parts": [{"text": user_text}]})
+        gem_contents.append({"role": "user", "parts": [{"text": user_text}]})
+    oai_messages = openai_turns(key, user_text)
 
-    global GEMINI_MODEL
-
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
-
-    def build(thinking: bool, max_tokens: int) -> dict:
-        gen: Dict[str, Any] = {
-            "temperature": TEMPERATURE,
-            "maxOutputTokens": max_tokens,
-        }
-        if thinking and THINKING_LEVEL:
-            # Nested - a flat "thinkingLevel" in generationConfig is a 400.
-            gen["thinkingConfig"] = {"thinkingLevel": THINKING_LEVEL}
-        return {
-            "system_instruction": {
-                "parts": [{"text": PERSONA + SYSTEM_SUFFIX + extra_system + now_line()}]
-            },
-            "contents": contents,
-            "generationConfig": gen,
-        }
-
-    global PINNED_UNTIL
-
-    # A model we fell back to is kept only for a while - quota and overload are
-    # both temporary, and we want the good model back once they pass.
-    if PINNED_UNTIL and time.time() > PINNED_UNTIL and GEMINI_MODEL != PRIMARY_MODEL:
-        log.info("  -> fallback expired, back to %s", PRIMARY_MODEL)
-        GEMINI_MODEL = PRIMARY_MODEL
-        PINNED_UNTIL = 0.0
-
-    use_thinking = bool(THINKING_LEVEL)
-    max_tokens = MAX_OUTPUT_TOKENS
-    models = [GEMINI_MODEL] + [m for m in (MODEL_CANDIDATES or []) if m != GEMINI_MODEL]
-    model_idx = 0
-    attempt = 0
-
-    # With other providers behind us there is no point grinding through a long
-    # backoff here - switching costs half a second, waiting costs the customer.
-    have_backup = len(PROVIDERS) > 1
-    max_attempts = 2 if have_backup else 6
-
-    while attempt < max_attempts and model_idx < len(models):
-        # Give up the moment the reply is called off. Without this a retry
-        # storm (429s, an overloaded model) would hold the chat's lock for a
-        # minute while the customer waits on a message we will never send.
+    best = LADDER[0]
+    for c in LADDER:
         if cancel is not None and cancel.is_set():
-            log.info("  -> abandoning the Gemini call, reply was called off")
             return None
-        model = models[model_idx]
-        url = f"{GEMINI_API}/models/{model}:generateContent"
-        started = time.time()
-        try:
-            r = session.post(
-                url, headers=headers, json=build(use_thinking, max_tokens),
-                timeout=GEMINI_TIMEOUT,
-            )
-        except Exception as exc:
-            attempt += 1
-            log.warning("  -> gemini failed after %.0fs: %s", time.time() - started, exc)
-            if cancel is not None:
-                if cancel.wait(min(2 ** attempt, 15)):
-                    return None
-            else:
-                time.sleep(min(2 ** attempt, 15))
+        if not c.usable:
             continue
 
-        elapsed = time.time() - started
+        if c.provider.name == "gemini":
+            text, status = gemini_call(c.model, system, gem_contents, MAX_OUTPUT_TOKENS)
+        else:
+            text, status = openai_call(c.provider, c.model, system, oai_messages,
+                                       MAX_OUTPUT_TOKENS)
+        if text:
+            c.provider.revive()
+            c.provider.model = c.model          # for /status and /check
+            if c is not best:
+                log.warning("  -> answered by %s (better rungs unavailable)", c)
+            return text
+        note_failure(c, status)
+        if status in (401, 403):
+            c.provider.park()          # the key, not the model, is the problem
 
-        if r.status_code == 200:
-            if model != GEMINI_MODEL:
-                log.warning("  -> %s worked, using it for the next %d min",
-                            model, FALLBACK_MINUTES)
-                GEMINI_MODEL = model
-                PINNED_UNTIL = time.time() + FALLBACK_MINUTES * 60
-            data = r.json()
-            cands = data.get("candidates") or []
-            if not cands:
-                log.warning("  -> gemini: no candidates (%s)", data.get("promptFeedback"))
-                return None
-            cand = cands[0]
-            parts = (cand.get("content") or {}).get("parts") or []
-            # Thinking models emit internal "thought" parts - skip those.
-            text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
-            if text:
-                log.info("  -> gemini 200 in %.1fs, %d chars", elapsed, len(text))
-                return text
-
-            reason = cand.get("finishReason")
-            usage = data.get("usageMetadata") or {}
-            log.warning(
-                "  -> gemini 200 in %.1fs but no text (finishReason=%s, thoughts=%s tokens)",
-                elapsed, reason, usage.get("thoughtsTokenCount"),
-            )
-            # Budget was eaten by reasoning: retry once, thinking off, bigger cap.
-            if reason == "MAX_TOKENS" and (use_thinking or max_tokens < 4096):
-                use_thinking = False
-                max_tokens = max(max_tokens, 4096)
-                log.info("  -> retrying with thinking off and %d tokens", max_tokens)
-                continue
-            return None
-
-        # Some models reject thinkingConfig - drop it and try again. This costs
-        # no attempt: the request was never really made with valid settings.
-        if r.status_code == 400 and use_thinking and "think" in r.text.lower():
-            log.warning("  -> %s rejected thinkingConfig, retrying without it", model)
-            use_thinking = False
-            continue
-
-        attempt += 1
-
-        # 429 = free-tier quota, 5xx = Google overloaded. Both are per-model,
-        # so the fastest cure is a different model, not a longer wait.
-        if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
-            log.warning("  -> gemini %s on %s: %s", r.status_code, model,
-                        r.text[:140].replace("\n", " "))
-            if model_idx + 1 < len(models):
-                model_idx += 1
-                log.info("  -> switching to %s", models[model_idx])
-                continue  # straight to the next model, no waiting
-            if have_backup:
-                log.info("  -> handing over to the next provider instead of waiting")
-                return None
-            wait = min(4 * attempt, 20) + random.random()
-            log.info("  -> all models busy, waiting %.0fs", wait)
-            if cancel is not None:
-                if cancel.wait(wait):
-                    return None
-            else:
-                time.sleep(wait)
-            continue
-
-        log.error("  -> gemini %s: %s", r.status_code, r.text[:400])
-        return None
-
-    log.warning("  -> gave up after %d attempts across %d model(s)", attempt, model_idx + 1)
+    log.error("  -> every rung of the ladder failed")
     return None
 
 
@@ -1582,13 +1567,11 @@ JUDGE_SCHEMA = {
 
 
 def judge_model() -> str:
-    """A light model for the gate - it is a yes/no, not an essay."""
+    """Whichever cheap rung the judge would reach for right now."""
     if GROUP_JUDGE_MODEL:
         return GROUP_JUDGE_MODEL
-    for m in MODEL_CANDIDATES:
-        if "lite" in m:
-            return m
-    return GEMINI_MODEL
+    usable = [c for c in LADDER if c.usable and not c.bad_judge]
+    return repr(min(usable, key=lambda c: c.quality)) if usable else "none"
 
 
 def judge_budget_ok(key: str) -> bool:
@@ -1622,15 +1605,19 @@ def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) ->
         f"Should he say something now?"
     )
 
-    for p in (x for x in PROVIDERS if not x.parked) or PROVIDERS:
-        verdict = judge_via(p, question)
+    # Judging is a yes/no, so it climbs the ladder from the cheap end and leaves
+    # the clever models for the actual replies.
+    for c in sorted((x for x in LADDER if x.usable and not x.bad_judge),
+                    key=lambda x: x.quality):
+        verdict = judge_via(c, question)
         if verdict is not None:
             reason = str(verdict.get("reason", ""))[:80]
             if verdict.get("speak"):
                 return f"context: {reason}"
             log.info("  staying quiet - %s", reason)
             return ""
-        log.info("  judge: %s unavailable, trying the next provider", p.name)
+        c.bad_judge = True
+        log.info("  judge: %s no good for verdicts, trying a lower rung", c)
     return None
 
 
@@ -1660,8 +1647,9 @@ JUDGE_JSON_HINT = ('\n\nAnswer with JSON and nothing else - no prose, no code '
                    'fences: {"speak": true, "reason": "a few words"}')
 
 
-def judge_via(p: Provider, question: str) -> Optional[dict]:
-    """Run the speak/stay-quiet decision on one provider. None = it failed."""
+def judge_via(c: Candidate, question: str) -> Optional[dict]:
+    """Run the speak/stay-quiet decision on one rung. None = it failed."""
+    p = c.provider
     if p.name != "gemini":
         # Strict JSON mode is the good path, but several free models cannot
         # honour it and answer 400. Falling back to plain text plus a tolerant
@@ -1671,7 +1659,7 @@ def judge_via(p: Provider, question: str) -> Optional[dict]:
             raw = openai_chat(
                 p, JUDGE_PROMPT + JUDGE_JSON_HINT,
                 [{"role": "user", "content": question}],
-                max_tokens=300, json_mode=strict, timeout=20,
+                max_tokens=600, json_mode=strict, timeout=20, model=c.model,
             )
             if not raw:
                 continue
@@ -1681,7 +1669,7 @@ def judge_via(p: Provider, question: str) -> Optional[dict]:
             log.warning("  judge: %s gave unparseable output", p.name)
         return None
 
-    model = judge_model()
+    model = c.model
     url = f"{GEMINI_API}/models/{model}:generateContent"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
 
@@ -2022,10 +2010,18 @@ def status_report() -> str:
             else "PRIVACY MODE ON - only mentions and replies arrive, so he "
                  "cannot see jabs or topics (see /setprivacy in BotFather)"
         ),
-        "providers: " + ", ".join(
-            f"{p.name}/{GEMINI_MODEL if p.name == 'gemini' else p.model}"
-            for p in PROVIDERS
-        ),
+        "ladder (best first):",
+    ] + [
+        "  {}{:<40} q={}".format(
+            "   " if c.usable else "x  ",
+            f"{c.provider.name}/{c.model}",
+            c.quality,
+        ) + ("" if c.usable else
+             "  dead" if c.dead else
+             f"  resting {int(c.cool_until - time.time())}s" if c.cool_until > time.time()
+             else "  provider parked")
+        for c in LADDER[:10]
+    ] + [
         f"uptime: {int((time.time() - STARTED_AT) / 60)} min",
         f"business connections known: {len(owner_of_connection)}",
     ]
@@ -2231,6 +2227,7 @@ def main() -> None:
 
     if any(p.name == "gemini" for p in PROVIDERS):
         pick_working_model()
+    build_ladder()
 
     if bool(UPSTASH_URL) != bool(UPSTASH_TOKEN):
         log.warning(

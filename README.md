@@ -107,6 +107,27 @@ large ones. The first model that answers is kept for the session and logged:
    (set GROQ_MODEL to keep it)
 ```
 
+**Models are ranked, not just providers.** At startup the bot asks every
+provider what it serves and builds one ladder across all of them, ordered by
+likely quality — parameter count, model family, version, minus penalties for
+`lite`/`mini`/`nano` and for chain-of-thought models that are slow and wordy in
+a chat. Replies always use the best rung still available:
+
+```
+model ladder (7 rungs): groq/llama-3.3-70b-versatile,
+  openrouter/meta-llama/llama-3.3-70b-instruct:free, gemini/gemini-3.8-flash, ...
+```
+
+When a model hits its own rate limit it rests for `MODEL_COOLDOWN` (10 min) and
+the bot steps down one rung — not to a different provider's worst model, but to
+the next-cleverest one anywhere. A model that answers 404/402/410 is retired for
+the session. As limits reset the ladder climbs back up on its own. `/status`
+prints it with the dead and resting rungs marked.
+
+The group judge walks the *same* ladder from the cheap end: a yes/no verdict
+does not need the good model, and this keeps the clever rungs free for actual
+replies.
+
 **A provider that keeps failing gets parked.** Three failures in a row and it
 is skipped entirely for ten minutes (`PARK_AFTER_FAILURES`, `PARK_MINUTES`) —
 an exhausted daily quota does not recover in a minute, and trying it first on
