@@ -2108,9 +2108,10 @@ def main() -> None:
         sees_everything = bool(me.get("can_read_all_group_messages"))
         BOT_SEES_ALL_GROUP_MESSAGES = sees_everything
         log.info(
-            "groups: on, replying when @%s is mentioned or replied to%s",
-            BOT_USERNAME,
-            ", on keywords, and to everything else" if GROUP_REPLY_ALL else " or on keywords",
+            "groups: on, replying when @%s is mentioned, replied to, called by "
+            "name, or talked about%s", BOT_USERNAME,
+            "; and to every message (reply-all)" if GROUP_REPLY_ALL
+            else "; may also join topics" if GROUP_JOIN_TOPICS else "",
         )
         if not sees_everything:
             log.warning(
@@ -2125,6 +2126,13 @@ def main() -> None:
 
     if any(p.name == "gemini" for p in PROVIDERS):
         pick_working_model()
+
+    if bool(UPSTASH_URL) != bool(UPSTASH_TOKEN):
+        log.warning(
+            "only half of the Upstash credentials are set (%s missing) - "
+            "falling back to the file, which does not survive a redeploy",
+            "UPSTASH_REDIS_REST_TOKEN" if UPSTASH_URL else "UPSTASH_REDIS_REST_URL",
+        )
 
     load_history()
     if redis_on() or HISTORY_FILE:
