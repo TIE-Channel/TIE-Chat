@@ -90,6 +90,51 @@ TYPING_MAX = float(os.environ.get("TYPING_MAX", "45"))    # never slower than th
 # every other conversation.
 WORKERS = int(os.environ.get("WORKERS", "4"))
 
+# Group chats. The bot joins as an ordinary member (Telegram Business does not
+# cover groups) and by default only speaks when spoken to - answering every
+# line in a group is spam and burns the free Gemini quota in minutes.
+GROUPS_ENABLED = os.environ.get("GROUPS_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+GROUP_REPLY_ALL = os.environ.get("GROUP_REPLY_ALL", "").strip().lower() in (
+    "1", "true", "yes",
+)
+# Optional: only these group chat IDs are served. Empty means all of them.
+GROUP_ALLOWLIST = {
+    int(x) for x in os.environ.get("GROUP_ALLOWLIST", "").replace(" ", "").split(",") if x
+}
+
+# Subjects Ilya cannot let pass without comment. Russian stems are matched with
+# a short suffix allowance so "бот" also catches "боты", "боту", "ботами" -
+# but not "ботинок". Override the whole list with GROUP_KEYWORDS.
+DEFAULT_KEYWORDS = (
+    # боты и ИИ
+    "бот,чатбот,нейросет,нейронк,искусственный интеллект,ии,машинное обучение,"
+    "алгоритм,робот,ассистент,подписк,"
+    # современные технологии
+    "технолог,гаджет,смартфон,айфон,цифров,автоматизац,приложух,облак,"
+    "интернет,соцсет,умный дом,электромобил,"
+    # ретро и ностальгия
+    "ретро,винтаж,ностальг,девяност,восьмидесят,нулев,кассет,пластинк,винил,"
+    "дискет,плёнк,пленк,аналогов,ламповый,старая школа,раньше было,"
+    # English
+    "bot,chatbot,ai,artificial intelligence,neural,machine learning,algorithm,"
+    "robot,assistant,subscription,tech,technology,gadget,smartphone,iphone,"
+    "digital,automation,app,cloud,internet,social media,smart home,"
+    "retro,vintage,nostalgia,nostalgic,nineties,eighties,cassette,vinyl,"
+    "floppy,analog,analogue,old school,back in the day"
+)
+GROUP_KEYWORDS = [
+    k.strip().lower()
+    for k in os.environ.get("GROUP_KEYWORDS", DEFAULT_KEYWORDS).split(",")
+    if k.strip()
+]
+
+# Butting in on a keyword is capped separately: without this the bot would
+# comment on every third line in a group that talks about tech all day.
+# Being @mentioned or replied to ignores this cap.
+GROUP_KEYWORD_COOLDOWN = float(os.environ.get("GROUP_KEYWORD_COOLDOWN", "120"))
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -203,6 +248,9 @@ can_reply: Dict[str, bool] = {}
 
 last_reply_at: Dict[str, float] = {}
 
+# Separate clock for unprompted keyword interjections in groups.
+last_keyword_reply: Dict[str, float] = {}
+
 # business_connection_id -> last time we re-queried the bot's rights
 last_rights_check: Dict[str, float] = {}
 
@@ -243,6 +291,10 @@ pending: Dict[str, Pending] = {}
 _pending_guard = threading.Lock()
 
 NEVER_CANCELLED = threading.Event()
+
+# Filled in from getMe at startup - needed to spot mentions and replies in groups.
+BOT_ID: Optional[int] = None
+BOT_USERNAME: str = ""
 
 
 def cancel_pending(key: str, reason: str, only_message_id: Optional[int] = None) -> bool:
@@ -330,20 +382,18 @@ class Typing:
     so it has to be re-sent on a timer rather than set once.
     """
 
-    def __init__(self, connection_id: str, chat_id: int) -> None:
+    def __init__(self, connection_id: Optional[str], chat_id: int) -> None:
         self.connection_id = connection_id
         self.chat_id = chat_id
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def _pump(self) -> None:
+        params: Dict[str, Any] = {"chat_id": self.chat_id, "action": "typing"}
+        if self.connection_id:
+            params["business_connection_id"] = self.connection_id
         while True:
-            tg(
-                "sendChatAction",
-                business_connection_id=self.connection_id,
-                chat_id=self.chat_id,
-                action="typing",
-            )
+            tg("sendChatAction", **params)
             if self._stop.wait(4.0):  # re-arm before Telegram's ~5s timeout
                 return
 
@@ -374,20 +424,55 @@ def typing_delay(text: str, already_spent: float) -> float:
     return max(0.0, seconds - already_spent)
 
 
-def send_reply(connection_id: str, chat_id: int, text: str, reply_to: Optional[int]) -> None:
+def send_reply(
+    connection_id: Optional[str],
+    chat_id: int,
+    text: str,
+    reply_to: Optional[int],
+    quote: bool = False,
+) -> None:
     # Telegram hard-limits messages to 4096 characters.
     for chunk in [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]:
-        params: Dict[str, Any] = {
-            "business_connection_id": connection_id,
-            "chat_id": chat_id,
-            "text": chunk,
-        }
-        # Off by default: a person answering their own chat just writes back,
-        # they don't quote the message they're standing right underneath.
-        if reply_to and QUOTE_REPLIES:
+        params: Dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+        if connection_id:
+            params["business_connection_id"] = connection_id
+        # Off by default in 1:1 chats - a person answering their own chat just
+        # writes back. In a group, quoting is how anyone knows who you mean.
+        if reply_to and (QUOTE_REPLIES or quote):
             params["reply_parameters"] = {"message_id": reply_to}
-            reply_to = None  # only the first chunk quotes the customer
+            reply_to = None  # only the first chunk quotes
         tg("sendMessage", **params)
+
+
+def pace_and_send(
+    connection_id: Optional[str],
+    chat_id: int,
+    incoming: str,
+    answer: str,
+    reply_to: Optional[int],
+    cancel: threading.Event,
+    spent: float,
+    quote: bool = False,
+) -> bool:
+    """Wait like a person would, then send - unless the reply gets called off."""
+    if cancel.is_set():
+        return False
+
+    pause = read_delay(incoming) - spent
+    if pause > 0:
+        log.info("  -> noticing the message in %.1fs", pause)
+    if not wait_unless_cancelled(cancel, pause):
+        return False
+
+    with Typing(connection_id, chat_id):
+        pause = typing_delay(answer, 0.0)
+        log.info("  -> typing %.1fs for %d chars", pause, len(answer))
+        if not wait_unless_cancelled(cancel, pause):
+            return False
+
+    send_reply(connection_id, chat_id, answer, reply_to, quote=quote)
+    log.info("  -> replied: %r", answer[:60])
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -438,7 +523,7 @@ def pick_working_model() -> str:
     return GEMINI_MODEL
 
 
-def ask_gemini(key: str, user_text: str) -> Optional[str]:
+def ask_gemini(key: str, user_text: Optional[str], extra_system: str = "") -> Optional[str]:
     """Send the chat history plus the new message to Gemini, return the reply.
 
     Gemini 3 models think by default, and maxOutputTokens caps thinking AND
@@ -450,7 +535,8 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
     contents: List[dict] = [
         {"role": h["role"], "parts": [{"text": h["text"]}]} for h in history[key]
     ]
-    contents.append({"role": "user", "parts": [{"text": user_text}]})
+    if user_text is not None:
+        contents.append({"role": "user", "parts": [{"text": user_text}]})
 
     global GEMINI_MODEL
 
@@ -466,7 +552,7 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
             gen["thinkingConfig"] = {"thinkingLevel": THINKING_LEVEL}
         return {
             "system_instruction": {
-                "parts": [{"text": PERSONA + SYSTEM_SUFFIX + now_line()}]
+                "parts": [{"text": PERSONA + SYSTEM_SUFFIX + extra_system + now_line()}]
             },
             "contents": contents,
             "generationConfig": gen,
@@ -653,35 +739,166 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
-    if cancel.is_set():
-        return
 
-    # Pick up the phone, unlock it, read the message. Nothing shows yet.
-    pause = read_delay(user_text) - (time.time() - started)
-    if pause > 0:
-        log.info("  -> noticing the message in %.1fs", pause)
-    if not wait_unless_cancelled(cancel, pause):
+    if not pace_and_send(connection_id, chat_id, user_text, answer,
+                         msg.get("message_id"), cancel, time.time() - started):
         return
-
-    # Only now does the indicator light up, and it stays lit until the message
-    # actually lands.
-    with Typing(connection_id, chat_id):
-        pause = typing_delay(answer, 0.0)
-        log.info("  -> typing %.1fs for %d chars", pause, len(answer))
-        if not wait_unless_cancelled(cancel, pause):
-            return
 
     history[key].append({"role": "user", "text": user_text})
     history[key].append({"role": "model", "text": answer})
-
     last_reply_at[key] = time.time()
-    send_reply(connection_id, chat_id, answer, msg.get("message_id"))
-    log.info("  -> replied: %r", answer[:60])
 
     with _pending_guard:
         p = pending.get(key)
         if p and p.cancel is cancel:
             pending.pop(key, None)
+
+
+GROUP_NOTE = """
+
+GROUP CHAT - THIS OVERRIDES THE ONE-LINE RULE
+You are in a group with several people. Every incoming line is prefixed with \
+the name of whoever said it. Never prefix your own replies with a name; use \
+someone's name only when it matters who you are answering.
+
+Here you may take room. Two or three sentences is normal, and a short riff is \
+fine when the subject deserves one - this is a conversation, not a support \
+desk. Still one paragraph, no line breaks, no lists, no headings, no emoji.
+
+Often nobody asked you anything: somebody merely said something you have an \
+opinion about. So come in as a person would - with the opinion, not with an \
+offer to help. Never ask whether they need assistance.
+"""
+
+
+def display_name(user: dict) -> str:
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
+    return name or user.get("username") or f"user{user.get('id')}"
+
+
+def _compile_keywords(words: List[str]) -> List[tuple]:
+    """Build one regex per keyword, tolerant of Russian word endings."""
+    out = []
+    for w in words:
+        parts = []
+        for token in w.split():
+            esc = re.escape(token)
+            if re.search(r"[а-яё]", token):
+                # Russian inflects: allow a short ending, but not a whole new word.
+                parts.append(esc + (r"[а-яё]{0,3}" if len(token) >= 3 else ""))
+            else:
+                parts.append(esc + r"(?:e?s)?")
+        out.append((w, re.compile(r"\b" + r"\s+".join(parts) + r"\b", re.I | re.U)))
+    return out
+
+
+KEYWORD_PATTERNS = _compile_keywords(GROUP_KEYWORDS)
+
+
+def matched_keyword(text: str) -> Optional[str]:
+    for word, pattern in KEYWORD_PATTERNS:
+        if pattern.search(text):
+            return word
+    return None
+
+
+def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
+    """Why we should speak up in this group, or None to stay quiet."""
+    if GROUP_REPLY_ALL:
+        return "reply-all is on"
+
+    replied = msg.get("reply_to_message") or {}
+    if (replied.get("from") or {}).get("id") == BOT_ID:
+        return "replying to us"
+    if BOT_USERNAME and f"@{BOT_USERNAME}".lower() in text.lower():
+        return "mentioned"
+
+    word = matched_keyword(text)
+    if word:
+        since = time.time() - last_keyword_reply.get(key, 0)
+        if since < GROUP_KEYWORD_COOLDOWN:
+            log.info("group %s | keyword %r, but butted in %.0fs ago", key, word, since)
+            return None
+        return f"keyword {word!r}"
+    return None
+
+
+def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) -> None:
+    cancel = cancel if cancel is not None else NEVER_CANCELLED
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    sender = msg.get("from") or {}
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+
+    if not text or sender.get("is_bot") or sender.get("id") in IGNORE_USER_IDS:
+        return
+    if GROUP_ALLOWLIST and chat_id not in GROUP_ALLOWLIST:
+        return
+
+    key = f"group:{chat_id}"
+
+    # Strip our own @mention so the model doesn't answer its own username.
+    clean = text
+    if BOT_USERNAME:
+        clean = re.sub(rf"@{re.escape(BOT_USERNAME)}\b", "", clean, flags=re.I).strip()
+
+    # Everything said in the room is remembered, so that when we do speak we
+    # know what the conversation has been about.
+    history[key].append({"role": "user", "text": f"{display_name(sender)}: {clean}"})
+
+    reason = group_trigger(msg, text, key)
+    if not reason:
+        return
+
+    log.info("group %s | %s: %r  (%s)", chat_id, display_name(sender), clean[:60], reason)
+
+    if time.time() - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
+        log.info("  -> ignored: within REPLY_COOLDOWN")
+        return
+
+    log.info("  -> answering...")
+    started = time.time()
+    answer = ask_gemini(key, None, GROUP_NOTE)
+    if not answer:
+        log.warning("  -> Gemini returned nothing, no reply sent")
+        return
+
+    # No quoting: Ilya just says his piece into the room.
+    if not pace_and_send(None, chat_id, clean, answer, None,
+                         cancel, time.time() - started):
+        return
+
+    history[key].append({"role": "model", "text": answer})
+    last_reply_at[key] = time.time()
+    if reason.startswith("keyword"):
+        last_keyword_reply[key] = time.time()
+
+    with _pending_guard:
+        p = pending.get(key)
+        if p and p.cancel is cancel:
+            pending.pop(key, None)
+
+
+def dispatch_group_message(msg: dict) -> None:
+    chat = msg.get("chat") or {}
+    key = f"group:{chat.get('id')}"
+    cancel_pending(key, "a newer message arrived")
+
+    entry = Pending(msg.get("message_id"))
+    with _pending_guard:
+        pending[key] = entry
+
+    def run() -> None:
+        with chat_lock(key):
+            try:
+                handle_group_message(msg, entry.cancel)
+            except Exception:
+                log.exception("error answering group %s", chat.get("id"))
+
+    if ASYNC_REPLIES:
+        EXECUTOR.submit(run)
+    else:
+        run()
 
 
 def dispatch_business_message(msg: dict) -> None:
@@ -770,11 +987,18 @@ def handle_update(update: dict) -> None:
             cancel_pending(key, "the message was deleted", only_message_id=mine)
         return
 
-    # A normal DM to the bot itself - handy for checking it is alive.
     msg = update.get("message")
     if not msg:
         log.info("update ignored (%s)", ", ".join(k for k in update if k != "update_id"))
         return
+
+    # Group chats: the bot is a plain member here, not a business assistant.
+    if (msg.get("chat") or {}).get("type") in ("group", "supergroup"):
+        if GROUPS_ENABLED:
+            dispatch_group_message(msg)
+        return
+
+    # A normal DM to the bot itself - handy for checking it is alive.
     text = (msg.get("text") or "").strip()
     if text.startswith("/status"):
         tg("sendMessage", chat_id=msg["chat"]["id"], text=status_report())
@@ -837,10 +1061,18 @@ def main() -> None:
     if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
         sys.exit("Set TELEGRAM_BOT_TOKEN and GEMINI_API_KEY (see .env.example).")
 
+    global BOT_ID, BOT_USERNAME
     me = tg("getMe")
     if not me:
         sys.exit("Telegram rejected the token. Check TELEGRAM_BOT_TOKEN.")
-    log.info("logged in as @%s", me.get("username"))
+    BOT_ID = me.get("id")
+    BOT_USERNAME = me.get("username") or ""
+    log.info("logged in as @%s (id %s)", BOT_USERNAME, BOT_ID)
+    if GROUPS_ENABLED:
+        log.info(
+            "groups: on, replying %s",
+            "to every message" if GROUP_REPLY_ALL else f"when @{BOT_USERNAME} is mentioned or replied to",
+        )
 
     pick_working_model()
 

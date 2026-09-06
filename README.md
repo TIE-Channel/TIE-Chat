@@ -133,6 +133,43 @@ so it never sleeps — a sleeping machine stops polling.
 
 ---
 
+## Step 6b — Group chats (optional)
+
+Telegram Business only covers 1:1 chats. For a group the bot joins as an
+ordinary member, and posts under its own name (`@TieChat_bot`), not yours.
+
+1. Add the bot to the group like any other member.
+2. That's it. It reads everything and speaks up in three cases:
+   - somebody **@mentions it**,
+   - somebody **replies to one of its messages**,
+   - the conversation touches one of its **subjects** — bots, AI, modern
+     technology, retro, nostalgia and the like, in Russian or English.
+
+Replies land as ordinary messages, not quoted — he is talking to the room, not
+filing a ticket. In a group he is also allowed to write more than one line:
+two or three sentences, or a short riff when the subject deserves it.
+
+Keyword interjections are capped at one per `GROUP_KEYWORD_COOLDOWN` seconds
+(120 by default) so he doesn't monologue through a whole tech argument. Being
+mentioned or replied to ignores that cap.
+
+Russian stems match inflected forms — `бот` catches "боты", "ботами", "о ботах"
+but not "ботинок". Replace the whole list with `GROUP_KEYWORDS`.
+
+It remembers the whole conversation either way, so when you do call on it, it
+knows what was being discussed. Each line it sees is labelled with who said it.
+
+**To make it answer everything** set `GROUP_REPLY_ALL=true` — and note that
+Telegram's privacy mode hides ordinary group messages from bots, so you must
+also send `/setprivacy` to @BotFather, choose the bot, pick **Disable**, then
+**remove and re-add** the bot to the group. The change only takes effect on
+re-join.
+
+To limit it to certain groups, put their chat IDs in `GROUP_ALLOWLIST` (the ID
+appears in the log as `group -1001234...` the first time anyone writes).
+
+---
+
 ## Step 7 — Make it sound like you
 
 Everything lives in the `PERSONA` env variable. Leave it unset for the built-in
@@ -163,6 +200,11 @@ Other knobs, all optional (see `.env.example`):
 | `TYPING_CPS` | `5` | typing speed, chars/second — about 45 words per minute |
 | `TYPING_MIN` / `TYPING_MAX` | `2` / `45` | floor and ceiling on that pause, in seconds |
 | `WORKERS` | `4` | chats answered in parallel; `1` turns threading off |
+| `GROUPS_ENABLED` | `true` | answer in group chats the bot has been added to |
+| `GROUP_REPLY_ALL` | `false` | `true` answers every group message, not just mentions and replies |
+| `GROUP_ALLOWLIST` | — | comma-separated group chat IDs; empty means all groups |
+| `GROUP_KEYWORDS` | built-in list | subjects that make him chime in unprompted; replaces the defaults |
+| `GROUP_KEYWORD_COOLDOWN` | `120` | seconds before he may butt in on a keyword again |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |
 | `MAX_OUTPUT_TOKENS` | `2048` | covers thinking **and** the answer — below ~1024 Gemini 3 returns nothing |
