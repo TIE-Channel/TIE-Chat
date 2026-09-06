@@ -63,6 +63,17 @@ THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
 # ordinary messages, the way a person actually answers their own chat.
 QUOTE_REPLIES = os.environ.get("QUOTE_REPLIES", "").strip().lower() in ("1", "true", "yes")
 
+# Your own Telegram user id. Set it: a bot with Secretary Mode on can be
+# attached by ANYONE to THEIR business account, and they would then be
+# answering their customers on your Gemini quota. With this set, the bot
+# serves only you and ignores every other connection.
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
+
+# Leave any group the owner is not a member of, instead of just staying quiet.
+GROUP_AUTO_LEAVE = os.environ.get("GROUP_AUTO_LEAVE", "").strip().lower() in (
+    "1", "true", "yes",
+)
+
 # Optional: comma-separated Telegram user IDs that are never auto-answered.
 IGNORE_USER_IDS = {
     int(x) for x in os.environ.get("IGNORE_USER_IDS", "").replace(" ", "").split(",") if x
@@ -251,6 +262,9 @@ last_reply_at: Dict[str, float] = {}
 # Separate clock for unprompted keyword interjections in groups.
 last_keyword_reply: Dict[str, float] = {}
 
+# chat_id -> (is one of ours, when we checked)
+group_ok_cache: Dict[int, tuple] = {}
+
 # business_connection_id -> last time we re-queried the bot's rights
 last_rights_check: Dict[str, float] = {}
 
@@ -295,6 +309,8 @@ NEVER_CANCELLED = threading.Event()
 # Filled in from getMe at startup - needed to spot mentions and replies in groups.
 BOT_ID: Optional[int] = None
 BOT_USERNAME: str = ""
+# False = Telegram privacy mode is on and ordinary group messages never arrive.
+BOT_SEES_ALL_GROUP_MESSAGES: bool = False
 
 
 def cancel_pending(key: str, reason: str, only_message_id: Optional[int] = None) -> bool:
@@ -369,10 +385,16 @@ def remember_connection(conn: dict) -> None:
         can_reply[cid] = bool(conn["can_reply"])
     else:
         can_reply[cid] = True
+    owner = owner_of_connection.get(cid)
     log.info(
         "business connection %s owner=%s enabled=%s can_reply=%s",
-        cid, owner_of_connection.get(cid), conn.get("is_enabled", True), can_reply.get(cid),
+        cid, owner, conn.get("is_enabled", True), can_reply.get(cid),
     )
+    if OWNER_ID and owner and owner != OWNER_ID:
+        log.warning(
+            "REFUSED: user %s attached this bot to their own business account. "
+            "Ignoring them (OWNER_ID=%s).", owner, OWNER_ID,
+        )
 
 
 class Typing:
@@ -691,6 +713,15 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
         return skip("%.0f min old, older than MAX_MESSAGE_AGE", age / 60)
 
     owner_id = resolve_owner(connection_id)
+
+    # Only serve the account this bot belongs to. Fails closed: if we cannot
+    # establish whose connection this is, we say nothing.
+    if OWNER_ID:
+        if owner_id is None:
+            return skip("cannot confirm whose business account this is")
+        if owner_id != OWNER_ID:
+            return skip("connection belongs to %s, not you - ignoring", owner_id)
+
     if owner_id is not None and sender.get("id") == owner_id:
         # This is you writing to the customer - record it as context, don't reply.
         if text:
@@ -802,6 +833,33 @@ def matched_keyword(text: str) -> Optional[str]:
     return None
 
 
+def group_allowed(chat_id: int) -> bool:
+    """Serve a group only if it is one of yours.
+
+    An explicit allowlist wins. Otherwise, if OWNER_ID is set, the test is
+    simply whether you are in that group - a stranger who adds the bot to
+    their own chat gets nothing.
+    """
+    if GROUP_ALLOWLIST:
+        return chat_id in GROUP_ALLOWLIST
+    if not OWNER_ID:
+        return True
+
+    cached = group_ok_cache.get(chat_id)
+    if cached and time.time() - cached[1] < 3600:
+        return cached[0]
+
+    res = tg("getChatMember", chat_id=chat_id, user_id=OWNER_ID)
+    ok = bool(res) and res.get("status") not in ("left", "kicked")
+    group_ok_cache[chat_id] = (ok, time.time())
+    if not ok:
+        log.warning("group %s: you are not in it - ignoring", chat_id)
+        if GROUP_AUTO_LEAVE:
+            log.warning("leaving group %s", chat_id)
+            tg("leaveChat", chat_id=chat_id)
+    return ok
+
+
 def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
     """Why we should speak up in this group, or None to stay quiet."""
     if GROUP_REPLY_ALL:
@@ -832,7 +890,7 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     if not text or sender.get("is_bot") or sender.get("id") in IGNORE_USER_IDS:
         return
-    if GROUP_ALLOWLIST and chat_id not in GROUP_ALLOWLIST:
+    if not group_allowed(chat_id):
         return
 
     key = f"group:{chat_id}"
@@ -933,6 +991,13 @@ def dispatch_business_message(msg: dict) -> None:
 
 def status_report() -> str:
     lines = [
+        f"locked to owner: {OWNER_ID or 'NO - anyone can use this bot'}",
+        "group messages: " + (
+            "all visible, keywords work"
+            if BOT_SEES_ALL_GROUP_MESSAGES
+            else "PRIVACY MODE ON - only mentions and replies arrive, "
+                 "keywords cannot fire (see /setprivacy in BotFather)"
+        ),
         f"model: {GEMINI_MODEL}",
         f"uptime: {int((time.time() - STARTED_AT) / 60)} min",
         f"business connections known: {len(owner_of_connection)}",
@@ -1000,6 +1065,17 @@ def handle_update(update: dict) -> None:
 
     # A normal DM to the bot itself - handy for checking it is alive.
     text = (msg.get("text") or "").strip()
+    sender_id = (msg.get("from") or {}).get("id")
+    is_owner = not OWNER_ID or sender_id == OWNER_ID
+
+    if not is_owner:
+        # Somebody else found the bot. Don't hand them diagnostics.
+        log.info("DM from %s (not the owner), turned away", sender_id)
+        if text.startswith("/"):
+            tg("sendMessage", chat_id=msg["chat"]["id"],
+               text="This bot is private.")
+        return
+
     if text.startswith("/status"):
         tg("sendMessage", chat_id=msg["chat"]["id"], text=status_report())
     elif text.startswith("/start"):
@@ -1061,18 +1137,44 @@ def main() -> None:
     if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
         sys.exit("Set TELEGRAM_BOT_TOKEN and GEMINI_API_KEY (see .env.example).")
 
-    global BOT_ID, BOT_USERNAME
+    global BOT_ID, BOT_USERNAME, BOT_SEES_ALL_GROUP_MESSAGES
     me = tg("getMe")
     if not me:
         sys.exit("Telegram rejected the token. Check TELEGRAM_BOT_TOKEN.")
     BOT_ID = me.get("id")
     BOT_USERNAME = me.get("username") or ""
     log.info("logged in as @%s (id %s)", BOT_USERNAME, BOT_ID)
-    if GROUPS_ENABLED:
-        log.info(
-            "groups: on, replying %s",
-            "to every message" if GROUP_REPLY_ALL else f"when @{BOT_USERNAME} is mentioned or replied to",
+
+    if OWNER_ID:
+        log.info("locked to owner %s - every other account is ignored", OWNER_ID)
+    else:
+        log.warning(
+            "OWNER_ID is not set: anyone who knows @%s can attach it to their "
+            "own business account and spend your Gemini quota. Set OWNER_ID to "
+            "your Telegram user id.", BOT_USERNAME,
         )
+    if GROUPS_ENABLED:
+        # Telegram only delivers ordinary group messages to a bot whose privacy
+        # mode is off. Without that the bot literally never sees the text, so
+        # keyword triggers and reply-all cannot fire - and nothing appears in
+        # the log to explain why.
+        sees_everything = bool(me.get("can_read_all_group_messages"))
+        BOT_SEES_ALL_GROUP_MESSAGES = sees_everything
+        log.info(
+            "groups: on, replying when @%s is mentioned or replied to%s",
+            BOT_USERNAME,
+            ", on keywords, and to everything else" if GROUP_REPLY_ALL else " or on keywords",
+        )
+        if not sees_everything:
+            log.warning(
+                "PRIVACY MODE IS ON: Telegram is not delivering ordinary group "
+                "messages to this bot, so keyword triggers will never fire. "
+                "Fix: @BotFather -> /setprivacy -> @%s -> Disable, then REMOVE "
+                "the bot from the group and add it back (the setting is only "
+                "applied when it joins).", BOT_USERNAME,
+            )
+        else:
+            log.info("privacy mode off - all group messages are visible")
 
     pick_working_model()
 

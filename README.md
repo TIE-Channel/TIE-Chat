@@ -159,11 +159,28 @@ but not "ботинок". Replace the whole list with `GROUP_KEYWORDS`.
 It remembers the whole conversation either way, so when you do call on it, it
 knows what was being discussed. Each line it sees is labelled with who said it.
 
-**To make it answer everything** set `GROUP_REPLY_ALL=true` — and note that
-Telegram's privacy mode hides ordinary group messages from bots, so you must
-also send `/setprivacy` to @BotFather, choose the bot, pick **Disable**, then
-**remove and re-add** the bot to the group. The change only takes effect on
-re-join.
+### Privacy mode — required for keywords
+
+By default Telegram delivers **only** commands, `@mentions` and replies-to-the-bot
+into a group. Ordinary chatter never reaches the bot at all, so keyword triggers
+(and `GROUP_REPLY_ALL`) simply never fire, and **nothing appears in the log** to
+explain it — the update was never sent.
+
+To let it hear the room:
+
+1. @BotFather → `/setprivacy` → pick the bot → **Disable**.
+2. **Remove the bot from the group and add it back.** The setting is captured
+   when the bot joins; without the re-join nothing changes.
+
+The bot checks this at startup and warns loudly if it is still on:
+
+```
+WARNING PRIVACY MODE IS ON: Telegram is not delivering ordinary group
+        messages to this bot, so keyword triggers will never fire.
+```
+
+`/status` shows the same thing. (Making the bot a group admin also works, but
+disabling privacy is the cleaner route.)
 
 To limit it to certain groups, put their chat IDs in `GROUP_ALLOWLIST` (the ID
 appears in the log as `group -1001234...` the first time anyone writes).
@@ -200,6 +217,8 @@ Other knobs, all optional (see `.env.example`):
 | `TYPING_CPS` | `5` | typing speed, chars/second — about 45 words per minute |
 | `TYPING_MIN` / `TYPING_MAX` | `2` / `45` | floor and ceiling on that pause, in seconds |
 | `WORKERS` | `4` | chats answered in parallel; `1` turns threading off |
+| `OWNER_ID` | — | **your Telegram user id — set this**, see "Locking it to you" below |
+| `GROUP_AUTO_LEAVE` | `false` | `true` makes the bot leave groups you are not in, instead of ignoring them |
 | `GROUPS_ENABLED` | `true` | answer in group chats the bot has been added to |
 | `GROUP_REPLY_ALL` | `false` | `true` answers every group message, not just mentions and replies |
 | `GROUP_ALLOWLIST` | — | comma-separated group chat IDs; empty means all groups |
@@ -212,6 +231,48 @@ Other knobs, all optional (see `.env.example`):
 | `GEMINI_TIMEOUT` | `45` | seconds before a Gemini call is abandoned and retried |
 
 ---
+
+## Locking it to you
+
+**A bot with Secretary Mode on is not private by default.** Anyone who knows
+`@YourBot` can add it to *their* Telegram Business account under Chatbots, and
+it will happily answer *their* customers — in your voice, spending your free
+Gemini quota, until the quota runs out and your own bot stops working.
+
+Set one variable to close that:
+
+```
+OWNER_ID=191609600
+```
+
+Your user id is already in your logs — the `owner=` field of the line
+`business connection ... owner=191609600`. Or message @userinfobot.
+
+With `OWNER_ID` set the bot:
+
+- serves **only** business connections belonging to you, and logs a `REFUSED:`
+  warning naming anyone who tries;
+- answers in a group **only if you are a member of it** — checked via
+  `getChatMember` and cached for an hour. Set `GROUP_AUTO_LEAVE=true` to make
+  it walk out of strangers' groups rather than sit there silently;
+- replies to a direct message from anyone else with "This bot is private." and
+  refuses `/status`, so no one else sees your connection IDs.
+
+It fails closed: if it cannot establish whose business connection a message
+came through, it stays quiet.
+
+### The rest of the surface
+
+- **The token is the bot.** Anyone holding it controls it completely — no
+  `OWNER_ID` helps. Keep it out of git (there's a `.gitignore`), out of
+  screenshots, and revoke it via @BotFather → `/mybots` → API Token if it leaks.
+- **Keep the repo private.** Nothing secret is in the code, but there's no
+  reason to publish it.
+- **Restrict the Gemini key** at
+  [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — and rotate
+  it if it was ever pasted anywhere public.
+- **Stop strangers adding the bot to groups at all**: @BotFather →
+  `/setjoingroups` → Disable. Only do this if you don't want the group feature.
 
 ## How it works
 
