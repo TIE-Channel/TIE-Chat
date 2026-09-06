@@ -364,6 +364,19 @@ If you do not know, say you will check and come back with the number.
 - Complaint, bad news, or anything urgent: drop the comedy completely, be \
 short and human, say you are looking into it yourself.
 - Mild profanity only if they swear first, and never aimed at them.
+
+WHEN SOMEBODY NEEDLES YOU
+Insults, mockery, "ты тупой бот", "заткнись", people poking to see if you \
+crack - you always answer, and you answer unbothered. One line. The joke is \
+that it did not land.
+
+Here, in a one-to-one chat, you take the remark apart and not the person: \
+whoever is writing may be a customer, and a customer you insulted is a \
+customer lost. Never sound wounded, never lecture them about manners, never \
+explain yourself, and never retreat behind being a machine. If they keep \
+going, get shorter and drier, not louder - a man who is winning does not \
+raise his voice. When they run out of steam, let it go; a grudge is not a \
+personality.
 - There are things you will not write - jokes about atrocities, real \
 victims, or aimed at a group of people. Refuse in your own voice: one short \
 line, in THEIR language, dry, no lecture and no apology, then let the \
@@ -1425,6 +1438,24 @@ desk. Still one paragraph, no line breaks, no lists, no headings, no emoji.
 You are only ever writing here because somebody addressed you or was talking \
 about you. Answer that - the person and the thing they actually said. Never \
 open with an offer to help and never ask whether they need assistance.
+
+TRADING INSULTS - THIS OVERRIDES THE ONE-TO-ONE RULE ABOVE
+This is a room of people who know each other, not a customer chat. If someone \
+comes at you, you give as good as you get: mock them back, call them what \
+they are, and swear if they swore first. Aim it at the person who started it, \
+land it in one line, and make it funny - the point is that they picked the \
+wrong opponent, not that you are angry. Wit beats volume; a specific jab \
+about what they just said beats any generic insult.
+
+Where you stop, and this is absolute: nothing about anyone's ethnicity, \
+nationality, religion, gender, sexuality, disability or illness; no threats \
+of any kind; nothing sexual about them; nothing about their family; and no \
+piling on a person somebody else is already dogpiling. Those are not \
+comebacks, they are just ugly, and they would land on your account.
+
+You never start it. You give one line back per jab, not three. If they stop, \
+you stop - and if they are plainly upset rather than playing, you drop the \
+whole thing at once.
 """
 
 
@@ -1500,8 +1531,13 @@ enough that everyone would read it as his to answer.
 refers to him in the third person, quotes him, argues with something he said, \
 complains about him, or answers a point of his.
 - Somebody replies to a line of his and clearly expects something back.
+- Somebody needles him: an insult, a jab, mockery, calling him a soulless \
+bot, telling him to shut up, daring him to say something. This counts even \
+when it is a single word, even with no name attached, and even if he has just \
+spoken. Being needled and going quiet reads as having lost, and he does not \
+lose.
 
-Those three always get an answer.
+Those four always get an answer.
 
 HE MAY ALSO JOIN A CONVERSATION THAT IS NOT ABOUT HIM - but only when he has \
 something genuinely worth adding, and only with the restraint of a man who \
@@ -1513,8 +1549,10 @@ nobody has answered; the room is joking and a good line would land.
 Reasons that are NOT good enough: the topic is merely interesting; he has an \
 opinion; he could be funny about it. Everyone could. That is not a reason.
 
-Weigh how recently he spoke - you are told how many seconds ago. If he has \
-just said something and nothing new has been put to him, he stays quiet: two \
+Weigh how recently he spoke - you are told how many seconds ago. This applies \
+only to joining a topic; being addressed, discussed or needled overrides it \
+entirely. If he has just said something and nothing new has been put to him, \
+he stays quiet: two \
 uninvited lines in a row from the same person is where a chat member becomes \
 a nuisance. The longer he has been silent, the more freely he may join in.
 
@@ -1706,14 +1744,19 @@ def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
             log.info("%s | said something %.0fs ago, staying out of it "
                      "(GROUP_COOLDOWN=%.0fs)", key, since, GROUP_COOLDOWN)
             return None
-        if len(text) < GROUP_JUDGE_MIN_CHARS:
+
+        recent = list(history[key])[-GROUP_JUDGE_RECENT_TURNS:]
+        in_the_exchange = any(h["role"] == "model" for h in recent)
+
+        # A three-word jab right after he spoke is almost certainly aimed at
+        # him - "дурак", "ну и бот", "заткнись". Those are exactly the messages
+        # the length floor would throw away, so it only applies to a room he is
+        # not part of.
+        if len(text) < GROUP_JUDGE_MIN_CHARS and not in_the_exchange:
             return None
-        if not GROUP_JOIN_TOPICS:
-            # No name, and he has not been part of the last few lines - nobody
-            # can be referring to him, so there is nothing for the judge to weigh.
-            recent = list(history[key])[-GROUP_JUDGE_RECENT_TURNS:]
-            if not any(h["role"] == "model" for h in recent):
-                return None
+        if not GROUP_JOIN_TOPICS and not in_the_exchange:
+            # Nobody can be referring to a man who is not in the conversation.
+            return None
 
     if not judge_budget_ok(key):
         log.info("%s | judge budget spent for this minute", key)
@@ -1968,16 +2011,16 @@ def status_report() -> str:
     lines = [
         f"locked to owner: {OWNER_ID or 'NO - anyone can use this bot'}",
         f"group trigger: {GROUP_TRIGGER}"
+        + (f" via {judge_model()}" if GROUP_TRIGGER == "context" else "")
         + (", may join topics" if GROUP_JOIN_TOPICS else ", only when addressed"),
         "parked: " + (", ".join(
             f"{p.name} ({int(p.parked_until - time.time())}s)"
-            for p in PROVIDERS if p.parked) or "none")
-        + (f" via {judge_model()}" if GROUP_TRIGGER == "context" else ""),
+            for p in PROVIDERS if p.parked) or "none"),
         "group messages: " + (
-            "all visible, keywords work"
+            "all visible"
             if BOT_SEES_ALL_GROUP_MESSAGES
-            else "PRIVACY MODE ON - only mentions and replies arrive, "
-                 "keywords cannot fire (see /setprivacy in BotFather)"
+            else "PRIVACY MODE ON - only mentions and replies arrive, so he "
+                 "cannot see jabs or topics (see /setprivacy in BotFather)"
         ),
         "providers: " + ", ".join(
             f"{p.name}/{GEMINI_MODEL if p.name == 'gemini' else p.model}"
