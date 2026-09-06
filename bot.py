@@ -47,6 +47,16 @@ MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "4000"))
 # Telegram holds updates for ~24h and delivers the lot when the bot wakes up.
 MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE", "3600"))
 
+# Gemini generation settings. maxOutputTokens covers thinking AND the answer,
+# so keep it comfortably above what a short reply needs.
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "2048"))
+GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "45"))
+
+# "minimal" | "low" | "medium" | "high", or empty to let the model decide.
+# A one-line chat reply does not need deep reasoning; low keeps it fast.
+THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
+
 # Optional: comma-separated Telegram user IDs that are never auto-answered.
 IGNORE_USER_IDS = {
     int(x) for x in os.environ.get("IGNORE_USER_IDS", "").replace(" ", "").split(",") if x
@@ -226,54 +236,98 @@ def pick_working_model() -> str:
 
 
 def ask_gemini(key: str, user_text: str) -> Optional[str]:
-    """Send the chat history plus the new message to Gemini, return the reply."""
+    """Send the chat history plus the new message to Gemini, return the reply.
+
+    Gemini 3 models think by default, and maxOutputTokens caps thinking AND
+    the visible answer together. Left alone, the model spends the whole budget
+    reasoning and hands back a candidate with no text at all. A short chat reply
+    needs no deep reasoning, so we ask for the lowest thinking level and keep a
+    budget large enough that it can never be starved.
+    """
     contents: List[dict] = [
         {"role": h["role"], "parts": [{"text": h["text"]}]} for h in history[key]
     ]
     contents.append({"role": "user", "parts": [{"text": user_text}]})
 
-    body = {
-        "system_instruction": {"parts": [{"text": PERSONA + SYSTEM_SUFFIX}]},
-        "contents": contents,
-        "generationConfig": {
-            "temperature": float(os.environ.get("TEMPERATURE", "1.0")),
-            "maxOutputTokens": int(os.environ.get("MAX_OUTPUT_TOKENS", "800")),
-        },
-    }
-
     url = f"{GEMINI_API}/models/{GEMINI_MODEL}:generateContent"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
 
+    def build(thinking: bool, max_tokens: int) -> dict:
+        gen: Dict[str, Any] = {
+            "temperature": TEMPERATURE,
+            "maxOutputTokens": max_tokens,
+        }
+        if thinking and THINKING_LEVEL:
+            gen["thinkingLevel"] = THINKING_LEVEL
+        return {
+            "system_instruction": {"parts": [{"text": PERSONA + SYSTEM_SUFFIX}]},
+            "contents": contents,
+            "generationConfig": gen,
+        }
+
+    use_thinking = bool(THINKING_LEVEL)
+    max_tokens = MAX_OUTPUT_TOKENS
+
     for attempt in range(4):
+        started = time.time()
         try:
-            r = session.post(url, headers=headers, json=body, timeout=90)
+            r = session.post(
+                url, headers=headers, json=build(use_thinking, max_tokens),
+                timeout=GEMINI_TIMEOUT,
+            )
         except Exception as exc:
-            log.warning("gemini request failed: %s", exc)
+            log.warning("  -> gemini failed after %.0fs: %s", time.time() - started, exc)
             time.sleep(2 ** attempt)
             continue
+
+        elapsed = time.time() - started
 
         if r.status_code == 200:
             data = r.json()
             cands = data.get("candidates") or []
             if not cands:
-                log.warning("gemini returned no candidates: %s", data.get("promptFeedback"))
+                log.warning("  -> gemini: no candidates (%s)", data.get("promptFeedback"))
                 return None
-            parts = (cands[0].get("content") or {}).get("parts") or []
-            # Thinking models can emit internal "thought" parts - skip those.
-            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-            return text.strip() or None
+            cand = cands[0]
+            parts = (cand.get("content") or {}).get("parts") or []
+            # Thinking models emit internal "thought" parts - skip those.
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+            if text:
+                log.info("  -> gemini 200 in %.1fs, %d chars", elapsed, len(text))
+                return text
+
+            reason = cand.get("finishReason")
+            usage = data.get("usageMetadata") or {}
+            log.warning(
+                "  -> gemini 200 in %.1fs but no text (finishReason=%s, thoughts=%s tokens)",
+                elapsed, reason, usage.get("thoughtsTokenCount"),
+            )
+            # Budget was eaten by reasoning: retry once, thinking off, bigger cap.
+            if reason == "MAX_TOKENS" and (use_thinking or max_tokens < 4096):
+                use_thinking = False
+                max_tokens = max(max_tokens, 4096)
+                log.info("  -> retrying with thinking off and %d tokens", max_tokens)
+                continue
+            return None
+
+        # Some models reject thinkingLevel outright - drop it and try again.
+        if r.status_code == 400 and use_thinking and "think" in r.text.lower():
+            log.warning("  -> model rejected thinkingLevel, retrying without it")
+            use_thinking = False
+            continue
 
         if r.status_code == 429:  # free-tier rate limit
             wait = 5 * (attempt + 1) + random.random()
-            log.warning("gemini rate limited, retrying in %.1fs", wait)
+            log.warning("  -> gemini rate limited, retrying in %.1fs", wait)
             time.sleep(wait)
             continue
 
         if r.status_code in (500, 502, 503, 504):
+            log.warning("  -> gemini %s, retrying", r.status_code)
             time.sleep(2 ** attempt)
             continue
 
-        log.error("gemini %s: %s", r.status_code, r.text[:400])
+        log.error("  -> gemini %s: %s", r.status_code, r.text[:400])
         return None
 
     return None

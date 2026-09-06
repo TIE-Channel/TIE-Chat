@@ -158,7 +158,9 @@ Other knobs, all optional (see `.env.example`):
 | `IGNORE_USER_IDS` | — | user IDs that never get an auto-reply |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |
-| `MAX_OUTPUT_TOKENS` | `800` | reply length ceiling |
+| `MAX_OUTPUT_TOKENS` | `2048` | covers thinking **and** the answer — below ~1024 Gemini 3 returns nothing |
+| `GEMINI_THINKING_LEVEL` | `low` | `minimal`/`low`/`medium`/`high`, or empty for the model default |
+| `GEMINI_TIMEOUT` | `45` | seconds before a Gemini call is abandoned and retried |
 
 ---
 
@@ -196,6 +198,8 @@ Other knobs, all optional (see `.env.example`):
 | `no reply rights` in the log | "Reply to messages" toggle off in Telegram Business settings |
 | No `business_message` updates at all | Chat is excluded in the Chatbots screen, or account has no Premium |
 | `gemini 404` | Model name not available to your key — run `list_models.py` |
+| Log stops at `-> answering...`, no reply | Gemini call hanging or starved. Check `MAX_OUTPUT_TOKENS` ≥ 1024 and `GEMINI_THINKING_LEVEL=low` |
+| `gemini 200 … but no text (finishReason=MAX_TOKENS)` | Thinking ate the whole budget. The bot retries automatically; raise `MAX_OUTPUT_TOKENS` if it persists |
 | Duplicate replies | Two copies of the bot running on one token |
 | Render: "no open ports detected" | Instance type or start command wrong — it must be a Web Service running `python bot.py` |
 | Render: bot answers, then goes quiet after ~15 min | Free Web Service spun down. Add an uptime pinger |
