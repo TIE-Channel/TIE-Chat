@@ -157,6 +157,12 @@ Other knobs, all optional (see `.env.example`):
 | `REPLY_COOLDOWN` | `2` | seconds between replies in one chat |
 | `IGNORE_USER_IDS` | — | user IDs that never get an auto-reply |
 | `QUOTE_REPLIES` | `false` | `true` makes replies quote the customer's message instead of arriving as plain ones |
+| `READ_MIN` / `READ_MAX` | `3` / `12` | silent pause before the typing indicator appears — picking up and unlocking the phone |
+| `READ_CPS` | `25` | reading speed, chars/second, added to that pause based on the incoming message |
+| `READ_CAP` | `40` | hard ceiling on the silent pause |
+| `TYPING_CPS` | `8` | typing speed in characters/second — lower means a longer, more deliberate pause |
+| `TYPING_MIN` / `TYPING_MAX` | `2` / `25` | floor and ceiling on that pause, in seconds |
+| `WORKERS` | `4` | chats answered in parallel; `1` turns threading off |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |
 | `MAX_OUTPUT_TOKENS` | `2048` | covers thinking **and** the answer — below ~1024 Gemini 3 returns nothing |

@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Deque, Dict, List, Optional
 
@@ -69,6 +70,23 @@ IGNORE_USER_IDS = {
 
 # Timezone the persona lives in - used to tell the model today's date.
 BOT_TZ = os.environ.get("BOT_TZ", "Europe/Berlin").strip()
+
+# Before typing starts: the phone is face down somewhere, it has to be picked
+# up, unlocked, and the message read. Nothing shows in the chat during this.
+READ_MIN = float(os.environ.get("READ_MIN", "3"))         # fastest pickup
+READ_MAX = float(os.environ.get("READ_MAX", "12"))        # slowest pickup
+READ_CPS = float(os.environ.get("READ_CPS", "25"))        # reading speed, chars/sec
+READ_CAP = float(os.environ.get("READ_CAP", "40"))        # hard ceiling
+
+# Typing simulation. An instant reply is the single most obvious tell, so the
+# bot spends roughly as long "typing" as a person would need for that text.
+TYPING_CPS = float(os.environ.get("TYPING_CPS", "8"))     # characters per second
+TYPING_MIN = float(os.environ.get("TYPING_MIN", "2"))     # never faster than this
+TYPING_MAX = float(os.environ.get("TYPING_MAX", "25"))    # never slower than this
+
+# Messages are handled in parallel so one chat's typing pause doesn't stall
+# every other conversation.
+WORKERS = int(os.environ.get("WORKERS", "4"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
@@ -194,6 +212,17 @@ PRIMARY_MODEL = GEMINI_MODEL
 PINNED_UNTIL = 0.0
 FALLBACK_MINUTES = int(os.environ.get("FALLBACK_MINUTES", "15"))
 
+EXECUTOR = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="reply")
+ASYNC_REPLIES = WORKERS > 1
+
+_chat_locks: Dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def chat_lock(key: str) -> threading.Lock:
+    with _locks_guard:
+        return _chat_locks.setdefault(key, threading.Lock())
+
 session = requests.Session()
 session.headers["User-Agent"] = "tg-business-ai/1.0"
 
@@ -247,6 +276,57 @@ def remember_connection(conn: dict) -> None:
         "business connection %s owner=%s enabled=%s can_reply=%s",
         cid, owner_of_connection.get(cid), conn.get("is_enabled", True), can_reply.get(cid),
     )
+
+
+class Typing:
+    """Keeps "Ilya is typing..." lit for as long as the block runs.
+
+    Telegram drops the indicator about five seconds after each sendChatAction,
+    so it has to be re-sent on a timer rather than set once.
+    """
+
+    def __init__(self, connection_id: str, chat_id: int) -> None:
+        self.connection_id = connection_id
+        self.chat_id = chat_id
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _pump(self) -> None:
+        while True:
+            tg(
+                "sendChatAction",
+                business_connection_id=self.connection_id,
+                chat_id=self.chat_id,
+                action="typing",
+            )
+            if self._stop.wait(4.0):  # re-arm before Telegram's ~5s timeout
+                return
+
+    def __enter__(self) -> "Typing":
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+
+def read_delay(incoming: str) -> float:
+    """Time before the typing indicator appears at all: reaching the phone,
+    unlocking it, and reading what arrived. A longer message takes longer."""
+    pickup = random.uniform(READ_MIN, READ_MAX)
+    reading = len(incoming) / max(READ_CPS, 1.0)
+    return min(pickup + reading, READ_CAP)
+
+
+def typing_delay(text: str, already_spent: float) -> float:
+    """How much longer to keep typing, given the time already burned."""
+    seconds = len(text) / max(TYPING_CPS, 0.5)
+    seconds *= random.uniform(0.85, 1.2)          # nobody types at a constant rate
+    seconds = max(TYPING_MIN, min(seconds, TYPING_MAX))
+    return max(0.0, seconds - already_spent)
 
 
 def send_reply(connection_id: str, chat_id: int, text: str, reply_to: Optional[int]) -> None:
@@ -522,18 +602,54 @@ def handle_business_message(msg: dict) -> None:
     user_text = text[:MAX_INPUT_CHARS]
     log.info("  -> answering...")
 
-    tg("sendChatAction", business_connection_id=connection_id, chat_id=chat_id, action="typing")
-
+    # Generate first, while the chat still looks untouched - as far as the other
+    # side is concerned the phone is still face down on a table somewhere.
+    started = time.time()
     answer = ask_gemini(key, user_text)
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
+
+    # Pick up the phone, unlock it, read the message. Nothing shows yet.
+    pause = read_delay(user_text) - (time.time() - started)
+    if pause > 0:
+        log.info("  -> noticing the message in %.1fs", pause)
+        time.sleep(pause)
+
+    # Only now does the indicator light up, and it stays lit until the message
+    # actually lands.
+    with Typing(connection_id, chat_id):
+        pause = typing_delay(answer, 0.0)
+        log.info("  -> typing %.1fs for %d chars", pause, len(answer))
+        time.sleep(pause)
 
     history[key].append({"role": "user", "text": user_text})
     history[key].append({"role": "model", "text": answer})
 
     send_reply(connection_id, chat_id, answer, msg.get("message_id"))
     log.info("  -> replied: %r", answer[:60])
+
+
+def dispatch_business_message(msg: dict) -> None:
+    """Answer in a worker thread, but keep each chat strictly in order.
+
+    A reply now takes ten to twenty seconds of deliberate typing. Doing that on
+    the polling thread would freeze every other conversation for the duration.
+    """
+    chat = msg.get("chat") or {}
+    key = f"{msg.get('business_connection_id')}:{chat.get('id')}"
+
+    def run() -> None:
+        with chat_lock(key):
+            try:
+                handle_business_message(msg)
+            except Exception:
+                log.exception("error answering chat %s", chat.get("id"))
+
+    if ASYNC_REPLIES:
+        EXECUTOR.submit(run)
+    else:
+        run()
 
 
 def status_report() -> str:
@@ -558,7 +674,7 @@ def handle_update(update: dict) -> None:
         remember_connection(update["business_connection"])
         return
     if "business_message" in update:
-        handle_business_message(update["business_message"])
+        dispatch_business_message(update["business_message"])
         return
     if "edited_business_message" in update:
         log.info("edited business message, ignored")
