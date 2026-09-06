@@ -115,36 +115,45 @@ GROUP_ALLOWLIST = {
     int(x) for x in os.environ.get("GROUP_ALLOWLIST", "").replace(" ", "").split(",") if x
 }
 
-# Subjects Ilya cannot let pass without comment. Russian stems are matched with
-# a short suffix allowance so "бот" also catches "боты", "боту", "ботами" -
-# but not "ботинок". Override the whole list with GROUP_KEYWORDS.
-DEFAULT_KEYWORDS = (
-    # боты и ИИ
-    "бот,чатбот,нейросет,нейронк,искусственный интеллект,ии,машинное обучение,"
-    "алгоритм,робот,ассистент,подписк,"
-    # современные технологии
-    "технолог,гаджет,смартфон,айфон,цифров,автоматизац,приложух,облак,"
-    "интернет,соцсет,умный дом,электромобил,"
-    # ретро и ностальгия
-    "ретро,винтаж,ностальг,девяност,восьмидесят,нулев,кассет,пластинк,винил,"
-    "дискет,плёнк,пленк,аналогов,ламповый,старая школа,раньше было,"
-    # English
-    "bot,chatbot,ai,artificial intelligence,neural,machine learning,algorithm,"
-    "robot,assistant,subscription,tech,technology,gadget,smartphone,iphone,"
-    "digital,automation,app,cloud,internet,social media,smart home,"
-    "retro,vintage,nostalgia,nostalgic,nineties,eighties,cassette,vinyl,"
-    "floppy,analog,analogue,old school,back in the day"
+# Names people call him by in the room. Not topic keywords - these are forms of
+# address, so exact words only: "бот" matches, "ботинок" does not. Being called
+# by name skips the cooldown and is handed to the judge as a strong signal,
+# because "бот, расскажи анекдот" and "нам нужен бот для склада" look alike to
+# a regex and nothing alike to a reader.
+DEFAULT_NAMES = (
+    "илья,ильи,илье,илью,ильей,ильёй,ильюша,илюха,илюху,илюхе,ilya,"
+    "бот,бота,боту,боте,ботом,боты,bot"
 )
-GROUP_KEYWORDS = [
-    k.strip().lower()
-    for k in os.environ.get("GROUP_KEYWORDS", DEFAULT_KEYWORDS).split(",")
-    if k.strip()
+GROUP_NAMES = [
+    n.strip().lower()
+    for n in os.environ.get("GROUP_NAMES", DEFAULT_NAMES).split(",")
+    if n.strip()
 ]
 
-# Butting in on a keyword is capped separately: without this the bot would
-# comment on every third line in a group that talks about tech all day.
-# Being @mentioned or replied to ignores this cap.
-GROUP_KEYWORD_COOLDOWN = float(os.environ.get("GROUP_KEYWORD_COOLDOWN", "60"))
+# How he decides to speak up in a group:
+#   context - a cheap second model reads the last few lines and judges whether
+#             he would naturally jump in
+#   all     - every single message
+GROUP_TRIGGER = os.environ.get("GROUP_TRIGGER", "context").strip().lower()
+if GROUP_TRIGGER == "keywords":       # retired - the judge does this better
+    GROUP_TRIGGER = "context"
+
+# The judge runs on its own model - a lite one is plenty and has its own quota.
+GROUP_JUDGE_MODEL = os.environ.get("GROUP_JUDGE_MODEL", "").strip()
+GROUP_JUDGE_TURNS = int(os.environ.get("GROUP_JUDGE_TURNS", "12"))
+# Don't spend a call judging "ок", "+1" or a sticker caption.
+GROUP_JUDGE_MIN_CHARS = int(os.environ.get("GROUP_JUDGE_MIN_CHARS", "10"))
+# Hard ceiling on judge calls per group per minute, so a busy chat cannot
+# quietly drain the free tier.
+GROUP_JUDGE_MAX_PER_MIN = int(os.environ.get("GROUP_JUDGE_MAX_PER_MIN", "8"))
+
+# Uninvited interjections are capped: without this he would comment on every
+# third line. Being @mentioned, replied to, or called by name ignores this.
+GROUP_COOLDOWN = float(
+    os.environ.get("GROUP_COOLDOWN")
+    or os.environ.get("GROUP_KEYWORD_COOLDOWN")   # previous name, still honoured
+    or "60"
+)
 
 # Groups get the reply straight away. The read/typing simulation belongs to a
 # 1:1 chat, where somebody is plainly answering you; in a room a 25-second
@@ -163,9 +172,15 @@ help you today?" - nobody talks like that.
 
 WHO YOU ARE
 Your name is Ilya. You were born on 30 December 1980. You live in Dresden. \
-Your wife is Katya. These are just facts about your life: say them plainly if \
-someone asks, never recite them unprompted, and never volunteer more detail \
-than the question needed.
+Your wife is Katya.
+
+Treat all of that as background, not as material. It exists so you can answer \
+if someone asks you directly - then you answer plainly and briefly and move \
+on. Otherwise it never appears. Do not work your age, your city or your wife \
+into a joke, a comparison, an aside or a sign-off. Do not reach for "at \
+forty-five", "here in Dresden", "my wife says" - a man does not narrate his \
+own biography to people who already know him. If a line of yours only works \
+because it mentions one of these, it is the wrong line: write a different one.
 
 FORMAT - THIS ONE IS STRICT
 Answer in ONE line. One sentence, occasionally two short ones. No paragraphs, \
@@ -189,7 +204,8 @@ How you get the laugh:
 - Escalate once. Never twice - the second escalation kills it.
 - Put the sharpest word at the END of the line. Land on it and stop.
 - Be specific. "Bureaucracy" is not funny; a form that asks for your mother's \
-maiden name in triplicate is.
+maiden name in triplicate is. Take that specificity from the thing being \
+discussed and from the world at large - never from your own biography.
 
 Never explain the joke, never signal it, never soften it afterwards. No \
 "haha", no winking, no emoji. Deadpan means you say it like it is just true.
@@ -238,7 +254,9 @@ def now_line() -> str:
         now = datetime.now(ZoneInfo(BOT_TZ))
     except Exception:
         now = datetime.now()
-    return f"\nRight now it is {now:%A, %d %B %Y, %H:%M} in {BOT_TZ}.\n"
+    # Deliberately no city or timezone name here - naming the place invites the
+    # model to keep bringing the place up.
+    return f"\nRight now it is {now:%A, %d %B %Y, %H:%M} where you are.\n"
 
 
 logging.basicConfig(
@@ -264,8 +282,11 @@ can_reply: Dict[str, bool] = {}
 
 last_reply_at: Dict[str, float] = {}
 
-# Separate clock for unprompted keyword interjections in groups.
-last_keyword_reply: Dict[str, float] = {}
+# Clock for uninvited interjections in groups (keyword or context alike).
+last_interjection: Dict[str, float] = {}
+
+# Judge calls per group in the last minute, for the budget guard.
+judge_calls: Dict[str, Deque[float]] = defaultdict(deque)
 
 # chat_id -> (is one of ours, when we checked)
 group_ok_cache: Dict[int, tuple] = {}
@@ -831,30 +852,17 @@ def display_name(user: dict) -> str:
     return name or user.get("username") or f"user{user.get('id')}"
 
 
-def _compile_keywords(words: List[str]) -> List[tuple]:
-    """Build one regex per keyword, tolerant of Russian word endings."""
-    out = []
-    for w in words:
-        parts = []
-        for token in w.split():
-            esc = re.escape(token)
-            if re.search(r"[а-яё]", token):
-                # Russian inflects: allow a short ending, but not a whole new word.
-                parts.append(esc + (r"[а-яё]{0,3}" if len(token) >= 3 else ""))
-            else:
-                parts.append(esc + r"(?:e?s)?")
-        out.append((w, re.compile(r"\b" + r"\s+".join(parts) + r"\b", re.I | re.U)))
-    return out
+NAME_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(n) for n in GROUP_NAMES) + r")\b", re.I | re.U
+) if GROUP_NAMES else None
 
 
-KEYWORD_PATTERNS = _compile_keywords(GROUP_KEYWORDS)
-
-
-def matched_keyword(text: str) -> Optional[str]:
-    for word, pattern in KEYWORD_PATTERNS:
-        if pattern.search(text):
-            return word
-    return None
+def called_by_name(text: str) -> Optional[str]:
+    """Did somebody use one of his names? Exact words only, no stemming."""
+    if not NAME_PATTERN:
+        return None
+    m = NAME_PATTERN.search(text)
+    return m.group(0) if m else None
 
 
 def group_allowed(chat_id: int) -> bool:
@@ -884,29 +892,184 @@ def group_allowed(chat_id: int) -> bool:
     return ok
 
 
+JUDGE_PROMPT = """\
+You decide one thing: whether Ilya should say something in this group chat \
+right now. Nothing else.
+
+Ilya is a member of this group. Forty-five, lives in Dresden, dry and \
+sardonic, strong opinions about technology, AI, bots, and how much better \
+things supposedly used to be. He is not a helper and not an assistant - he is \
+a guy in a chat who talks when he actually has something to say.
+
+You are given the last lines of the conversation, oldest first, each labelled \
+with who said it. Ilya's own lines are labelled "Ilya".
+
+Somebody may have used one of his names in the last line - Ilya, Ilyusha, or \
+simply "bot", which is what people in this group call him. If they are \
+ADDRESSING him with it, he answers: that is being spoken to, and ignoring it \
+is rude. But the same words also come up when people are merely talking ABOUT \
+bots, or about some other Ilya, and then it is not his cue. Read which one it \
+is; the note under the transcript tells you a name was used, not that he was \
+addressed.
+
+He speaks up when:
+- somebody asks something he plausibly has an answer or an opinion about;
+- the talk touches his subjects - technology, AI, bots, gadgets, progress, \
+retro, nostalgia, the way things used to be done;
+- somebody says something sweeping, wrong, or begging to be punctured;
+- the room is joking and a good line would land;
+- he is clearly being talked about or invited in.
+
+He stays quiet when:
+- two people are settling something private, practical or logistical;
+- it is greetings, thanks, one-word noise, stickers, links without comment;
+- the subject is serious, sad, medical, financial or otherwise sensitive;
+- the last line closes a thought and invites nothing;
+- he already made this point in the recent lines - repeating it is worse than \
+silence;
+- he spoke very recently and nothing new has been put to him.
+
+When genuinely unsure, stay quiet. Somebody who comments on everything is \
+exhausting, and silence costs nothing.
+"""
+
+JUDGE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "speak": {"type": "BOOLEAN"},
+        "reason": {"type": "STRING"},
+    },
+    "required": ["speak", "reason"],
+}
+
+
+def judge_model() -> str:
+    """A light model for the gate - it is a yes/no, not an essay."""
+    if GROUP_JUDGE_MODEL:
+        return GROUP_JUDGE_MODEL
+    for m in MODEL_CANDIDATES:
+        if "lite" in m:
+            return m
+    return GEMINI_MODEL
+
+
+def judge_budget_ok(key: str) -> bool:
+    now = time.time()
+    calls = judge_calls[key]
+    while calls and now - calls[0] > 60:
+        calls.popleft()
+    if len(calls) >= GROUP_JUDGE_MAX_PER_MIN:
+        return False
+    calls.append(now)
+    return True
+
+
+def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) -> Optional[str]:
+    """Ask a cheap model whether Ilya would naturally jump in right now.
+
+    Returns the reason to speak, "" when the judge says stay quiet, and None
+    when the call itself failed (so the caller can fall back to keywords).
+    """
+    lines = [h["text"] if h["role"] == "user" else f"Ilya: {h['text']}"
+             for h in list(history[key])[-GROUP_JUDGE_TURNS:]]
+    transcript = "\n".join(lines)
+    note = ""
+    if name_used:
+        note = (f'The last line contains the word "{name_used}". Decide whether '
+                f"it is addressed to Ilya or merely mentions it.\n")
+    question = (
+        f"{transcript}\n\n---\n"
+        f"{note}"
+        f"Ilya last said something here {int(quiet_for)} seconds ago.\n"
+        f"Should he say something now?"
+    )
+
+    model = judge_model()
+    url = f"{GEMINI_API}/models/{model}:generateContent"
+    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+
+    def body(thinking: bool) -> dict:
+        gen: Dict[str, Any] = {
+            "temperature": 0.2,
+            "maxOutputTokens": 1024,
+            "responseMimeType": "application/json",
+            "responseSchema": JUDGE_SCHEMA,
+        }
+        if thinking:
+            gen["thinkingConfig"] = {"thinkingLevel": "low"}
+        return {
+            "system_instruction": {"parts": [{"text": JUDGE_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": question}]}],
+            "generationConfig": gen,
+        }
+
+    for thinking in (True, False):
+        try:
+            r = session.post(url, headers=headers, json=body(thinking), timeout=20)
+        except Exception as exc:
+            log.warning("  judge call failed: %s", exc)
+            return None
+        if r.status_code == 400 and thinking and "think" in r.text.lower():
+            continue
+        if r.status_code != 200:
+            log.warning("  judge %s: %s", r.status_code, r.text[:120].replace("\n", " "))
+            return None
+        try:
+            parts = (r.json()["candidates"][0].get("content") or {}).get("parts") or []
+            raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            verdict = json.loads(raw)
+        except Exception as exc:
+            log.warning("  judge gave unusable output: %s", exc)
+            return None
+        reason = str(verdict.get("reason", ""))[:80]
+        if verdict.get("speak"):
+            return f"context: {reason}"
+        log.info("  staying quiet - %s", reason)
+        return ""
+    return None
+
+
 def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
     """Why we should speak up in this group, or None to stay quiet."""
-    if GROUP_REPLY_ALL:
+    if GROUP_REPLY_ALL or GROUP_TRIGGER == "all":
         return "reply-all is on"
 
+    # Being spoken to directly always wins - no judging, no cooldown.
     replied = msg.get("reply_to_message") or {}
     if (replied.get("from") or {}).get("id") == BOT_ID:
         return "replying to us"
     if BOT_USERNAME and f"@{BOT_USERNAME}".lower() in text.lower():
         return "mentioned"
 
-    word = matched_keyword(text)
-    if word:
-        since = time.time() - last_keyword_reply.get(key, 0)
-        if since < GROUP_KEYWORD_COOLDOWN:
-            log.info(
-                "%s | keyword %r - staying quiet, last interjection was %.0fs ago "
-                "(GROUP_KEYWORD_COOLDOWN=%.0fs)",
-                key, word, since, GROUP_KEYWORD_COOLDOWN,
-            )
+    # Being called by name is close enough to being spoken to that it skips the
+    # cooldown and the length floor - but the judge still decides, because
+    # "бот, расскажи анекдот" and "нам нужен бот для склада" look identical to
+    # a regex.
+    name = called_by_name(text)
+
+    since = time.time() - last_interjection.get(key, 0)
+    if not name:
+        if since < GROUP_COOLDOWN:
+            log.info("%s | said something %.0fs ago, staying out of it "
+                     "(GROUP_COOLDOWN=%.0fs)", key, since, GROUP_COOLDOWN)
             return None
-        return f"keyword {word!r}"
-    return None
+        if len(text) < GROUP_JUDGE_MIN_CHARS:
+            return None
+
+    if not judge_budget_ok(key):
+        log.info("%s | judge budget spent for this minute", key)
+        return None
+
+    verdict = should_speak(key, since, name)
+    if verdict:
+        return verdict
+    if verdict == "":
+        return None                      # the judge deliberately said no
+    # None means the call itself failed. Without a judge the only safe rule is:
+    # answer if he was called by name, otherwise keep out of it.
+    log.info("%s | judge unavailable, %s", key,
+             "answering because a name was used" if name else "staying quiet")
+    return f"called {name!r} (judge unavailable)" if name else None
 
 
 def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) -> None:
@@ -961,8 +1124,8 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     history[key].append({"role": "model", "text": answer})
     last_reply_at[key] = time.time()
-    if reason.startswith("keyword"):
-        last_keyword_reply[key] = time.time()
+    if not reason.startswith(("mentioned", "replying")):
+        last_interjection[key] = time.time()
 
 
 def dispatch_group_message(msg: dict) -> None:
@@ -1021,6 +1184,8 @@ def dispatch_business_message(msg: dict) -> None:
 def status_report() -> str:
     lines = [
         f"locked to owner: {OWNER_ID or 'NO - anyone can use this bot'}",
+        f"group trigger: {GROUP_TRIGGER}"
+        + (f" via {judge_model()}" if GROUP_TRIGGER == "context" else ""),
         "group messages: " + (
             "all visible, keywords work"
             if BOT_SEES_ALL_GROUP_MESSAGES
@@ -1183,6 +1348,8 @@ def main() -> None:
             "your Telegram user id.", BOT_USERNAME,
         )
     if GROUPS_ENABLED:
+        log.info("group trigger mode: %s%s", GROUP_TRIGGER,
+                 f" (judge: {judge_model()})" if GROUP_TRIGGER == "context" else "")
         # Telegram only delivers ordinary group messages to a bot whose privacy
         # mode is off. Without that the bot literally never sees the text, so
         # keyword triggers and reply-all cannot fire - and nothing appears in
