@@ -107,6 +107,13 @@ large ones. The first model that answers is kept for the session and logged:
    (set GROQ_MODEL to keep it)
 ```
 
+**A provider that keeps failing gets parked.** Three failures in a row and it
+is skipped entirely for ten minutes (`PARK_AFTER_FAILURES`, `PARK_MINUTES`) —
+an exhausted daily quota does not recover in a minute, and trying it first on
+every message costs a wasted round trip each time. It is retried automatically
+when the parking expires, and `/check` always tests everyone and revives
+whoever recovered. `/status` shows who is parked and for how long.
+
 When a backup exists, Gemini stops retrying almost immediately — switching
 costs half a second, waiting out a backoff costs the customer. The group judge
 uses the same chain, so it survives an outage too. `/status` lists the live

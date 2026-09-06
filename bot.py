@@ -187,11 +187,31 @@ GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 # --------------------------------------------------------------------------
 
 class Provider:
-    __slots__ = ("name", "base", "key", "model", "searched")
+    __slots__ = ("name", "base", "key", "model", "searched", "fails", "parked_until")
 
     def __init__(self, name: str, base: str, key: str, model: str) -> None:
         self.name, self.base, self.key, self.model = name, base, key, model
         self.searched = False        # have we already hunted for a live model?
+        self.fails = 0               # consecutive failures
+        self.parked_until = 0.0      # skip it entirely until this time
+
+    def park(self) -> None:
+        """Stop trying a provider that keeps failing - for a while."""
+        self.fails += 1
+        if self.fails >= PARK_AFTER_FAILURES:
+            self.parked_until = time.time() + PARK_MINUTES * 60
+            log.warning("  -> parking %s for %d min after %d failures in a row",
+                        self.name, PARK_MINUTES, self.fails)
+
+    def revive(self) -> None:
+        if self.fails:
+            log.info("  -> %s is answering again", self.name)
+        self.fails = 0
+        self.parked_until = 0.0
+
+    @property
+    def parked(self) -> bool:
+        return time.time() < self.parked_until
 
     def __repr__(self) -> str:
         return f"{self.name}({self.model})"
@@ -218,6 +238,12 @@ PROVIDER_CATALOGUE = {
 }
 
 RETIRED = {"github": "GitHub Models was retired on 30 July 2026"}
+
+# An exhausted daily quota does not recover in a minute, and trying it first on
+# every single message costs a round trip each time. After this many failures
+# in a row a provider is skipped for a while, then given another chance.
+PARK_AFTER_FAILURES = int(os.environ.get("PARK_AFTER_FAILURES", "3"))
+PARK_MINUTES = int(os.environ.get("PARK_MINUTES", "10"))
 
 AI_ORDER = [
     n.strip().lower()
@@ -840,7 +866,13 @@ def ask_ai(
         return None
 
     system = PERSONA + SYSTEM_SUFFIX + extra_system + now_line()
-    for p in PROVIDERS:
+    live = [p for p in PROVIDERS if not p.parked]
+    if not live:                       # everyone is parked - try them anyway
+        live = PROVIDERS
+        for p in live:
+            p.parked_until = 0.0
+
+    for p in live:
         if cancel is not None and cancel.is_set():
             return None
         if p.name == "gemini":
@@ -849,9 +881,11 @@ def ask_ai(
             text = openai_chat(p, system, openai_turns(key, user_text),
                                MAX_OUTPUT_TOKENS)
         if text:
-            if p is not PROVIDERS[0]:
+            p.revive()
+            if p is not live[0]:
                 log.warning("  -> answered by %s (the ones before it were busy)", p.name)
             return text
+        p.park()
         log.warning("  -> %s could not answer, moving on", p.name)
     log.error("  -> every provider failed")
     return None
@@ -1297,7 +1331,7 @@ def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) ->
         f"Should he say something now?"
     )
 
-    for p in PROVIDERS:
+    for p in (x for x in PROVIDERS if not x.parked) or PROVIDERS:
         verdict = judge_via(p, question)
         if verdict is not None:
             reason = str(verdict.get("reason", ""))[:80]
@@ -1633,6 +1667,7 @@ def check_providers() -> str:
     for p in PROVIDERS:
         ok, detail, took = probe_provider(p)
         if ok:
+            p.revive()
             working += 1
             lines.append(f"OK    {p.name:<11} {detail}  ({took:.1f}s)")
         else:
@@ -1651,7 +1686,10 @@ def status_report() -> str:
     lines = [
         f"locked to owner: {OWNER_ID or 'NO - anyone can use this bot'}",
         f"group trigger: {GROUP_TRIGGER}"
-        + (", may join topics" if GROUP_JOIN_TOPICS else ", only when addressed")
+        + (", may join topics" if GROUP_JOIN_TOPICS else ", only when addressed"),
+        "parked: " + (", ".join(
+            f"{p.name} ({int(p.parked_until - time.time())}s)"
+            for p in PROVIDERS if p.parked) or "none")
         + (f" via {judge_model()}" if GROUP_TRIGGER == "context" else ""),
         "group messages: " + (
             "all visible, keywords work"
