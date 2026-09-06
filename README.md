@@ -139,16 +139,19 @@ Telegram Business only covers 1:1 chats. For a group the bot joins as an
 ordinary member, and posts under its own name (`@TieChat_bot`), not yours.
 
 1. Add the bot to the group like any other member.
-2. That's it. It reads everything and speaks up when:
+2. That's it. **He only speaks when the room involves him** — addressed, or
+   talked about. An interesting subject is not an invitation: a whole argument
+   about AI and cassette tapes goes past him in silence unless somebody brings
+   him into it.
+
+   Concretely, he answers when:
    - somebody **@mentions it**, or **replies to one of its messages** — these
      always go through, no judging and no cooldown;
    - somebody **calls him by name** — "Илья", "Илюха", or just "бот", which is
      what people in a group tend to call him;
-   - **the conversation itself calls for it.** A second, cheap model reads the
-     last dozen lines and decides whether Ilya would naturally jump in: someone
-     asked something he'd have an answer to, the talk drifted onto his subjects,
-     somebody said something begging to be punctured. It stays out of private
-     logistics, greetings, and anything serious or sad.
+   - **somebody is talking about him** — asking where he went, wondering why
+     he's quiet, referring to him in the third person, arguing with something
+     he said. A second, cheap model reads the last dozen lines and decides.
 
 There is no keyword list any more — the judge does that job better. A name in
 the text is not a trigger on its own either, it is a *signal handed to the
@@ -168,14 +171,16 @@ A newer message in a group does **not** cancel a reply in progress either —
 other people talking is the normal state of a room, not somebody correcting
 themselves. (In 1:1 chats it still does.)
 
-Uninvited interjections are capped at one per `GROUP_COOLDOWN` seconds (60 by
-default) so he doesn't monologue through a whole argument. Being mentioned,
-replied to, or called by name ignores that cap.
+There is no cooldown by default (`GROUP_COOLDOWN=0`) — there is nothing to
+ration when he only answers people who addressed him. Set it above zero if you
+want enforced silence between his replies anyway.
 
-**Cost control**, because the judge is a second API call per message: it never
-runs when he spoke within the cooldown, never on messages under
-`GROUP_JUDGE_MIN_CHARS`, never on mentions and replies, and never more than
-`GROUP_JUDGE_MAX_PER_MIN` times a minute per group. It also runs on a lite
+**Cost control**, because the judge is a second API call: it never runs on
+`@mentions` or replies (already unambiguous), never on messages under
+`GROUP_JUDGE_MIN_CHARS`, never more than `GROUP_JUDGE_MAX_PER_MIN` times a
+minute per group, and — the big one — never when the message has no name in it
+*and* he hasn't appeared in the last `GROUP_JUDGE_RECENT_TURNS` lines, since
+nobody can be referring to a man who isn't in the conversation. It also runs on a lite
 model with its own quota. In practice a busy group costs a handful of small
 calls a minute, not one per message.
 
@@ -255,7 +260,8 @@ Other knobs, all optional (see `.env.example`):
 | `GROUP_JUDGE_MIN_CHARS` | `10` | shorter messages are never judged |
 | `GROUP_JUDGE_MAX_PER_MIN` | `8` | ceiling on judge calls per group per minute |
 | `GROUP_NAMES` | built-in list | names he answers to; exact words, no stemming |
-| `GROUP_COOLDOWN` | `60` | seconds before he may butt in uninvited again |
+| `GROUP_COOLDOWN` | `0` | enforced silence between his group replies; 0 = none |
+| `GROUP_JUDGE_RECENT_TURNS` | `6` | how recently he must have spoken for an unnamed message to be judged |
 | `GROUP_DELAY` | `false` | `true` applies the 1:1 read/typing pauses in groups as well |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |

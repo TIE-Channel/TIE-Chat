@@ -147,13 +147,19 @@ GROUP_JUDGE_MIN_CHARS = int(os.environ.get("GROUP_JUDGE_MIN_CHARS", "10"))
 # quietly drain the free tier.
 GROUP_JUDGE_MAX_PER_MIN = int(os.environ.get("GROUP_JUDGE_MAX_PER_MIN", "8"))
 
-# Uninvited interjections are capped: without this he would comment on every
-# third line. Being @mentioned, replied to, or called by name ignores this.
+# Seconds of enforced silence after he speaks in a group. 0 = no cooldown at
+# all, which is the right default now that he only answers when the room is
+# actually talking to him or about him - there is nothing to ration.
 GROUP_COOLDOWN = float(
     os.environ.get("GROUP_COOLDOWN")
     or os.environ.get("GROUP_KEYWORD_COOLDOWN")   # previous name, still honoured
-    or "60"
+    or "0"
 )
+
+# When his name is not used, judge only if he is already part of this exchange:
+# somebody may be referring to him as "он", "ему", "he". If he has not appeared
+# in the last few lines, the conversation is not about him and needs no call.
+GROUP_JUDGE_RECENT_TURNS = int(os.environ.get("GROUP_JUDGE_RECENT_TURNS", "6"))
 
 # Groups get the reply straight away. The read/typing simulation belongs to a
 # 1:1 chat, where somebody is plainly answering you; in a room a 25-second
@@ -841,9 +847,9 @@ Here you may take room. Two or three sentences is normal, and a short riff is \
 fine when the subject deserves one - this is a conversation, not a support \
 desk. Still one paragraph, no line breaks, no lists, no headings, no emoji.
 
-Often nobody asked you anything: somebody merely said something you have an \
-opinion about. So come in as a person would - with the opinion, not with an \
-offer to help. Never ask whether they need assistance.
+You are only ever writing here because somebody addressed you or was talking \
+about you. Answer that - the person and the thing they actually said. Never \
+open with an offer to help and never ask whether they need assistance.
 """
 
 
@@ -912,25 +918,34 @@ bots, or about some other Ilya, and then it is not his cue. Read which one it \
 is; the note under the transcript tells you a name was used, not that he was \
 addressed.
 
-He speaks up when:
-- somebody asks something he plausibly has an answer or an opinion about;
-- the talk touches his subjects - technology, AI, bots, gadgets, progress, \
-retro, nostalgia, the way things used to be done;
-- somebody says something sweeping, wrong, or begging to be punctured;
-- the room is joking and a good line would land;
-- he is clearly being talked about or invited in.
+THE ONLY REASON HE SPEAKS IS THAT THE ROOM INVOLVED HIM.
+- Somebody addresses him: by name, or by aiming a question at him plainly \
+enough that everyone would read it as his to answer.
+- Somebody talks about him: asks where he went, wonders why he is quiet, \
+refers to him in the third person, quotes him, argues with something he said, \
+complains about him, or answers a point of his.
+- Somebody replies to a line of his and clearly expects something back.
 
-He stays quiet when:
+Otherwise he says nothing - and "otherwise" covers almost everything.
+
+In particular, an interesting subject is NOT an invitation. Technology, AI, \
+bots, retro, how things used to be done - he has opinions about all of it, and \
+none of that matters here. If nobody brought him into it, it is not his \
+conversation and he stays out of it.
+
+Stay quiet as well when:
+- one of his names appears but the talk is about bots or software in general, \
+or about a different Ilya, rather than to him or about him;
+- the mention of him is finished business - somebody thanked him, agreed, or \
+signed off, and nothing is being put to him;
 - two people are settling something private, practical or logistical;
-- it is greetings, thanks, one-word noise, stickers, links without comment;
+- it is greetings, one-word noise, stickers, links without comment;
 - the subject is serious, sad, medical, financial or otherwise sensitive;
-- the last line closes a thought and invites nothing;
 - he already made this point in the recent lines - repeating it is worse than \
-silence;
-- he spoke very recently and nothing new has been put to him.
+silence.
 
-When genuinely unsure, stay quiet. Somebody who comments on everything is \
-exhausting, and silence costs nothing.
+When genuinely unsure, stay quiet. Silence costs nothing; a man who inserts \
+himself into conversations that were not about him is exhausting.
 """
 
 JUDGE_SCHEMA = {
@@ -1041,19 +1056,23 @@ def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
     if BOT_USERNAME and f"@{BOT_USERNAME}".lower() in text.lower():
         return "mentioned"
 
-    # Being called by name is close enough to being spoken to that it skips the
-    # cooldown and the length floor - but the judge still decides, because
+    # A name skips every guard below - but the judge still decides, because
     # "бот, расскажи анекдот" and "нам нужен бот для склада" look identical to
-    # a regex.
+    # a regex and nothing alike to a reader.
     name = called_by_name(text)
 
     since = time.time() - last_interjection.get(key, 0)
     if not name:
-        if since < GROUP_COOLDOWN:
+        if GROUP_COOLDOWN and since < GROUP_COOLDOWN:
             log.info("%s | said something %.0fs ago, staying out of it "
                      "(GROUP_COOLDOWN=%.0fs)", key, since, GROUP_COOLDOWN)
             return None
         if len(text) < GROUP_JUDGE_MIN_CHARS:
+            return None
+        # No name, and he has not been part of the last few lines - then nobody
+        # can be referring to him, and there is nothing for the judge to weigh.
+        recent = list(history[key])[-GROUP_JUDGE_RECENT_TURNS:]
+        if not any(h["role"] == "model" for h in recent):
             return None
 
     if not judge_budget_ok(key):
