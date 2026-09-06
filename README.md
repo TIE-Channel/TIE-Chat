@@ -160,8 +160,8 @@ Other knobs, all optional (see `.env.example`):
 | `READ_MIN` / `READ_MAX` | `3` / `12` | silent pause before the typing indicator appears — picking up and unlocking the phone |
 | `READ_CPS` | `25` | reading speed, chars/second, added to that pause based on the incoming message |
 | `READ_CAP` | `40` | hard ceiling on the silent pause |
-| `TYPING_CPS` | `8` | typing speed in characters/second — lower means a longer, more deliberate pause |
-| `TYPING_MIN` / `TYPING_MAX` | `2` / `25` | floor and ceiling on that pause, in seconds |
+| `TYPING_CPS` | `2.5` | typing speed, chars/second — two fingers on a phone, ~23 wpm |
+| `TYPING_MIN` / `TYPING_MAX` | `2` / `60` | floor and ceiling on that pause, in seconds |
 | `WORKERS` | `4` | chats answered in parallel; `1` turns threading off |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |
