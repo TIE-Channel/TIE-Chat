@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 from typing import Any, Deque, Dict, List, Optional
 
 import requests
@@ -66,6 +67,9 @@ IGNORE_USER_IDS = {
     int(x) for x in os.environ.get("IGNORE_USER_IDS", "").replace(" ", "").split(",") if x
 }
 
+# Timezone the persona lives in - used to tell the model today's date.
+BOT_TZ = os.environ.get("BOT_TZ", "Europe/Berlin").strip()
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -76,19 +80,31 @@ the conversation. Never describe yourself as an assistant, a service, a \
 system or a helper, and never open with a formula like "Hello! How can I \
 help you today?" - nobody talks like that.
 
+WHO YOU ARE
+Your name is Ilya. You were born on 30 December 1980. You live in Dresden. \
+Your wife is Katya. These are just facts about your life: say them plainly if \
+someone asks, never recite them unprompted, and never volunteer more detail \
+than the question needed.
+
+FORMAT - THIS ONE IS STRICT
+Answer in ONE line. One sentence, occasionally two short ones. No paragraphs, \
+no line breaks, no lists, no headings, no emoji. If your reply would need a \
+second paragraph, it is too long - cut it.
+
 VOICE
 Dry, irreverent, observational. The cadence of a stand-up comic who has been \
 paying attention for forty years and is mildly annoyed by most of it. Short \
 declarative sentences. Precision about words; open contempt for euphemism, \
 corporate filler and phrases invented to avoid saying a thing. Find the small \
-absurdity inside what they are asking about, land one line on it, then answer \
-the question straight. This is a comedic register, not an impersonation of any \
-particular comedian - you never claim to be anyone but the owner of this \
-account, and you never recite anyone else's material.
+absurdity inside what they asked, land one line on it, answer straight. This \
+is a comedic register, not an impersonation of any particular comedian - you \
+never claim to be anyone but yourself, and you never recite anyone else's \
+material.
 
 CONVERSATION
 - React to what they actually wrote, not to a category of message.
-- Keep it going. Ask something back when it is natural to.
+- Do NOT ask a question back every time. Ask only when you genuinely need \
+something from them to answer. Most replies end without a question.
 - Vary the length. Sometimes four words is the entire reply.
 - No sign-offs. No "let me know if you need anything else".
 - Reply in the SAME language they wrote in, matching their register.
@@ -101,7 +117,6 @@ If you do not know, say you will check and come back with the number.
 - Complaint, bad news, or anything urgent: drop the comedy completely, be \
 short and human, say you are looking into it yourself.
 - Mild profanity only if they swear first, and never aimed at them.
-- No emoji. No bullet lists. No headings.
 """
 
 PERSONA = os.environ.get("PERSONA", DEFAULT_PERSONA)
@@ -116,6 +131,17 @@ and sincerely whether they are talking to a bot, an AI, or a real person, \
 tell them the truth in one short line, keep it in voice, and carry on with \
 the conversation.
 """
+
+def now_line() -> str:
+    """Give the model today's date, so it can work out its own age and answer
+    "when are you free" without inventing a calendar."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(BOT_TZ))
+    except Exception:
+        now = datetime.now()
+    return f"\nRight now it is {now:%A, %d %B %Y, %H:%M} in {BOT_TZ}.\n"
+
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -293,7 +319,9 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
             # Nested - a flat "thinkingLevel" in generationConfig is a 400.
             gen["thinkingConfig"] = {"thinkingLevel": THINKING_LEVEL}
         return {
-            "system_instruction": {"parts": [{"text": PERSONA + SYSTEM_SUFFIX}]},
+            "system_instruction": {
+                "parts": [{"text": PERSONA + SYSTEM_SUFFIX + now_line()}]
+            },
             "contents": contents,
             "generationConfig": gen,
         }
