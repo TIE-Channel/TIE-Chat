@@ -111,6 +111,9 @@ can_reply: Dict[str, bool] = {}
 
 last_reply_at: Dict[str, float] = {}
 
+# business_connection_id -> last time we re-queried the bot's rights
+last_rights_check: Dict[str, float] = {}
+
 STARTED_AT = time.time()
 
 session = requests.Session()
@@ -331,7 +334,18 @@ def handle_business_message(msg: dict) -> None:
         return skip("sender is in IGNORE_USER_IDS")
 
     if can_reply.get(connection_id) is False:
-        return skip("connection has no reply rights - enable 'Reply to messages'")
+        # The toggle may have been flipped since we cached this - re-check, but
+        # at most once a minute so a permanently-off switch isn't hammered.
+        if time.time() - last_rights_check.get(connection_id, 0) > 60:
+            last_rights_check[connection_id] = time.time()
+            fresh = tg("getBusinessConnection", business_connection_id=connection_id)
+            if fresh:
+                remember_connection(fresh)
+        if can_reply.get(connection_id) is False:
+            return skip(
+                "no reply rights - turn on 'Reply to messages' in "
+                "Telegram > Settings > Telegram Business > Chatbots"
+            )
 
     if not text.strip():
         return skip("no text (sticker, photo, voice note)")
