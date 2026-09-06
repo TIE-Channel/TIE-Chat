@@ -187,10 +187,11 @@ GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 # --------------------------------------------------------------------------
 
 class Provider:
-    __slots__ = ("name", "base", "key", "model")
+    __slots__ = ("name", "base", "key", "model", "searched")
 
     def __init__(self, name: str, base: str, key: str, model: str) -> None:
         self.name, self.base, self.key, self.model = name, base, key, model
+        self.searched = False        # have we already hunted for a live model?
 
     def __repr__(self) -> str:
         return f"{self.name}({self.model})"
@@ -200,15 +201,15 @@ class Provider:
 PROVIDER_CATALOGUE = {
     "gemini":     ("", "GEMINI_API_KEY", "GEMINI_MODEL", ""),
     "groq":       ("https://api.groq.com/openai/v1", "GROQ_API_KEY",
-                   "GROQ_MODEL", "llama-3.3-70b-versatile"),
+                   "GROQ_MODEL", "llama-3.1-8b-instant"),
     "cerebras":   ("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY",
                    "CEREBRAS_MODEL", "llama-3.3-70b"),
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
                    "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
     "mistral":    ("https://api.mistral.ai/v1", "MISTRAL_API_KEY",
                    "MISTRAL_MODEL", "mistral-small-latest"),
-    "github":     ("https://models.inference.ai.azure.com", "GITHUB_MODELS_TOKEN",
-                   "GITHUB_MODEL", "gpt-4o-mini"),
+    "github":     ("https://models.github.ai/inference", "GITHUB_MODELS_TOKEN",
+                   "GITHUB_MODEL", "openai/gpt-4o-mini"),
 }
 
 AI_ORDER = [
@@ -646,6 +647,65 @@ def pick_working_model() -> str:
     return GEMINI_MODEL
 
 
+# Model names churn constantly, and a provider's catalogue is full of things
+# that are not chatbots. These never are.
+NOT_A_CHAT_MODEL = (
+    "guard", "whisper", "tts", "embed", "rerank", "moderation", "safety",
+    "ocr", "asr", "transcribe", "diffusion", "image", "vision", "audio",
+    "speech", "reward", "classifier",
+)
+
+
+def score_model(name: str, provider: str) -> int:
+    """How suitable is this model id for holding a conversation?"""
+    n = name.lower()
+    if any(bad in n for bad in NOT_A_CHAT_MODEL):
+        return -1
+    if provider == "openrouter" and not n.endswith(":free"):
+        return -1                       # paid slugs are not what we came for
+
+    score = 1
+    for family, weight in (("llama", 4), ("qwen", 3), ("mistral", 3),
+                           ("deepseek", 3), ("gpt-oss", 4), ("gpt-4", 4),
+                           ("gemma", 2), ("phi", 1), ("nemo", 2)):
+        if family in n:
+            score += weight
+    if any(good in n for good in ("instruct", "chat", "versatile", "instant", "-it")):
+        score += 2
+
+    size = re.search(r"(\d+)\s*b\b", n)
+    if size:                            # 7B-90B is the sweet spot for a free tier
+        billions = int(size.group(1))
+        score += 3 if 7 <= billions <= 90 else -1
+    return score
+
+
+def suggested_by_error(text: str) -> Optional[str]:
+    """Some providers name the replacement right in the error message."""
+    m = re.search(r"use this slug instead:?\s*([\w\-./:]+)", text, re.I)
+    return m.group(1).rstrip(".,") if m else None
+
+
+def discover_model(p: Provider) -> Optional[str]:
+    """Ask the provider what it actually serves and pick the best chat model."""
+    headers = {"Authorization": f"Bearer {p.key}"}
+    try:
+        r = session.get(f"{p.base}/models", headers=headers, timeout=20)
+        ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+    except Exception as exc:
+        log.warning("  -> could not list %s models: %s", p.name, exc)
+        return None
+    ranked = sorted(((score_model(i, p.name), i) for i in ids), reverse=True)
+    return next((i for score, i in ranked if score > 0), None)
+
+
+def looks_like_model_error(status: int, text: str) -> bool:
+    if status not in (400, 404, 422):
+        return False
+    t = text.lower()
+    return any(w in t for w in ("model", "not found", "decommission", "slug"))
+
+
 def openai_turns(key: str, user_text: Optional[str]) -> List[dict]:
     msgs = [
         {"role": "user" if h["role"] == "user" else "assistant", "content": h["text"]}
@@ -689,6 +749,16 @@ def openai_chat(
     if r.status_code != 200:
         log.warning("  -> %s %s: %s", p.name, r.status_code,
                     r.text[:140].replace("\n", " "))
+        # A dead model name is fixable without you: find a live one and retry.
+        if looks_like_model_error(r.status_code, r.text) and not p.searched:
+            p.searched = True
+            alt = suggested_by_error(r.text) or discover_model(p)
+            if alt and alt != p.model:
+                log.warning("  -> %s: %s is gone, switching to %s "
+                            "(set %s_MODEL to keep it)",
+                            p.name, p.model, alt, p.name.upper())
+                p.model = alt
+                return openai_chat(p, system, messages, max_tokens, json_mode, timeout)
         return None
     try:
         text = r.json()["choices"][0]["message"]["content"]
@@ -1438,15 +1508,10 @@ def probe_provider(p: Provider) -> tuple:
     detail = http_error(r)
     # A dead model name is the most common failure, and the fix is knowable:
     # ask the provider what it actually serves.
-    if any(w in detail.lower() for w in ("model", "not found", "decommission")):
-        try:
-            lr = session.get(f"{p.base}/models", headers=headers, timeout=20)
-            ids = [m.get("id") for m in (lr.json().get("data") or []) if m.get("id")]
-        except Exception:
-            ids = []
-        if ids:
-            alt = next((m for m in ids if "llama" in m.lower()), ids[0])
-            detail += f" - try {p.name.upper()}_MODEL={alt}"
+    if looks_like_model_error(r.status_code, r.text):
+        alt = suggested_by_error(r.text) or discover_model(p)
+        if alt:
+            detail += f" - use {p.name.upper()}_MODEL={alt}"
     return False, detail, took
 
 

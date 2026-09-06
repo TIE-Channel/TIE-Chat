@@ -94,6 +94,19 @@ time. The log names whoever ends up answering:
 -> answered by groq (the ones before it were busy)
 ```
 
+**Model names die constantly** on free tiers, and every provider phrases it
+differently. The bot handles that itself: on a "model does not exist" error it
+takes the replacement slug straight out of the error message if the provider
+offered one, otherwise it asks `/models` what is actually being served and
+picks the best conversational model — deliberately skipping the guard, whisper,
+embedding and moderation models that litter those catalogues. It then keeps the
+new model for the session and logs it:
+
+```
+-> groq: llama-3.1-8b-instant is gone, switching to llama-3.3-70b-versatile
+   (set GROQ_MODEL to keep it)
+```
+
 When a backup exists, Gemini stops retrying almost immediately — switching
 costs half a second, waiting out a backoff costs the customer. The group judge
 uses the same chain, so it survives an outage too. `/status` lists the live
