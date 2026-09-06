@@ -56,6 +56,10 @@ TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "2048"))
 GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "45"))
 
+# Hard ceiling on what actually gets sent. The persona asks for one line; this
+# is the seatbelt for when a model ignores that entirely.
+REPLY_MAX_CHARS = int(os.environ.get("REPLY_MAX_CHARS", "1200"))
+
 # "minimal" | "low" | "medium" | "high", or empty to let the model decide.
 # A one-line chat reply does not need deep reasoning; low keeps it fast.
 THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
@@ -204,12 +208,13 @@ GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 
 class Provider:
     __slots__ = ("name", "base", "key", "model", "searched", "fails",
-                 "parked_until", "no_json")
+                 "parked_until", "no_json", "no_reasoning_param")
 
     def __init__(self, name: str, base: str, key: str, model: str) -> None:
         self.name, self.base, self.key, self.model = name, base, key, model
         self.searched = False        # have we already hunted for a live model?
         self.no_json = False         # strict JSON mode is broken here
+        self.no_reasoning_param = False
         self.fails = 0               # consecutive failures
         self.parked_until = 0.0      # skip it entirely until this time
 
@@ -961,6 +966,44 @@ def looks_like_model_error(status: int, text: str) -> bool:
                                 "end of life", "gone", "retired"))
 
 
+THINK_BLOCK = re.compile(
+    r"<\s*(think|thinking|reason|reasoning|scratchpad)\s*>.*?<\s*/\s*\1\s*>",
+    re.S | re.I,
+)
+THINK_OPEN = re.compile(r"<\s*(think|thinking|reason|reasoning|scratchpad)\s*>", re.I)
+THINK_CLOSE = re.compile(r"<\s*/\s*(think|thinking|reason|reasoning|scratchpad)\s*>", re.I)
+
+
+def strip_thinking(text: str) -> str:
+    """Remove a reasoning model's inner monologue from what we are about to send.
+
+    Some models emit <think>...</think> inside the ordinary content field. That
+    is not an answer, it is homework, and it must never reach a customer.
+    """
+    cleaned = THINK_BLOCK.sub("", text)
+    # Truncated or malformed blocks: keep only what follows the last closing tag,
+    # and if a block was opened and never closed, the whole thing was thinking.
+    last_close = None
+    for m in THINK_CLOSE.finditer(cleaned):
+        last_close = m
+    if last_close:
+        cleaned = cleaned[last_close.end():]
+    if THINK_OPEN.search(cleaned):
+        cleaned = THINK_OPEN.split(cleaned)[0]
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)       # tidy the seam
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def trim_reply(text: str) -> str:
+    """Last-resort length guard, cutting at a sentence end where possible."""
+    if len(text) <= REPLY_MAX_CHARS:
+        return text
+    head = text[:REPLY_MAX_CHARS]
+    cut = max(head.rfind(". "), head.rfind("! "), head.rfind("? "),
+              head.rfind(".\n"), head.rfind("…"))
+    return (head[:cut + 1] if cut > REPLY_MAX_CHARS // 3 else head).strip()
+
+
 def openai_turns(key: str, user_text: Optional[str]) -> List[dict]:
     msgs = [
         {"role": "user" if h["role"] == "user" else "assistant", "content": h["text"]}
@@ -988,6 +1031,10 @@ def openai_chat(
     }
     if json_mode:
         body["response_format"] = {"type": "json_object"}
+    if p.name == "groq" and not p.no_reasoning_param:
+        # Groq can drop a reasoning model's monologue server-side, which is both
+        # cheaper and safer than us cleaning it up afterwards.
+        body["reasoning_format"] = "hidden"
     headers = {"Authorization": f"Bearer {p.key}", "Content-Type": "application/json"}
     if p.name == "openrouter":                      # OpenRouter asks for these
         headers["HTTP-Referer"] = "https://t.me"
@@ -1002,6 +1049,11 @@ def openai_chat(
         return None
 
     if r.status_code != 200:
+        if (r.status_code == 400 and "reasoning_format" in r.text
+                and not p.no_reasoning_param):
+            p.no_reasoning_param = True
+            log.info("  -> %s rejects reasoning_format, retrying without it", p.name)
+            return openai_chat(p, system, messages, max_tokens, json_mode, timeout)
         if json_mode and r.status_code == 400 and "json" in r.text.lower():
             # This model cannot honour response_format. Note it once and stop
             # paying for the lesson on every future call.
@@ -1037,10 +1089,20 @@ def openai_chat(
     except Exception as exc:
         log.warning("  -> %s gave unusable output: %s", p.name, exc)
         return None
-    text = (text or "").strip()
+    raw_len = len(text or "")
+    text = strip_thinking(text or "")
+    if raw_len and not text:
+        log.warning("  -> %s sent %d chars of pure reasoning and no answer",
+                    p.name, raw_len)
+        return None
+    if len(text) < raw_len:
+        log.info("  -> stripped %d chars of <think> from %s",
+                 raw_len - len(text), p.name)
     if not text:
         log.warning("  -> %s returned an empty message", p.name)
         return None
+    if not json_mode:
+        text = trim_reply(text)
     log.info("  -> %s 200 in %.1fs, %d chars", p.name, time.time() - started, len(text))
     return text
 
