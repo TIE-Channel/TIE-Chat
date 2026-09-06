@@ -43,6 +43,10 @@ REPLY_COOLDOWN = float(os.environ.get("REPLY_COOLDOWN", "2"))
 # Max characters of a customer message we forward to the model.
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "4000"))
 
+# Ignore messages older than this (seconds). Matters on hosts that sleep:
+# Telegram holds updates for ~24h and delivers the lot when the bot wakes up.
+MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE", "3600"))
+
 # Optional: comma-separated Telegram user IDs that are never auto-answered.
 IGNORE_USER_IDS = {
     int(x) for x in os.environ.get("IGNORE_USER_IDS", "").replace(" ", "").split(",") if x
@@ -106,6 +110,8 @@ owner_of_connection: Dict[str, int] = {}
 can_reply: Dict[str, bool] = {}
 
 last_reply_at: Dict[str, float] = {}
+
+STARTED_AT = time.time()
 
 session = requests.Session()
 session.headers["User-Agent"] = "tg-business-ai/1.0"
@@ -282,56 +288,92 @@ def handle_business_message(msg: dict) -> None:
     chat_id = chat.get("id")
     text = msg.get("text") or msg.get("caption") or ""
 
-    if not connection_id or chat_id is None:
-        return
+    # Every business message is logged before any filtering, so "nothing
+    # happened" always has a visible reason in the log.
+    log.info(
+        "business_message chat=%s from=%s conn=%s text=%r",
+        chat_id, sender.get("id"), connection_id, text[:60],
+    )
 
-    # Only auto-answer 1:1 private chats.
+    def skip(reason: str, *args: Any) -> None:
+        log.info("  -> ignored: " + reason, *args)
+
+    if not connection_id or chat_id is None:
+        return skip("malformed update")
+
     if chat.get("type") != "private":
-        return
+        return skip("not a private chat (type=%s)", chat.get("type"))
+
+    # On hosts that sleep (Render free tier), Telegram queues messages while the
+    # instance is down and delivers them all on wake-up. Answer the recent ones,
+    # ignore anything genuinely stale.
+    sent_at = float(msg.get("date") or 0)
+    age = time.time() - sent_at if sent_at else 0.0
+    if age > MAX_MESSAGE_AGE:
+        return skip("%.0f min old, older than MAX_MESSAGE_AGE", age / 60)
 
     owner_id = resolve_owner(connection_id)
     if owner_id is not None and sender.get("id") == owner_id:
         # This is you writing to the customer - record it as context, don't reply.
         if text:
             history[f"{connection_id}:{chat_id}"].append({"role": "model", "text": text})
-        return
+        return skip("sent by you (the business owner), kept as context")
     if owner_id is None and sender.get("id") != chat_id:
         # Fallback heuristic: in a private chat the customer's own id equals the
         # chat id, so anything else is the owner's outgoing message.
         if text:
             history[f"{connection_id}:{chat_id}"].append({"role": "model", "text": text})
-        return
+        return skip("looks like your own outgoing message, kept as context")
 
-    if sender.get("is_bot") or sender.get("id") in IGNORE_USER_IDS:
-        return
+    if sender.get("is_bot"):
+        return skip("sender is a bot")
+    if sender.get("id") in IGNORE_USER_IDS:
+        return skip("sender is in IGNORE_USER_IDS")
 
     if can_reply.get(connection_id) is False:
-        log.info("connection %s has no reply rights, skipping", connection_id)
-        return
+        return skip("connection has no reply rights - enable 'Reply to messages'")
 
     if not text.strip():
-        return  # stickers, photos without caption, voice notes, ...
+        return skip("no text (sticker, photo, voice note)")
 
     key = f"{connection_id}:{chat_id}"
     now = time.time()
     if now - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
-        return
+        return skip("within REPLY_COOLDOWN of the last reply")
     last_reply_at[key] = now
 
     user_text = text[:MAX_INPUT_CHARS]
-    log.info("msg from %s in %s: %s", sender.get("id"), chat_id, user_text[:80])
+    log.info("  -> answering...")
 
     tg("sendChatAction", business_connection_id=connection_id, chat_id=chat_id, action="typing")
 
     answer = ask_gemini(key, user_text)
     if not answer:
-        log.warning("no answer generated for %s", key)
+        log.warning("  -> Gemini returned nothing, no reply sent")
         return
 
     history[key].append({"role": "user", "text": user_text})
     history[key].append({"role": "model", "text": answer})
 
     send_reply(connection_id, chat_id, answer, msg.get("message_id"))
+    log.info("  -> replied: %r", answer[:60])
+
+
+def status_report() -> str:
+    lines = [
+        f"model: {GEMINI_MODEL}",
+        f"uptime: {int((time.time() - STARTED_AT) / 60)} min",
+        f"business connections known: {len(owner_of_connection)}",
+    ]
+    for cid, oid in owner_of_connection.items():
+        lines.append(f"  {cid[:12]}... owner={oid} can_reply={can_reply.get(cid)}")
+    if not owner_of_connection:
+        lines.append(
+            "  none yet - the bot learns this on the first business message, "
+            "or when you re-add it under Telegram Business > Chatbots"
+        )
+    lines.append(f"active chats in memory: {len(history)}")
+    return "\n".join(lines)
 
 
 def handle_update(update: dict) -> None:
@@ -341,15 +383,26 @@ def handle_update(update: dict) -> None:
     if "business_message" in update:
         handle_business_message(update["business_message"])
         return
+    if "edited_business_message" in update:
+        log.info("edited business message, ignored")
+        return
+
     # A normal DM to the bot itself - handy for checking it is alive.
     msg = update.get("message")
-    if msg and (msg.get("text") or "").startswith("/start"):
+    if not msg:
+        log.info("update ignored (%s)", ", ".join(k for k in update if k != "update_id"))
+        return
+    text = (msg.get("text") or "").strip()
+    if text.startswith("/status"):
+        tg("sendMessage", chat_id=msg["chat"]["id"], text=status_report())
+    elif text.startswith("/start"):
         tg(
             "sendMessage",
             chat_id=msg["chat"]["id"],
             text=(
                 "I'm alive. Connect me under Settings -> Telegram Business -> "
-                "Chatbots and I'll answer your customers for you."
+                "Chatbots and I'll answer your customers for you.\n\n"
+                "Send /status to see what I currently know."
             ),
         )
 
@@ -407,12 +460,11 @@ def main() -> None:
 
     pick_working_model()
 
-    # Drop any backlog so a restart doesn't replay old chats.
-    tg("deleteWebhook", drop_pending_updates=True)
+    # Keep the backlog. On a host that sleeps, the messages that arrived while
+    # the instance was down are queued here - dropping them means the customer
+    # is silently ignored. MAX_MESSAGE_AGE filters out anything truly stale.
+    tg("deleteWebhook", drop_pending_updates=False)
     offset = 0
-    pending = tg("getUpdates", offset=-1, timeout=0, allowed_updates=ALLOWED_UPDATES)
-    if pending:
-        offset = pending[-1]["update_id"] + 1
 
     log.info("polling for business messages...")
     while True:

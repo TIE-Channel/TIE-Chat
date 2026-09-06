@@ -156,6 +156,7 @@ Other knobs, all optional (see `.env.example`):
 | `HISTORY_TURNS` | `20` | messages of context kept per chat |
 | `REPLY_COOLDOWN` | `2` | seconds between replies in one chat |
 | `IGNORE_USER_IDS` | — | user IDs that never get an auto-reply |
+| `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |
 | `MAX_OUTPUT_TOKENS` | `800` | reply length ceiling |
 
