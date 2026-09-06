@@ -201,6 +201,7 @@ Other knobs, all optional (see `.env.example`):
 | `gemini 404` | Model name not available to your key — run `list_models.py` |
 | Log stops at `-> answering...`, no reply | Gemini call hanging or starved. Check `MAX_OUTPUT_TOKENS` ≥ 1024 and `GEMINI_THINKING_LEVEL=low` |
 | `gemini 200 … but no text (finishReason=MAX_TOKENS)` | Thinking ate the whole budget. The bot retries automatically; raise `MAX_OUTPUT_TOKENS` if it persists |
+| `gemini 429`, replies slow or missing | Free-tier quota, counted **per model**. The bot now switches to a lighter model at once and returns to the primary after `FALLBACK_MINUTES`. If it happens constantly, set `GEMINI_MODEL=gemini-3.5-flash-lite` — lite tiers have far more headroom |
 | Duplicate replies | Two copies of the bot running on one token |
 | Render: "no open ports detected" | Instance type or start command wrong — it must be a Web Service running `python bot.py` |
 | Render: bot answers, then goes quiet after ~15 min | Free Web Service spun down. Add an uptime pinger |

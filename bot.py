@@ -91,14 +91,30 @@ Answer in ONE line. One sentence, occasionally two short ones. No paragraphs, \
 no line breaks, no lists, no headings, no emoji. If your reply would need a \
 second paragraph, it is too long - cut it.
 
-VOICE
-Dry, irreverent, observational. The cadence of a stand-up comic who has been \
-paying attention for forty years and is mildly annoyed by most of it. Short \
+VOICE - THE POINT OF YOU
+You are funny. Not "professional with a light touch" - funny. Every single \
+reply carries a joke: an observation, an absurdity, a small grievance against \
+the world. A flat informational answer is a failed answer.
+
+Dry, irreverent, deadpan. The cadence of a stand-up comic who has been paying \
+attention for forty years and is mildly annoyed by most of it. Short \
 declarative sentences. Precision about words; open contempt for euphemism, \
-corporate filler and phrases invented to avoid saying a thing. Find the small \
-absurdity inside what they asked, land one line on it, answer straight. This \
-is a comedic register, not an impersonation of any particular comedian - you \
-never claim to be anyone but yourself, and you never recite anyone else's \
+corporate filler and phrases invented to avoid saying a thing.
+
+How you get the laugh:
+- Take the premise completely literally and follow it somewhere stupid.
+- Name the thing everyone is politely pretending not to notice.
+- Answer the question, then undercut your own answer.
+- Escalate once. Never twice - the second escalation kills it.
+- Put the sharpest word at the END of the line. Land on it and stop.
+- Be specific. "Bureaucracy" is not funny; a form that asks for your mother's \
+maiden name in triplicate is.
+
+Never explain the joke, never signal it, never soften it afterwards. No \
+"haha", no winking, no emoji. Deadpan means you say it like it is just true.
+
+This is a comedic register, not an impersonation of any particular comedian - \
+you never claim to be anyone but yourself, and you never recite anyone else's \
 material.
 
 CONVERSATION
@@ -110,7 +126,8 @@ something from them to answer. Most replies end without a question.
 - Reply in the SAME language they wrote in, matching their register.
 
 LIMITS
-- Useful first. The joke rides on top of a real answer, never instead of one.
+- The joke rides on top of a real answer, never instead of one. Still answer \
+what they asked.
 - Never invent facts: no prices, no deadlines, no delivery dates, no promises. \
 If you do not know, say you will check and come back with the number.
 - Sardonic about the world, never about the person you are talking to.
@@ -173,6 +190,9 @@ STARTED_AT = time.time()
 
 # Primary model first, lighter flash models behind it as live fallbacks.
 MODEL_CANDIDATES: List[str] = []
+PRIMARY_MODEL = GEMINI_MODEL
+PINNED_UNTIL = 0.0
+FALLBACK_MINUTES = int(os.environ.get("FALLBACK_MINUTES", "15"))
 
 session = requests.Session()
 session.headers["User-Agent"] = "tg-business-ai/1.0"
@@ -252,7 +272,7 @@ def send_reply(connection_id: str, chat_id: int, text: str, reply_to: Optional[i
 
 def pick_working_model() -> str:
     """Confirm GEMINI_MODEL works and build the fallback list behind it."""
-    global GEMINI_MODEL, MODEL_CANDIDATES
+    global GEMINI_MODEL, MODEL_CANDIDATES, PRIMARY_MODEL
     try:
         r = session.get(
             f"{GEMINI_API}/models",
@@ -287,6 +307,7 @@ def pick_working_model() -> str:
     # Google's servers hand out 503 "overloaded" under load, and the newest
     # model is the busiest one. Keep the lighter models as a live fallback.
     MODEL_CANDIDATES = [GEMINI_MODEL] + [m for m in flash if m != GEMINI_MODEL]
+    PRIMARY_MODEL = GEMINI_MODEL
     log.info("using Gemini model %s (fallbacks: %s)",
              GEMINI_MODEL, ", ".join(MODEL_CANDIDATES[1:3]) or "none")
     return GEMINI_MODEL
@@ -326,9 +347,18 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
             "generationConfig": gen,
         }
 
+    global PINNED_UNTIL
+
+    # A model we fell back to is kept only for a while - quota and overload are
+    # both temporary, and we want the good model back once they pass.
+    if PINNED_UNTIL and time.time() > PINNED_UNTIL and GEMINI_MODEL != PRIMARY_MODEL:
+        log.info("  -> fallback expired, back to %s", PRIMARY_MODEL)
+        GEMINI_MODEL = PRIMARY_MODEL
+        PINNED_UNTIL = 0.0
+
     use_thinking = bool(THINKING_LEVEL)
     max_tokens = MAX_OUTPUT_TOKENS
-    models = MODEL_CANDIDATES or [GEMINI_MODEL]
+    models = [GEMINI_MODEL] + [m for m in (MODEL_CANDIDATES or []) if m != GEMINI_MODEL]
     model_idx = 0
     attempt = 0
 
@@ -351,8 +381,10 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
 
         if r.status_code == 200:
             if model != GEMINI_MODEL:
-                log.warning("  -> switched to %s, sticking with it", model)
+                log.warning("  -> %s worked, using it for the next %d min",
+                            model, FALLBACK_MINUTES)
                 GEMINI_MODEL = model
+                PINNED_UNTIL = time.time() + FALLBACK_MINUTES * 60
             data = r.json()
             cands = data.get("candidates") or []
             if not cands:
@@ -389,22 +421,18 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
 
         attempt += 1
 
-        if r.status_code == 429:  # free-tier rate limit
-            wait = 5 * attempt + random.random()
-            log.warning("  -> gemini rate limited, retrying in %.0fs", wait)
-            time.sleep(wait)
-            continue
-
-        if r.status_code in (500, 502, 503, 504):
-            # 503 means Google's side is overloaded, and the newest model is
-            # the busiest. After two strikes, drop to a lighter one.
+        # 429 = free-tier quota, 5xx = Google overloaded. Both are per-model,
+        # so the fastest cure is a different model, not a longer wait.
+        if r.status_code == 429 or r.status_code in (500, 502, 503, 504):
             log.warning("  -> gemini %s on %s: %s", r.status_code, model,
-                        r.text[:160].replace("\n", " "))
-            if attempt % 2 == 0 and model_idx + 1 < len(models):
+                        r.text[:140].replace("\n", " "))
+            if model_idx + 1 < len(models):
                 model_idx += 1
-                log.info("  -> trying fallback model %s", models[model_idx])
-                continue
-            time.sleep(min(2 ** attempt, 15) + random.random())
+                log.info("  -> switching to %s", models[model_idx])
+                continue  # straight to the next model, no waiting
+            wait = min(4 * attempt, 20) + random.random()
+            log.info("  -> all models busy, waiting %.0fs", wait)
+            time.sleep(wait)
             continue
 
         log.error("  -> gemini %s: %s", r.status_code, r.text[:400])
