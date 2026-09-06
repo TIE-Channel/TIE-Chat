@@ -149,8 +149,17 @@ Replies land as ordinary messages, not quoted — he is talking to the room, not
 filing a ticket. In a group he is also allowed to write more than one line:
 two or three sentences, or a short riff when the subject deserves it.
 
+**Group replies go out immediately** — no read pause, no typing indicator. That
+pacing exists for a 1:1 chat, where somebody is visibly answering *you*; in a
+room a 25-second pause just means the conversation has moved on without him.
+Set `GROUP_DELAY=true` if you want it there anyway.
+
+A newer message in a group does **not** cancel a reply in progress either —
+other people talking is the normal state of a room, not somebody correcting
+themselves. (In 1:1 chats it still does.)
+
 Keyword interjections are capped at one per `GROUP_KEYWORD_COOLDOWN` seconds
-(120 by default) so he doesn't monologue through a whole tech argument. Being
+(60 by default) so he doesn't monologue through a whole tech argument. Being
 mentioned or replied to ignores that cap.
 
 Russian stems match inflected forms — `бот` catches "боты", "ботами", "о ботах"
@@ -223,7 +232,8 @@ Other knobs, all optional (see `.env.example`):
 | `GROUP_REPLY_ALL` | `false` | `true` answers every group message, not just mentions and replies |
 | `GROUP_ALLOWLIST` | — | comma-separated group chat IDs; empty means all groups |
 | `GROUP_KEYWORDS` | built-in list | subjects that make him chime in unprompted; replaces the defaults |
-| `GROUP_KEYWORD_COOLDOWN` | `120` | seconds before he may butt in on a keyword again |
+| `GROUP_KEYWORD_COOLDOWN` | `60` | seconds before he may butt in on a keyword again |
+| `GROUP_DELAY` | `false` | `true` applies the 1:1 read/typing pauses in groups as well |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |
 | `MAX_OUTPUT_TOKENS` | `2048` | covers thinking **and** the answer — below ~1024 Gemini 3 returns nothing |

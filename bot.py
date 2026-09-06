@@ -144,7 +144,12 @@ GROUP_KEYWORDS = [
 # Butting in on a keyword is capped separately: without this the bot would
 # comment on every third line in a group that talks about tech all day.
 # Being @mentioned or replied to ignores this cap.
-GROUP_KEYWORD_COOLDOWN = float(os.environ.get("GROUP_KEYWORD_COOLDOWN", "120"))
+GROUP_KEYWORD_COOLDOWN = float(os.environ.get("GROUP_KEYWORD_COOLDOWN", "60"))
+
+# Groups get the reply straight away. The read/typing simulation belongs to a
+# 1:1 chat, where somebody is plainly answering you; in a room a 25-second
+# pause just means the conversation has moved on without you.
+GROUP_DELAY = os.environ.get("GROUP_DELAY", "").strip().lower() in ("1", "true", "yes")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
@@ -545,7 +550,12 @@ def pick_working_model() -> str:
     return GEMINI_MODEL
 
 
-def ask_gemini(key: str, user_text: Optional[str], extra_system: str = "") -> Optional[str]:
+def ask_gemini(
+    key: str,
+    user_text: Optional[str],
+    extra_system: str = "",
+    cancel: Optional[threading.Event] = None,
+) -> Optional[str]:
     """Send the chat history plus the new message to Gemini, return the reply.
 
     Gemini 3 models think by default, and maxOutputTokens caps thinking AND
@@ -596,6 +606,12 @@ def ask_gemini(key: str, user_text: Optional[str], extra_system: str = "") -> Op
     attempt = 0
 
     while attempt < 6 and model_idx < len(models):
+        # Give up the moment the reply is called off. Without this a retry
+        # storm (429s, an overloaded model) would hold the chat's lock for a
+        # minute while the customer waits on a message we will never send.
+        if cancel is not None and cancel.is_set():
+            log.info("  -> abandoning the Gemini call, reply was called off")
+            return None
         model = models[model_idx]
         url = f"{GEMINI_API}/models/{model}:generateContent"
         started = time.time()
@@ -607,7 +623,11 @@ def ask_gemini(key: str, user_text: Optional[str], extra_system: str = "") -> Op
         except Exception as exc:
             attempt += 1
             log.warning("  -> gemini failed after %.0fs: %s", time.time() - started, exc)
-            time.sleep(min(2 ** attempt, 15))
+            if cancel is not None:
+                if cancel.wait(min(2 ** attempt, 15)):
+                    return None
+            else:
+                time.sleep(min(2 ** attempt, 15))
             continue
 
         elapsed = time.time() - started
@@ -665,7 +685,11 @@ def ask_gemini(key: str, user_text: Optional[str], extra_system: str = "") -> Op
                 continue  # straight to the next model, no waiting
             wait = min(4 * attempt, 20) + random.random()
             log.info("  -> all models busy, waiting %.0fs", wait)
-            time.sleep(wait)
+            if cancel is not None:
+                if cancel.wait(wait):
+                    return None
+            else:
+                time.sleep(wait)
             continue
 
         log.error("  -> gemini %s: %s", r.status_code, r.text[:400])
@@ -766,7 +790,7 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
     # Generate first, while the chat still looks untouched - as far as the other
     # side is concerned the phone is still face down on a table somewhere.
     started = time.time()
-    answer = ask_gemini(key, user_text)
+    answer = ask_gemini(key, user_text, cancel=cancel)
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
@@ -875,7 +899,11 @@ def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
     if word:
         since = time.time() - last_keyword_reply.get(key, 0)
         if since < GROUP_KEYWORD_COOLDOWN:
-            log.info("group %s | keyword %r, but butted in %.0fs ago", key, word, since)
+            log.info(
+                "%s | keyword %r - staying quiet, last interjection was %.0fs ago "
+                "(GROUP_KEYWORD_COOLDOWN=%.0fs)",
+                key, word, since, GROUP_KEYWORD_COOLDOWN,
+            )
             return None
         return f"keyword {word!r}"
     return None
@@ -921,35 +949,36 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
 
-    # No quoting: Ilya just says his piece into the room.
-    if not pace_and_send(None, chat_id, clean, answer, None,
-                         cancel, time.time() - started):
-        return
+    # No quoting, and no human-typing theatre: in a room full of people a
+    # 25-second pause just means the conversation has moved on without you.
+    if GROUP_DELAY:
+        if not pace_and_send(None, chat_id, clean, answer, None,
+                             cancel, time.time() - started):
+            return
+    else:
+        send_reply(None, chat_id, answer, None)
+        log.info("  -> replied: %r", answer[:60])
 
     history[key].append({"role": "model", "text": answer})
     last_reply_at[key] = time.time()
     if reason.startswith("keyword"):
         last_keyword_reply[key] = time.time()
 
-    with _pending_guard:
-        p = pending.get(key)
-        if p and p.cancel is cancel:
-            pending.pop(key, None)
-
 
 def dispatch_group_message(msg: dict) -> None:
+    """Unlike a 1:1 chat, a newer message here does NOT cancel the answer.
+
+    In a group other people keep talking; that is the normal state of a room,
+    not somebody correcting themselves. The chat lock still keeps replies in
+    order, and REPLY_COOLDOWN stops it answering twice in a row.
+    """
     chat = msg.get("chat") or {}
     key = f"group:{chat.get('id')}"
-    cancel_pending(key, "a newer message arrived")
-
-    entry = Pending(msg.get("message_id"))
-    with _pending_guard:
-        pending[key] = entry
 
     def run() -> None:
         with chat_lock(key):
             try:
-                handle_group_message(msg, entry.cancel)
+                handle_group_message(msg)
             except Exception:
                 log.exception("error answering group %s", chat.get("id"))
 
