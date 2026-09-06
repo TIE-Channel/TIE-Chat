@@ -145,6 +145,9 @@ last_rights_check: Dict[str, float] = {}
 
 STARTED_AT = time.time()
 
+# Primary model first, lighter flash models behind it as live fallbacks.
+MODEL_CANDIDATES: List[str] = []
+
 session = requests.Session()
 session.headers["User-Agent"] = "tg-business-ai/1.0"
 
@@ -222,8 +225,8 @@ def send_reply(connection_id: str, chat_id: int, text: str, reply_to: Optional[i
 
 
 def pick_working_model() -> str:
-    """Return GEMINI_MODEL, or fall back to the first available flash model."""
-    global GEMINI_MODEL
+    """Confirm GEMINI_MODEL works and build the fallback list behind it."""
+    global GEMINI_MODEL, MODEL_CANDIDATES
     try:
         r = session.get(
             f"{GEMINI_API}/models",
@@ -241,19 +244,26 @@ def pick_working_model() -> str:
 
     if not models:
         return GEMINI_MODEL
-    if GEMINI_MODEL in models:
-        log.info("using Gemini model %s", GEMINI_MODEL)
-        return GEMINI_MODEL
 
     def rank(name: str) -> tuple:
         ver = re.search(r"(\d+(?:\.\d+)?)", name)
         return (float(ver.group(1)) if ver else 0.0, "lite" not in name)
 
-    flash = sorted([m for m in models if "flash" in m and "preview" not in m], key=rank, reverse=True)
-    chosen = flash[0] if flash else models[0]
-    log.warning("model %r unavailable for this key; falling back to %r", GEMINI_MODEL, chosen)
-    GEMINI_MODEL = chosen
-    return chosen
+    flash = sorted(
+        [m for m in models if "flash" in m and "preview" not in m], key=rank, reverse=True
+    )
+
+    if GEMINI_MODEL not in models:
+        chosen = flash[0] if flash else models[0]
+        log.warning("model %r unavailable for this key; using %r", GEMINI_MODEL, chosen)
+        GEMINI_MODEL = chosen
+
+    # Google's servers hand out 503 "overloaded" under load, and the newest
+    # model is the busiest one. Keep the lighter models as a live fallback.
+    MODEL_CANDIDATES = [GEMINI_MODEL] + [m for m in flash if m != GEMINI_MODEL]
+    log.info("using Gemini model %s (fallbacks: %s)",
+             GEMINI_MODEL, ", ".join(MODEL_CANDIDATES[1:3]) or "none")
+    return GEMINI_MODEL
 
 
 def ask_gemini(key: str, user_text: str) -> Optional[str]:
@@ -270,7 +280,8 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
     ]
     contents.append({"role": "user", "parts": [{"text": user_text}]})
 
-    url = f"{GEMINI_API}/models/{GEMINI_MODEL}:generateContent"
+    global GEMINI_MODEL
+
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
 
     def build(thinking: bool, max_tokens: int) -> dict:
@@ -279,7 +290,8 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
             "maxOutputTokens": max_tokens,
         }
         if thinking and THINKING_LEVEL:
-            gen["thinkingLevel"] = THINKING_LEVEL
+            # Nested - a flat "thinkingLevel" in generationConfig is a 400.
+            gen["thinkingConfig"] = {"thinkingLevel": THINKING_LEVEL}
         return {
             "system_instruction": {"parts": [{"text": PERSONA + SYSTEM_SUFFIX}]},
             "contents": contents,
@@ -288,8 +300,13 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
 
     use_thinking = bool(THINKING_LEVEL)
     max_tokens = MAX_OUTPUT_TOKENS
+    models = MODEL_CANDIDATES or [GEMINI_MODEL]
+    model_idx = 0
+    attempt = 0
 
-    for attempt in range(4):
+    while attempt < 6 and model_idx < len(models):
+        model = models[model_idx]
+        url = f"{GEMINI_API}/models/{model}:generateContent"
         started = time.time()
         try:
             r = session.post(
@@ -297,13 +314,17 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
                 timeout=GEMINI_TIMEOUT,
             )
         except Exception as exc:
+            attempt += 1
             log.warning("  -> gemini failed after %.0fs: %s", time.time() - started, exc)
-            time.sleep(2 ** attempt)
+            time.sleep(min(2 ** attempt, 15))
             continue
 
         elapsed = time.time() - started
 
         if r.status_code == 200:
+            if model != GEMINI_MODEL:
+                log.warning("  -> switched to %s, sticking with it", model)
+                GEMINI_MODEL = model
             data = r.json()
             cands = data.get("candidates") or []
             if not cands:
@@ -331,26 +352,37 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
                 continue
             return None
 
-        # Some models reject thinkingLevel outright - drop it and try again.
+        # Some models reject thinkingConfig - drop it and try again. This costs
+        # no attempt: the request was never really made with valid settings.
         if r.status_code == 400 and use_thinking and "think" in r.text.lower():
-            log.warning("  -> model rejected thinkingLevel, retrying without it")
+            log.warning("  -> %s rejected thinkingConfig, retrying without it", model)
             use_thinking = False
             continue
 
+        attempt += 1
+
         if r.status_code == 429:  # free-tier rate limit
-            wait = 5 * (attempt + 1) + random.random()
-            log.warning("  -> gemini rate limited, retrying in %.1fs", wait)
+            wait = 5 * attempt + random.random()
+            log.warning("  -> gemini rate limited, retrying in %.0fs", wait)
             time.sleep(wait)
             continue
 
         if r.status_code in (500, 502, 503, 504):
-            log.warning("  -> gemini %s, retrying", r.status_code)
-            time.sleep(2 ** attempt)
+            # 503 means Google's side is overloaded, and the newest model is
+            # the busiest. After two strikes, drop to a lighter one.
+            log.warning("  -> gemini %s on %s: %s", r.status_code, model,
+                        r.text[:160].replace("\n", " "))
+            if attempt % 2 == 0 and model_idx + 1 < len(models):
+                model_idx += 1
+                log.info("  -> trying fallback model %s", models[model_idx])
+                continue
+            time.sleep(min(2 ** attempt, 15) + random.random())
             continue
 
         log.error("  -> gemini %s: %s", r.status_code, r.text[:400])
         return None
 
+    log.warning("  -> gave up after %d attempts across %d model(s)", attempt, model_idx + 1)
     return None
 
 
