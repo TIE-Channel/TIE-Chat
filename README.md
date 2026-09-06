@@ -160,8 +160,8 @@ Other knobs, all optional (see `.env.example`):
 | `READ_MIN` / `READ_MAX` | `3` / `12` | silent pause before the typing indicator appears — picking up and unlocking the phone |
 | `READ_CPS` | `25` | reading speed, chars/second, added to that pause based on the incoming message |
 | `READ_CAP` | `40` | hard ceiling on the silent pause |
-| `TYPING_CPS` | `2.5` | typing speed, chars/second — two fingers on a phone, ~23 wpm |
-| `TYPING_MIN` / `TYPING_MAX` | `2` / `60` | floor and ceiling on that pause, in seconds |
+| `TYPING_CPS` | `3.33` | typing speed, chars/second — two fingers on a phone, ~30 wpm |
+| `TYPING_MIN` / `TYPING_MAX` | `2` / `45` | floor and ceiling on that pause, in seconds |
 | `WORKERS` | `4` | chats answered in parallel; `1` turns threading off |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |
@@ -183,6 +183,9 @@ Other knobs, all optional (see `.env.example`):
   makes the message appear to come from you.
 - Filters out Gemini "thought" parts, retries on 429/5xx, splits replies over
   4096 characters.
+- Holds the unsent reply until the typing pause is over, so it can still be
+  called off: deleting the message cancels it silently, editing it starts the
+  answer again from the new text, and a newer message supersedes the old one.
 
 ## Known limits
 

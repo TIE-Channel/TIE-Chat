@@ -82,9 +82,9 @@ READ_CAP = float(os.environ.get("READ_CAP", "40"))        # hard ceiling
 # bot spends roughly as long "typing" as a person would need for that text.
 # 2.5 chars/sec is measured, not guessed: 105 characters in 42 seconds, which
 # is about 23 words per minute - two fingers, on a phone, unhurried.
-TYPING_CPS = float(os.environ.get("TYPING_CPS", "2.5"))   # characters per second
+TYPING_CPS = float(os.environ.get("TYPING_CPS", "3.33"))  # characters per second
 TYPING_MIN = float(os.environ.get("TYPING_MIN", "2"))     # never faster than this
-TYPING_MAX = float(os.environ.get("TYPING_MAX", "60"))    # never slower than this
+TYPING_MAX = float(os.environ.get("TYPING_MAX", "45"))    # never slower than this
 
 # Messages are handled in parallel so one chat's typing pause doesn't stall
 # every other conversation.
@@ -224,6 +224,49 @@ _locks_guard = threading.Lock()
 def chat_lock(key: str) -> threading.Lock:
     with _locks_guard:
         return _chat_locks.setdefault(key, threading.Lock())
+
+
+class Pending:
+    """The message a chat is currently composing an answer to."""
+
+    __slots__ = ("message_id", "cancel")
+
+    def __init__(self, message_id: int) -> None:
+        self.message_id = message_id
+        self.cancel = threading.Event()
+
+
+# key -> Pending. Anything in here is mid-answer: the reply has been generated
+# or is being "typed", but nothing has been sent yet, so it can still be called
+# off if the customer deletes or edits what they wrote.
+pending: Dict[str, Pending] = {}
+_pending_guard = threading.Lock()
+
+NEVER_CANCELLED = threading.Event()
+
+
+def cancel_pending(key: str, reason: str, only_message_id: Optional[int] = None) -> bool:
+    """Call off the answer a chat is composing. Returns True if there was one."""
+    with _pending_guard:
+        p = pending.get(key)
+        if not p:
+            return False
+        if only_message_id is not None and p.message_id != only_message_id:
+            return False
+        p.cancel.set()
+        pending.pop(key, None)
+    log.info("  -> dropping the unsent reply: %s", reason)
+    return True
+
+
+def wait_unless_cancelled(cancel: threading.Event, seconds: float) -> bool:
+    """Pause, but wake instantly if the answer gets called off.
+
+    Returns True to carry on, False if the reply should be abandoned.
+    """
+    if seconds <= 0:
+        return not cancel.is_set()
+    return not cancel.wait(seconds)
 
 session = requests.Session()
 session.headers["User-Agent"] = "tg-business-ai/1.0"
@@ -529,7 +572,8 @@ def ask_gemini(key: str, user_text: str) -> Optional[str]:
 # --------------------------------------------------------------------------
 
 
-def handle_business_message(msg: dict) -> None:
+def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None) -> None:
+    cancel = cancel if cancel is not None else NEVER_CANCELLED
     connection_id = msg.get("business_connection_id")
     chat = msg.get("chat") or {}
     sender = msg.get("from") or {}
@@ -596,10 +640,8 @@ def handle_business_message(msg: dict) -> None:
         return skip("no text (sticker, photo, voice note)")
 
     key = f"{connection_id}:{chat_id}"
-    now = time.time()
-    if now - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
+    if time.time() - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
         return skip("within REPLY_COOLDOWN of the last reply")
-    last_reply_at[key] = now
 
     user_text = text[:MAX_INPUT_CHARS]
     log.info("  -> answering...")
@@ -611,25 +653,35 @@ def handle_business_message(msg: dict) -> None:
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
+    if cancel.is_set():
+        return
 
     # Pick up the phone, unlock it, read the message. Nothing shows yet.
     pause = read_delay(user_text) - (time.time() - started)
     if pause > 0:
         log.info("  -> noticing the message in %.1fs", pause)
-        time.sleep(pause)
+    if not wait_unless_cancelled(cancel, pause):
+        return
 
     # Only now does the indicator light up, and it stays lit until the message
     # actually lands.
     with Typing(connection_id, chat_id):
         pause = typing_delay(answer, 0.0)
         log.info("  -> typing %.1fs for %d chars", pause, len(answer))
-        time.sleep(pause)
+        if not wait_unless_cancelled(cancel, pause):
+            return
 
     history[key].append({"role": "user", "text": user_text})
     history[key].append({"role": "model", "text": answer})
 
+    last_reply_at[key] = time.time()
     send_reply(connection_id, chat_id, answer, msg.get("message_id"))
     log.info("  -> replied: %r", answer[:60])
+
+    with _pending_guard:
+        p = pending.get(key)
+        if p and p.cancel is cancel:
+            pending.pop(key, None)
 
 
 def dispatch_business_message(msg: dict) -> None:
@@ -641,10 +693,18 @@ def dispatch_business_message(msg: dict) -> None:
     chat = msg.get("chat") or {}
     key = f"{msg.get('business_connection_id')}:{chat.get('id')}"
 
+    # Anything still being composed for this chat is now out of date - a newer
+    # message has arrived, or this one replaced an edited original.
+    cancel_pending(key, "a newer message arrived")
+
+    entry = Pending(msg.get("message_id"))
+    with _pending_guard:
+        pending[key] = entry
+
     def run() -> None:
         with chat_lock(key):
             try:
-                handle_business_message(msg)
+                handle_business_message(msg, entry.cancel)
             except Exception:
                 log.exception("error answering chat %s", chat.get("id"))
 
@@ -679,7 +739,35 @@ def handle_update(update: dict) -> None:
         dispatch_business_message(update["business_message"])
         return
     if "edited_business_message" in update:
-        log.info("edited business message, ignored")
+        msg = update["edited_business_message"]
+        chat = msg.get("chat") or {}
+        key = f"{msg.get('business_connection_id')}:{chat.get('id')}"
+        with _pending_guard:
+            p = pending.get(key)
+            mid = msg.get("message_id")
+            answering_it = bool(p and p.message_id == mid)
+        if answering_it:
+            # They fixed it before we answered - throw our draft away and read
+            # the new version from scratch.
+            log.info("message %s edited mid-answer, starting over", mid)
+            dispatch_business_message(msg)
+        else:
+            log.info("edited business message %s, already answered - ignored", mid)
+        return
+
+    if "deleted_business_messages" in update:
+        d = update["deleted_business_messages"]
+        chat = d.get("chat") or {}
+        key = f"{d.get('business_connection_id')}:{chat.get('id')}"
+        ids = set(d.get("message_ids") or [])
+        with _pending_guard:
+            p = pending.get(key)
+            mine = p.message_id if p else None
+        if mine in ids:
+            # They took it back before we answered. Say nothing and wait for
+            # whatever they write next.
+            log.info("message %s deleted before the reply went out", mine)
+            cancel_pending(key, "the message was deleted", only_message_id=mine)
         return
 
     # A normal DM to the bot itself - handy for checking it is alive.
@@ -737,6 +825,7 @@ ALLOWED_UPDATES = [
     "business_connection",
     "business_message",
     "edited_business_message",
+    "deleted_business_messages",
 ]
 
 
