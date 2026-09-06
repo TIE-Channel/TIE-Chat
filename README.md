@@ -58,22 +58,13 @@ for a card:
 | `CEREBRAS_API_KEY` | [cloud.cerebras.ai](https://cloud.cerebras.ai) | ~30 req/min, ~1M tokens/day |
 | `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) | one key, many `:free` models |
 | `MISTRAL_API_KEY` | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | needs a phone number — see note |
-| `GITHUB_MODELS_TOKEN` | [github.com/settings/tokens](https://github.com/settings/tokens) | needs the `models` permission only — see note |
+| `NVIDIA_API_KEY` | [build.nvidia.com](https://build.nvidia.com) | NVIDIA NIM, ~80 models |
+| `HF_TOKEN` | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) | Hugging Face Inference Providers |
 
-**The GitHub token needs exactly one permission, and no repository access.**
-Since May 2025 GitHub Models requires `models:read`, and that is *all* this bot
-needs — it never touches your code. Use a **fine-grained** token:
-
-- Type: **Fine-grained personal access token**
-- Repository access: **Public repositories** (or "Only select repositories" and
-  pick none) — the bot reads no repos
-- Permissions → **Account permissions** → **Models** → **Read-only**
-- Leave every other permission untouched
-
-If you use a **classic** token instead, tick only the **`models`** checkbox and
-nothing else. A classic token with `repo` ticked hands whoever holds it your
-private source code — which is why the one you pasted earlier is the urgent one
-to revoke.
+**GitHub Models is gone.** It was fully retired on 30 July 2026 and now answers
+`HTTP 410`. It is not in the default order; if `GITHUB_MODELS_TOKEN` is still
+set the bot ignores it and says so at startup. Revoke that token — it buys you
+nothing and a classic PAT usually carries repo access.
 
 **Mistral is the fiddly one.** "You don't have access to this application"
 means the account exists but the free tier isn't switched on yet: Mistral gates
@@ -83,7 +74,7 @@ but a real phone number. If you'd rather not hand one over, skip it — the othe
 five need nothing but an email, and any two of them already make the bot
 effectively outage-proof.
 
-Order is `AI_ORDER`, default `gemini,groq,cerebras,openrouter,mistral,github`.
+Order is `AI_ORDER`, default `gemini,groq,cerebras,openrouter,nvidia,huggingface,mistral`.
 Providers without a key are skipped silently, so you can add them one at a
 time. The log names whoever ends up answering:
 
@@ -350,7 +341,7 @@ Other knobs, all optional (see `.env.example`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AI_ORDER` | `gemini,groq,cerebras,openrouter,mistral,github` | provider order; those without a key are skipped |
+| `AI_ORDER` | `gemini,groq,cerebras,openrouter,nvidia,huggingface,mistral` | provider order; those without a key are skipped |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | falls back to a working flash model if your key can't use it |
 | `GROQ_MODEL` etc. | see table above | per-provider model override |
 | `HISTORY_TURNS` | `20` | messages of context kept per chat |

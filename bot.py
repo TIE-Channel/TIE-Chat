@@ -208,14 +208,21 @@ PROVIDER_CATALOGUE = {
                    "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
     "mistral":    ("https://api.mistral.ai/v1", "MISTRAL_API_KEY",
                    "MISTRAL_MODEL", "mistral-small-latest"),
-    "github":     ("https://models.github.ai/inference", "GITHUB_MODELS_TOKEN",
-                   "GITHUB_MODEL", "openai/gpt-4o-mini"),
+    "nvidia":     ("https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY",
+                   "NVIDIA_MODEL", "meta/llama-3.3-70b-instruct"),
+    "huggingface": ("https://router.huggingface.co/v1", "HF_TOKEN",
+                   "HF_MODEL", "meta-llama/Llama-3.3-70B-Instruct"),
+    # GitHub Models was fully retired on 30 July 2026. Kept only so an old
+    # GITHUB_MODELS_TOKEN produces an explanation instead of a mystery.
+    "github":     ("", "GITHUB_MODELS_TOKEN", "GITHUB_MODEL", ""),
 }
+
+RETIRED = {"github": "GitHub Models was retired on 30 July 2026"}
 
 AI_ORDER = [
     n.strip().lower()
     for n in os.environ.get(
-        "AI_ORDER", "gemini,groq,cerebras,openrouter,mistral,github"
+        "AI_ORDER", "gemini,groq,cerebras,openrouter,nvidia,huggingface,mistral"
     ).split(",")
     if n.strip()
 ]
@@ -232,6 +239,9 @@ def build_providers() -> List[Provider]:
         base, key_env, model_env, default_model = spec
         key = os.environ.get(key_env, "").strip()
         if not key:
+            continue
+        if name in RETIRED:
+            log.warning("%s is set but %s - ignoring it", key_env, RETIRED[name])
             continue
         out.append(Provider(name, base, key,
                             os.environ.get(model_env, default_model).strip()))
@@ -341,6 +351,11 @@ logging.basicConfig(
 log = logging.getLogger("tgbiz")
 
 PROVIDERS = build_providers()
+
+for _name, _why in RETIRED.items():
+    if os.environ.get(PROVIDER_CATALOGUE[_name][1], "").strip():
+        log.warning("%s is set, but %s - remove the variable and revoke the token",
+                    PROVIDER_CATALOGUE[_name][1], _why)
 
 
 # --------------------------------------------------------------------------
@@ -680,10 +695,17 @@ def score_model(name: str, provider: str) -> int:
     return score
 
 
-def suggested_by_error(text: str) -> Optional[str]:
+def suggested_by_error(text: str, provider: str = "") -> Optional[str]:
     """Some providers name the replacement right in the error message."""
     m = re.search(r"use this slug instead:?\s*([\w\-./:]+)", text, re.I)
-    return m.group(1).rstrip(".,") if m else None
+    if not m:
+        return None
+    slug = m.group(1).rstrip(".,")
+    # OpenRouter happily points at the paid twin of a retired free model.
+    # Take the hint, but keep it on the free tier.
+    if provider == "openrouter" and not slug.endswith(":free"):
+        slug += ":free"
+    return slug
 
 
 def discover_model(p: Provider) -> Optional[str]:
@@ -752,7 +774,7 @@ def openai_chat(
         # A dead model name is fixable without you: find a live one and retry.
         if looks_like_model_error(r.status_code, r.text) and not p.searched:
             p.searched = True
-            alt = suggested_by_error(r.text) or discover_model(p)
+            alt = suggested_by_error(r.text, p.name) or discover_model(p)
             if alt and alt != p.model:
                 log.warning("  -> %s: %s is gone, switching to %s "
                             "(set %s_MODEL to keep it)",
@@ -1509,9 +1531,27 @@ def probe_provider(p: Provider) -> tuple:
     # A dead model name is the most common failure, and the fix is knowable:
     # ask the provider what it actually serves.
     if looks_like_model_error(r.status_code, r.text):
-        alt = suggested_by_error(r.text) or discover_model(p)
-        if alt:
-            detail += f" - use {p.name.upper()}_MODEL={alt}"
+        alt = suggested_by_error(r.text, p.name) or discover_model(p)
+        if alt and alt != p.model:
+            # Don't just suggest it - try it, and if it works, keep it.
+            try:
+                r2 = session.post(
+                    f"{p.base}/chat/completions", headers=headers,
+                    json={"model": alt, "max_tokens": 16, "temperature": 0,
+                          "messages": [{"role": "user", "content": "Reply with OK"}]},
+                    timeout=25,
+                )
+            except Exception:
+                r2 = None
+            if r2 is not None and r2.status_code == 200:
+                old_model, p.model = p.model, alt
+                log.warning("check: %s switched %s -> %s", p.name, old_model, alt)
+                return (True,
+                        f"{alt}  (was {old_model}; pin it with {p.name.upper()}_MODEL)",
+                        time.time() - started)
+            detail += f" - {alt} did not work either"
+        elif alt:
+            detail += f" - try {p.name.upper()}_MODEL={alt}"
     return False, detail, took
 
 
