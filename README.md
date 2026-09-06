@@ -14,7 +14,7 @@ No webhook, no public URL, no framework — just long polling and two HTTP APIs.
 |---|---|---|
 | Telegram **Premium** on your personal account | paid | required by Telegram for Business mode — there is no free workaround |
 | A bot token | free | @BotFather |
-| A Gemini API key | free tier | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| At least one AI key | free tier | Gemini, Groq, Cerebras, OpenRouter, Mistral or GitHub Models — see below |
 | A host | free tier | Railway / Render / Fly.io |
 
 ---
@@ -44,6 +44,70 @@ the bot to your business account.
 The free tier is rate-limited per minute and per day. If you get more traffic
 than that, the bot logs a rate-limit warning, backs off, and retries.
 
+## Step 3b — Add backup AI providers (recommended)
+
+One free tier is one 429 away from a silent bot. The bot takes a list of
+providers and uses the first one that answers, so add a couple of spares — each
+is a key in an env variable, no code changes. All of them are free and none ask
+for a card:
+
+| Provider | Key from | Notes |
+|---|---|---|
+| `GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | best quality of the free ones |
+| `GROQ_API_KEY` | [console.groq.com/keys](https://console.groq.com/keys) | ~30 req/min, extremely fast |
+| `CEREBRAS_API_KEY` | [cloud.cerebras.ai](https://cloud.cerebras.ai) | ~30 req/min, ~1M tokens/day |
+| `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) | one key, many `:free` models |
+| `MISTRAL_API_KEY` | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | needs a phone number — see note |
+| `GITHUB_MODELS_TOKEN` | [github.com/settings/tokens](https://github.com/settings/tokens) | needs the `models` permission only — see note |
+
+**The GitHub token needs exactly one permission, and no repository access.**
+Since May 2025 GitHub Models requires `models:read`, and that is *all* this bot
+needs — it never touches your code. Use a **fine-grained** token:
+
+- Type: **Fine-grained personal access token**
+- Repository access: **Public repositories** (or "Only select repositories" and
+  pick none) — the bot reads no repos
+- Permissions → **Account permissions** → **Models** → **Read-only**
+- Leave every other permission untouched
+
+If you use a **classic** token instead, tick only the **`models`** checkbox and
+nothing else. A classic token with `repo` ticked hands whoever holds it your
+private source code — which is why the one you pasted earlier is the urgent one
+to revoke.
+
+**Mistral is the fiddly one.** "You don't have access to this application"
+means the account exists but the free tier isn't switched on yet: Mistral gates
+it behind **phone (SMS) verification**, and you then have to activate the free
+**Experiment** plan in the console before the API Keys page will open. No card,
+but a real phone number. If you'd rather not hand one over, skip it — the other
+five need nothing but an email, and any two of them already make the bot
+effectively outage-proof.
+
+Order is `AI_ORDER`, default `gemini,groq,cerebras,openrouter,mistral,github`.
+Providers without a key are skipped silently, so you can add them one at a
+time. The log names whoever ends up answering:
+
+```
+-> gemini 429 on gemini-3.8-flash: quota exceeded
+-> handing over to the next provider instead of waiting
+-> groq 200 in 0.6s, 74 chars
+-> answered by groq (the ones before it were busy)
+```
+
+When a backup exists, Gemini stops retrying almost immediately — switching
+costs half a second, waiting out a backoff costs the customer. The group judge
+uses the same chain, so it survives an outage too. `/status` lists the live
+order.
+
+Conversation history is stored provider-neutrally and converted per call, so
+switching providers mid-conversation loses nothing: if Gemini answers one
+message and Groq the next, Groq sees the whole thread — including Gemini's
+reply — and the identical persona prompt. The person on the other end cannot
+tell that anything changed.
+
+Everything except Gemini is OpenAI-compatible, so any other endpoint of that
+shape can be dropped into `PROVIDER_CATALOGUE` in five lines.
+
 ## Step 4 — Run it once locally to check it works
 
 ```bash
@@ -65,6 +129,31 @@ python list_models.py     # which Gemini models your key can use
 
 Message your bot directly with `/start` — it should answer. That only proves it
 is alive; the real work happens after step 5.
+
+Three owner-only commands in that private chat:
+
+| Command | What it does |
+|---|---|
+| `/start` | proves the bot is running |
+| `/status` | model in use, providers, business connections, group settings |
+| `/check` | sends one real request to **every** configured AI provider and reports which keys work, which model answered, and how long it took |
+
+`/check` is the fast way to find a dead key. It names the HTTP error the
+provider returned, and if a model has been decommissioned it asks the provider
+what it does serve and tells you exactly what to set:
+
+```
+2 of 4 providers answered. The working ones cover for the rest.
+
+OK    gemini      gemini-3.8-flash  (1.2s)
+OK    groq        llama-3.3-70b-versatile  (0.4s)
+FAIL  cerebras    HTTP 404: model `llama-3.3-70b` was decommissioned
+                  - try CEREBRAS_MODEL=llama-4-scout-17b
+FAIL  openrouter  HTTP 401: No auth credentials found
+```
+
+Anyone who isn't `OWNER_ID` gets "This bot is private." and no diagnostics.
+The same check runs standalone as `python check_keys.py`.
 
 ## Step 5 — Connect it to Telegram Business
 
@@ -139,19 +228,29 @@ Telegram Business only covers 1:1 chats. For a group the bot joins as an
 ordinary member, and posts under its own name (`@TieChat_bot`), not yours.
 
 1. Add the bot to the group like any other member.
-2. That's it. **He only speaks when the room involves him** — addressed, or
-   talked about. An interesting subject is not an invitation: a whole argument
-   about AI and cassette tapes goes past him in silence unless somebody brings
-   him into it.
+2. That's it. He always answers when the room involves him, and may join a
+   conversation that isn't about him when he has something worth adding.
 
-   Concretely, he answers when:
+   He always answers when:
    - somebody **@mentions it**, or **replies to one of its messages** — these
      always go through, no judging and no cooldown;
    - somebody **calls him by name** — "Илья", "Илюха", or just "бот", which is
      what people in a group tend to call him;
    - **somebody is talking about him** — asking where he went, wondering why
      he's quiet, referring to him in the third person, arguing with something
-     he said. A second, cheap model reads the last dozen lines and decides.
+     he said.
+
+   Beyond that, a second cheap model reads the last dozen lines and decides
+   whether he has a reason to join in: he knows something about the subject,
+   somebody said something plainly wrong, a question is hanging unanswered, or
+   the room is joking and a line would land. Being merely interested is
+   explicitly *not* a reason — everyone could have an opinion, that isn't one.
+
+   The judge is also told how many seconds he has been quiet and instructed to
+   weigh it: two uninvited lines in a row is where a chat member becomes a
+   nuisance. That replaces the old fixed cooldown with something that can read
+   the room. Set `GROUP_JOIN_TOPICS=false` to go back to answering only when
+   addressed or discussed.
 
 There is no keyword list any more — the judge does that job better. A name in
 the text is not a trigger on its own either, it is a *signal handed to the
@@ -238,7 +337,9 @@ Other knobs, all optional (see `.env.example`):
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `AI_ORDER` | `gemini,groq,cerebras,openrouter,mistral,github` | provider order; those without a key are skipped |
 | `GEMINI_MODEL` | `gemini-3.8-flash` | falls back to a working flash model if your key can't use it |
+| `GROQ_MODEL` etc. | see table above | per-provider model override |
 | `HISTORY_TURNS` | `20` | messages of context kept per chat |
 | `REPLY_COOLDOWN` | `2` | seconds between replies in one chat |
 | `IGNORE_USER_IDS` | — | user IDs that never get an auto-reply |
@@ -261,7 +362,8 @@ Other knobs, all optional (see `.env.example`):
 | `GROUP_JUDGE_MAX_PER_MIN` | `8` | ceiling on judge calls per group per minute |
 | `GROUP_NAMES` | built-in list | names he answers to; exact words, no stemming |
 | `GROUP_COOLDOWN` | `0` | enforced silence between his group replies; 0 = none |
-| `GROUP_JUDGE_RECENT_TURNS` | `6` | how recently he must have spoken for an unnamed message to be judged |
+| `GROUP_JOIN_TOPICS` | `true` | may join conversations that aren't about him |
+| `GROUP_JUDGE_RECENT_TURNS` | `6` | only with `GROUP_JOIN_TOPICS=false`: how recently he must have spoken for an unnamed message to be judged |
 | `GROUP_DELAY` | `false` | `true` applies the 1:1 read/typing pauses in groups as well |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |

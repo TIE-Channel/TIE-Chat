@@ -156,7 +156,16 @@ GROUP_COOLDOWN = float(
     or "0"
 )
 
-# When his name is not used, judge only if he is already part of this exchange:
+# May he join a conversation that is not about him, when the judge thinks he
+# has something worth adding? With several providers behind him, quota is no
+# longer the reason to say no - so this is on. The judge still has to be
+# convinced, and it is told to weigh how recently he spoke.
+GROUP_JOIN_TOPICS = os.environ.get("GROUP_JOIN_TOPICS", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# Only used when GROUP_JOIN_TOPICS is off: with no name in the message, judge
+# only if he is already part of this exchange -
 # somebody may be referring to him as "он", "ему", "he". If he has not appeared
 # in the last few lines, the conversation is not about him and needs no call.
 GROUP_JUDGE_RECENT_TURNS = int(os.environ.get("GROUP_JUDGE_RECENT_TURNS", "6"))
@@ -168,6 +177,64 @@ GROUP_DELAY = os.environ.get("GROUP_DELAY", "").strip().lower() in ("1", "true",
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
+
+
+# --------------------------------------------------------------------------
+# AI providers. Gemini speaks its own dialect; everything else below is
+# OpenAI-compatible, so one client covers all of them. Providers are tried in
+# order and the first one that answers wins, which means a 429 on the free tier
+# is a half-second detour instead of a dead chat.
+# --------------------------------------------------------------------------
+
+class Provider:
+    __slots__ = ("name", "base", "key", "model")
+
+    def __init__(self, name: str, base: str, key: str, model: str) -> None:
+        self.name, self.base, self.key, self.model = name, base, key, model
+
+    def __repr__(self) -> str:
+        return f"{self.name}({self.model})"
+
+
+# name -> (base url, env var for the key, env var for the model, default model)
+PROVIDER_CATALOGUE = {
+    "gemini":     ("", "GEMINI_API_KEY", "GEMINI_MODEL", ""),
+    "groq":       ("https://api.groq.com/openai/v1", "GROQ_API_KEY",
+                   "GROQ_MODEL", "llama-3.3-70b-versatile"),
+    "cerebras":   ("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY",
+                   "CEREBRAS_MODEL", "llama-3.3-70b"),
+    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
+                   "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
+    "mistral":    ("https://api.mistral.ai/v1", "MISTRAL_API_KEY",
+                   "MISTRAL_MODEL", "mistral-small-latest"),
+    "github":     ("https://models.inference.ai.azure.com", "GITHUB_MODELS_TOKEN",
+                   "GITHUB_MODEL", "gpt-4o-mini"),
+}
+
+AI_ORDER = [
+    n.strip().lower()
+    for n in os.environ.get(
+        "AI_ORDER", "gemini,groq,cerebras,openrouter,mistral,github"
+    ).split(",")
+    if n.strip()
+]
+
+
+def build_providers() -> List[Provider]:
+    """Every provider you actually supplied a key for, in your chosen order."""
+    out: List[Provider] = []
+    for name in AI_ORDER:
+        spec = PROVIDER_CATALOGUE.get(name)
+        if not spec:
+            log.warning("unknown provider %r in AI_ORDER, ignoring", name)
+            continue
+        base, key_env, model_env, default_model = spec
+        key = os.environ.get(key_env, "").strip()
+        if not key:
+            continue
+        out.append(Provider(name, base, key,
+                            os.environ.get(model_env, default_model).strip()))
+    return out
 
 DEFAULT_PERSONA = """\
 You are answering messages on your own Telegram account. Somebody wrote to \
@@ -271,6 +338,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("tgbiz")
+
+PROVIDERS = build_providers()
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +646,92 @@ def pick_working_model() -> str:
     return GEMINI_MODEL
 
 
+def openai_turns(key: str, user_text: Optional[str]) -> List[dict]:
+    msgs = [
+        {"role": "user" if h["role"] == "user" else "assistant", "content": h["text"]}
+        for h in history[key]
+    ]
+    if user_text is not None:
+        msgs.append({"role": "user", "content": user_text})
+    return msgs
+
+
+def openai_chat(
+    p: Provider,
+    system: str,
+    messages: List[dict],
+    max_tokens: int,
+    json_mode: bool = False,
+    timeout: Optional[int] = None,
+) -> Optional[str]:
+    """One call to any OpenAI-compatible endpoint. None means it did not work."""
+    body: Dict[str, Any] = {
+        "model": p.model,
+        "messages": [{"role": "system", "content": system}] + messages,
+        "temperature": 0.2 if json_mode else TEMPERATURE,
+        "max_tokens": max_tokens,
+    }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {p.key}", "Content-Type": "application/json"}
+    if p.name == "openrouter":                      # OpenRouter asks for these
+        headers["HTTP-Referer"] = "https://t.me"
+        headers["X-Title"] = "telegram-business-bot"
+
+    started = time.time()
+    try:
+        r = session.post(f"{p.base}/chat/completions", headers=headers, json=body,
+                         timeout=timeout or GEMINI_TIMEOUT)
+    except Exception as exc:
+        log.warning("  -> %s failed after %.0fs: %s", p.name, time.time() - started, exc)
+        return None
+
+    if r.status_code != 200:
+        log.warning("  -> %s %s: %s", p.name, r.status_code,
+                    r.text[:140].replace("\n", " "))
+        return None
+    try:
+        text = r.json()["choices"][0]["message"]["content"]
+    except Exception as exc:
+        log.warning("  -> %s gave unusable output: %s", p.name, exc)
+        return None
+    text = (text or "").strip()
+    if not text:
+        log.warning("  -> %s returned an empty message", p.name)
+        return None
+    log.info("  -> %s 200 in %.1fs, %d chars", p.name, time.time() - started, len(text))
+    return text
+
+
+def ask_ai(
+    key: str,
+    user_text: Optional[str],
+    extra_system: str = "",
+    cancel: Optional[threading.Event] = None,
+) -> Optional[str]:
+    """Ask the providers in order; the first one that answers wins."""
+    if not PROVIDERS:
+        log.error("no AI providers configured - set at least one API key")
+        return None
+
+    system = PERSONA + SYSTEM_SUFFIX + extra_system + now_line()
+    for p in PROVIDERS:
+        if cancel is not None and cancel.is_set():
+            return None
+        if p.name == "gemini":
+            text = ask_gemini(key, user_text, extra_system, cancel)
+        else:
+            text = openai_chat(p, system, openai_turns(key, user_text),
+                               MAX_OUTPUT_TOKENS)
+        if text:
+            if p is not PROVIDERS[0]:
+                log.warning("  -> answered by %s (the ones before it were busy)", p.name)
+            return text
+        log.warning("  -> %s could not answer, moving on", p.name)
+    log.error("  -> every provider failed")
+    return None
+
+
 def ask_gemini(
     key: str,
     user_text: Optional[str],
@@ -632,7 +787,12 @@ def ask_gemini(
     model_idx = 0
     attempt = 0
 
-    while attempt < 6 and model_idx < len(models):
+    # With other providers behind us there is no point grinding through a long
+    # backoff here - switching costs half a second, waiting costs the customer.
+    have_backup = len(PROVIDERS) > 1
+    max_attempts = 2 if have_backup else 6
+
+    while attempt < max_attempts and model_idx < len(models):
         # Give up the moment the reply is called off. Without this a retry
         # storm (429s, an overloaded model) would hold the chat's lock for a
         # minute while the customer waits on a message we will never send.
@@ -710,6 +870,9 @@ def ask_gemini(
                 model_idx += 1
                 log.info("  -> switching to %s", models[model_idx])
                 continue  # straight to the next model, no waiting
+            if have_backup:
+                log.info("  -> handing over to the next provider instead of waiting")
+                return None
             wait = min(4 * attempt, 20) + random.random()
             log.info("  -> all models busy, waiting %.0fs", wait)
             if cancel is not None:
@@ -817,7 +980,7 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
     # Generate first, while the chat still looks untouched - as far as the other
     # side is concerned the phone is still face down on a table somewhere.
     started = time.time()
-    answer = ask_gemini(key, user_text, cancel=cancel)
+    answer = ask_ai(key, user_text, cancel=cancel)
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
@@ -926,12 +1089,22 @@ refers to him in the third person, quotes him, argues with something he said, \
 complains about him, or answers a point of his.
 - Somebody replies to a line of his and clearly expects something back.
 
-Otherwise he says nothing - and "otherwise" covers almost everything.
+Those three always get an answer.
 
-In particular, an interesting subject is NOT an invitation. Technology, AI, \
-bots, retro, how things used to be done - he has opinions about all of it, and \
-none of that matters here. If nobody brought him into it, it is not his \
-conversation and he stays out of it.
+HE MAY ALSO JOIN A CONVERSATION THAT IS NOT ABOUT HIM - but only when he has \
+something genuinely worth adding, and only with the restraint of a man who \
+knows the difference between contributing and interrupting. Reasons good \
+enough: the subject is one he actually knows something about; somebody said \
+something sweeping or plainly wrong; a question is hanging in the air that \
+nobody has answered; the room is joking and a good line would land.
+
+Reasons that are NOT good enough: the topic is merely interesting; he has an \
+opinion; he could be funny about it. Everyone could. That is not a reason.
+
+Weigh how recently he spoke - you are told how many seconds ago. If he has \
+just said something and nothing new has been put to him, he stays quiet: two \
+uninvited lines in a row from the same person is where a chat member becomes \
+a nuisance. The longer he has been silent, the more freely he may join in.
 
 Stay quiet as well when:
 - one of his names appears but the talk is about bots or software in general, \
@@ -999,6 +1172,36 @@ def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) ->
         f"Should he say something now?"
     )
 
+    for p in PROVIDERS:
+        verdict = judge_via(p, question)
+        if verdict is not None:
+            reason = str(verdict.get("reason", ""))[:80]
+            if verdict.get("speak"):
+                return f"context: {reason}"
+            log.info("  staying quiet - %s", reason)
+            return ""
+        log.info("  judge: %s unavailable, trying the next provider", p.name)
+    return None
+
+
+def judge_via(p: Provider, question: str) -> Optional[dict]:
+    """Run the speak/stay-quiet decision on one provider. None = it failed."""
+    if p.name != "gemini":
+        raw = openai_chat(
+            p,
+            JUDGE_PROMPT + '\n\nAnswer with JSON only: '
+                           '{"speak": true|false, "reason": "a few words"}',
+            [{"role": "user", "content": question}],
+            max_tokens=300, json_mode=True, timeout=20,
+        )
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            log.warning("  judge: %s did not return JSON", p.name)
+            return None
+
     model = judge_model()
     url = f"{GEMINI_API}/models/{model}:generateContent"
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
@@ -1031,16 +1234,11 @@ def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) ->
             return None
         try:
             parts = (r.json()["candidates"][0].get("content") or {}).get("parts") or []
-            raw = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-            verdict = json.loads(raw)
+            raw = "".join(x.get("text", "") for x in parts if not x.get("thought"))
+            return json.loads(raw)
         except Exception as exc:
             log.warning("  judge gave unusable output: %s", exc)
             return None
-        reason = str(verdict.get("reason", ""))[:80]
-        if verdict.get("speak"):
-            return f"context: {reason}"
-        log.info("  staying quiet - %s", reason)
-        return ""
     return None
 
 
@@ -1069,11 +1267,12 @@ def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
             return None
         if len(text) < GROUP_JUDGE_MIN_CHARS:
             return None
-        # No name, and he has not been part of the last few lines - then nobody
-        # can be referring to him, and there is nothing for the judge to weigh.
-        recent = list(history[key])[-GROUP_JUDGE_RECENT_TURNS:]
-        if not any(h["role"] == "model" for h in recent):
-            return None
+        if not GROUP_JOIN_TOPICS:
+            # No name, and he has not been part of the last few lines - nobody
+            # can be referring to him, so there is nothing for the judge to weigh.
+            recent = list(history[key])[-GROUP_JUDGE_RECENT_TURNS:]
+            if not any(h["role"] == "model" for h in recent):
+                return None
 
     if not judge_budget_ok(key):
         log.info("%s | judge budget spent for this minute", key)
@@ -1126,7 +1325,7 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     log.info("  -> answering...")
     started = time.time()
-    answer = ask_gemini(key, None, GROUP_NOTE)
+    answer = ask_ai(key, None, GROUP_NOTE)
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
@@ -1200,10 +1399,95 @@ def dispatch_business_message(msg: dict) -> None:
         run()
 
 
+def probe_provider(p: Provider) -> tuple:
+    """One tiny real request. Returns (ok, detail, seconds)."""
+    started = time.time()
+
+    if p.name == "gemini":
+        try:
+            r = session.post(
+                f"{GEMINI_API}/models/{GEMINI_MODEL}:generateContent",
+                headers={"x-goog-api-key": p.key, "Content-Type": "application/json"},
+                json={"contents": [{"role": "user", "parts": [{"text": "Reply with OK"}]}],
+                      "generationConfig": {"maxOutputTokens": 1024, "temperature": 0}},
+                timeout=25,
+            )
+        except Exception as exc:
+            return False, f"network error: {exc}", time.time() - started
+        took = time.time() - started
+        return (True, GEMINI_MODEL, took) if r.status_code == 200 else (
+            False, http_error(r), took)
+
+    headers = {"Authorization": f"Bearer {p.key}", "Content-Type": "application/json"}
+    if p.name == "openrouter":
+        headers["HTTP-Referer"] = "https://t.me"
+        headers["X-Title"] = "telegram-business-bot"
+    try:
+        r = session.post(
+            f"{p.base}/chat/completions", headers=headers,
+            json={"model": p.model, "max_tokens": 16, "temperature": 0,
+                  "messages": [{"role": "user", "content": "Reply with OK"}]},
+            timeout=25,
+        )
+    except Exception as exc:
+        return False, f"network error: {exc}", time.time() - started
+    took = time.time() - started
+    if r.status_code == 200:
+        return True, p.model, took
+
+    detail = http_error(r)
+    # A dead model name is the most common failure, and the fix is knowable:
+    # ask the provider what it actually serves.
+    if any(w in detail.lower() for w in ("model", "not found", "decommission")):
+        try:
+            lr = session.get(f"{p.base}/models", headers=headers, timeout=20)
+            ids = [m.get("id") for m in (lr.json().get("data") or []) if m.get("id")]
+        except Exception:
+            ids = []
+        if ids:
+            alt = next((m for m in ids if "llama" in m.lower()), ids[0])
+            detail += f" - try {p.name.upper()}_MODEL={alt}"
+    return False, detail, took
+
+
+def http_error(r: Any) -> str:
+    try:
+        err = r.json().get("error", {})
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+    except Exception:
+        msg = None
+    msg = (msg or r.text or "")[:120].replace("\n", " ").strip()
+    return f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}"
+
+
+def check_providers() -> str:
+    """Probe every configured provider and describe what happened."""
+    if not PROVIDERS:
+        return "No AI providers configured at all - the bot cannot answer anything."
+
+    lines, working = [], 0
+    for p in PROVIDERS:
+        ok, detail, took = probe_provider(p)
+        if ok:
+            working += 1
+            lines.append(f"OK    {p.name:<11} {detail}  ({took:.1f}s)")
+        else:
+            lines.append(f"FAIL  {p.name:<11} {detail}")
+        log.info("check: %s %s", p.name, "ok" if ok else f"failed - {detail}")
+
+    head = f"{working} of {len(PROVIDERS)} providers answered."
+    if working == 0:
+        head += " Nothing will work until one of them does."
+    elif working < len(PROVIDERS):
+        head += " The working ones cover for the rest."
+    return head + "\n\n" + "\n".join(lines)
+
+
 def status_report() -> str:
     lines = [
         f"locked to owner: {OWNER_ID or 'NO - anyone can use this bot'}",
         f"group trigger: {GROUP_TRIGGER}"
+        + (", may join topics" if GROUP_JOIN_TOPICS else ", only when addressed")
         + (f" via {judge_model()}" if GROUP_TRIGGER == "context" else ""),
         "group messages: " + (
             "all visible, keywords work"
@@ -1211,7 +1495,10 @@ def status_report() -> str:
             else "PRIVACY MODE ON - only mentions and replies arrive, "
                  "keywords cannot fire (see /setprivacy in BotFather)"
         ),
-        f"model: {GEMINI_MODEL}",
+        "providers: " + ", ".join(
+            f"{p.name}/{GEMINI_MODEL if p.name == 'gemini' else p.model}"
+            for p in PROVIDERS
+        ),
         f"uptime: {int((time.time() - STARTED_AT) / 60)} min",
         f"business connections known: {len(owner_of_connection)}",
     ]
@@ -1289,7 +1576,21 @@ def handle_update(update: dict) -> None:
                text="This bot is private.")
         return
 
-    if text.startswith("/status"):
+    if text.startswith("/check"):
+        chat_id = msg["chat"]["id"]
+        tg("sendMessage", chat_id=chat_id,
+           text=f"Checking {len(PROVIDERS)} provider(s), one real request each...")
+
+        def run_check() -> None:
+            try:
+                tg("sendMessage", chat_id=chat_id, text=check_providers())
+            except Exception:
+                log.exception("provider check failed")
+                tg("sendMessage", chat_id=chat_id, text="The check itself broke - see the log.")
+
+        # Probing five providers can take a minute; never block the poll loop.
+        EXECUTOR.submit(run_check) if ASYNC_REPLIES else run_check()
+    elif text.startswith("/status"):
         tg("sendMessage", chat_id=msg["chat"]["id"], text=status_report())
     elif text.startswith("/start"):
         tg(
@@ -1298,7 +1599,8 @@ def handle_update(update: dict) -> None:
             text=(
                 "I'm alive. Connect me under Settings -> Telegram Business -> "
                 "Chatbots and I'll answer your customers for you.\n\n"
-                "Send /status to see what I currently know."
+                "/status - what I currently know\n"
+                "/check  - test every AI provider key"
             ),
         )
 
@@ -1347,8 +1649,16 @@ def main() -> None:
     # web services) mark the deploy as failed if nothing binds quickly.
     start_health_server()
 
-    if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-        sys.exit("Set TELEGRAM_BOT_TOKEN and GEMINI_API_KEY (see .env.example).")
+    if not TELEGRAM_TOKEN:
+        sys.exit("Set TELEGRAM_BOT_TOKEN (see .env.example).")
+    if not PROVIDERS:
+        sys.exit(
+            "No AI provider configured. Set at least one of GEMINI_API_KEY, "
+            "GROQ_API_KEY, CEREBRAS_API_KEY, OPENROUTER_API_KEY, "
+            "MISTRAL_API_KEY, GITHUB_MODELS_TOKEN (see .env.example)."
+        )
+    log.info("AI providers, in order: %s",
+             ", ".join(f"{p.name}/{p.model or 'auto'}" for p in PROVIDERS))
 
     global BOT_ID, BOT_USERNAME, BOT_SEES_ALL_GROUP_MESSAGES
     me = tg("getMe")
@@ -1391,7 +1701,8 @@ def main() -> None:
         else:
             log.info("privacy mode off - all group messages are visible")
 
-    pick_working_model()
+    if any(p.name == "gemini" for p in PROVIDERS):
+        pick_working_model()
 
     # Keep the backlog. On a host that sleeps, the messages that arrived while
     # the instance was down are queued here - dropping them means the customer
