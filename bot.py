@@ -708,24 +708,40 @@ def suggested_by_error(text: str, provider: str = "") -> Optional[str]:
     return slug
 
 
-def discover_model(p: Provider) -> Optional[str]:
-    """Ask the provider what it actually serves and pick the best chat model."""
+def discover_models(p: Provider, limit: int = 4) -> List[str]:
+    """Best chat models this provider advertises, best first.
+
+    A catalogue entry is not a promise: free keys are routinely refused models
+    that are listed, so the caller should be ready to try more than one.
+    """
     headers = {"Authorization": f"Bearer {p.key}"}
     try:
         r = session.get(f"{p.base}/models", headers=headers, timeout=20)
         ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
     except Exception as exc:
         log.warning("  -> could not list %s models: %s", p.name, exc)
-        return None
+        return []
     ranked = sorted(((score_model(i, p.name), i) for i in ids), reverse=True)
-    return next((i for score, i in ranked if score > 0), None)
+    return [i for score, i in ranked if score > 0][:limit]
+
+
+def replacement_models(p: Provider, error_text: str) -> List[str]:
+    """What to try instead of p.model, best first."""
+    out = []
+    hint = suggested_by_error(error_text, p.name)
+    # A provider pointing at the model that just failed is no help at all.
+    if hint and hint != p.model:
+        out.append(hint)
+    out += [m for m in discover_models(p) if m != p.model and m not in out]
+    return out
 
 
 def looks_like_model_error(status: int, text: str) -> bool:
-    if status not in (400, 404, 422):
+    if status not in (400, 404, 410, 422):
         return False
     t = text.lower()
-    return any(w in t for w in ("model", "not found", "decommission", "slug"))
+    return any(w in t for w in ("model", "not found", "decommission", "slug",
+                                "end of life", "gone", "retired"))
 
 
 def openai_turns(key: str, user_text: Optional[str]) -> List[dict]:
@@ -774,13 +790,16 @@ def openai_chat(
         # A dead model name is fixable without you: find a live one and retry.
         if looks_like_model_error(r.status_code, r.text) and not p.searched:
             p.searched = True
-            alt = suggested_by_error(r.text, p.name) or discover_model(p)
-            if alt and alt != p.model:
-                log.warning("  -> %s: %s is gone, switching to %s "
-                            "(set %s_MODEL to keep it)",
-                            p.name, p.model, alt, p.name.upper())
+            dead = p.model
+            for alt in replacement_models(p, r.text):
+                log.warning("  -> %s: %s is gone, trying %s", p.name, dead, alt)
                 p.model = alt
-                return openai_chat(p, system, messages, max_tokens, json_mode, timeout)
+                answer = openai_chat(p, system, messages, max_tokens, json_mode, timeout)
+                if answer:
+                    log.warning("  -> %s now on %s (set %s_MODEL to keep it)",
+                                p.name, alt, p.name.upper())
+                    return answer
+            p.model = dead
         return None
     try:
         text = r.json()["choices"][0]["message"]["content"]
@@ -1531,9 +1550,10 @@ def probe_provider(p: Provider) -> tuple:
     # A dead model name is the most common failure, and the fix is knowable:
     # ask the provider what it actually serves.
     if looks_like_model_error(r.status_code, r.text):
-        alt = suggested_by_error(r.text, p.name) or discover_model(p)
-        if alt and alt != p.model:
-            # Don't just suggest it - try it, and if it works, keep it.
+        candidates = replacement_models(p, r.text)
+        tried = []
+        for alt in candidates:
+            tried.append(alt)
             try:
                 r2 = session.post(
                     f"{p.base}/chat/completions", headers=headers,
@@ -1542,16 +1562,17 @@ def probe_provider(p: Provider) -> tuple:
                     timeout=25,
                 )
             except Exception:
-                r2 = None
-            if r2 is not None and r2.status_code == 200:
-                old_model, p.model = p.model, alt
-                log.warning("check: %s switched %s -> %s", p.name, old_model, alt)
+                continue
+            if r2.status_code == 200:
+                dead, p.model = p.model, alt
+                log.warning("check: %s switched %s -> %s", p.name, dead, alt)
                 return (True,
-                        f"{alt}  (was {old_model}; pin it with {p.name.upper()}_MODEL)",
+                        f"{alt}  (was {dead}; pin it with {p.name.upper()}_MODEL)",
                         time.time() - started)
-            detail += f" - {alt} did not work either"
-        elif alt:
-            detail += f" - try {p.name.upper()}_MODEL={alt}"
+        if tried:
+            detail += f" - none of these worked either: {', '.join(tried)}"
+        else:
+            detail += " - and it lists no usable chat model"
     return False, detail, took
 
 

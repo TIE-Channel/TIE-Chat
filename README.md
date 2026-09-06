@@ -87,11 +87,13 @@ time. The log names whoever ends up answering:
 
 **Model names die constantly** on free tiers, and every provider phrases it
 differently. The bot handles that itself: on a "model does not exist" error it
-takes the replacement slug straight out of the error message if the provider
-offered one, otherwise it asks `/models` what is actually being served and
-picks the best conversational model — deliberately skipping the guard, whisper,
-embedding and moderation models that litter those catalogues. It then keeps the
-new model for the session and logs it:
+takes the replacement slug out of the error message if the provider offered a
+useful one, then asks `/models` what is actually being served and ranks the
+candidates — deliberately skipping the guard, whisper, embedding and moderation
+models that litter those catalogues, and on OpenRouter keeping only `:free`
+slugs. It tries them in order, because a listed model is not a promise: free
+keys are routinely refused models the catalogue advertises. The first one that
+answers is kept for the session and logged:
 
 ```
 -> groq: llama-3.1-8b-instant is gone, switching to llama-3.3-70b-versatile
