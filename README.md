@@ -380,18 +380,24 @@ If the group has **Topics** turned on, every reply carries the
 answer under **General**, where nobody who asked is looking — that is the
 symptom to recognise.
 
-The topic is taken from the incoming message when **either** signal says
-forum: the message marked `is_topic_message`, or the chat marked `is_forum`.
-Either alone is enough on purpose — clients do not always set
-`is_topic_message` (a reply written inside a topic is the usual case), and
-demanding it sent the answer to General, which is the exact bug this exists to
-prevent. A `message_thread_id` with *neither* signal is an ordinary
-supergroup's reply chain, not a topic, and `sendMessage` refuses it there — so
-that one is ignored.
+**Two independent guarantees**, because guessing at the flags failed twice.
 
-If the topic was closed or deleted while the answer was being written, Telegram
-says so, the bot posts to General rather than losing the answer, and the log
-says why.
+1. **`message_thread_id` is sent whenever the incoming message has one.** No
+   test on `is_topic_message` or `is_forum`: the API documents both, but
+   neither is reliably present on every client and message shape, and each time
+   one was missing the answer went to General. Telegram is the only authority
+   on whether a thread id is usable, so the bot sends it and lets `sendMessage`
+   refuse — on a thread error it re-sends without it rather than losing the
+   answer. Only private chats are excluded, where the field means something
+   else.
+
+2. **In a topic, the answer is a reply to the message that summoned him**
+   (`GROUP_QUOTE_IN_TOPICS`, on by default). A reply is anchored to a message,
+   and Telegram files it in that message's topic whatever the bot worked out
+   about ids — so even a missing or refused `message_thread_id` still lands in
+   the right place. `allow_sending_without_reply` is set, so a question deleted
+   mid-answer costs the quote, not the reply. Ordinary groups are unchanged:
+   still no quoting there.
 
 The first message from each forum is logged in full, so this is diagnosable
 from outside:

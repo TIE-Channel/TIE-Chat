@@ -246,6 +246,17 @@ GROUPS_ENABLED = os.environ.get("GROUPS_ENABLED", "true").strip().lower() not in
 GROUP_REPLY_ALL = os.environ.get("GROUP_REPLY_ALL", "").strip().lower() in (
     "1", "true", "yes",
 )
+# In a forum topic, answer as a reply to the message that summoned him.
+#
+# This is not decoration either: a reply is anchored to a message, and Telegram
+# puts it in that message's topic whatever the bot did or did not work out
+# about thread ids. It is the belt to message_thread_id's braces - if the id is
+# missing or refused, the answer still lands where it was asked for.
+#
+# Only in topics. An ordinary group is unchanged: no quoting, as before.
+GROUP_QUOTE_IN_TOPICS = os.environ.get(
+    "GROUP_QUOTE_IN_TOPICS", "true").strip().lower() not in ("0", "false", "no")
+
 # Optional: only these group chat IDs are served. Empty means all of them.
 GROUP_ALLOWLIST = {
     int(x) for x in os.environ.get("GROUP_ALLOWLIST", "").replace(" ", "").split(",") if x
@@ -1051,23 +1062,24 @@ def typing_delay(text: str, already_spent: float) -> float:
 def thread_of(msg: dict) -> Optional[int]:
     """The forum topic a message was written in, if it was written in one.
 
-    `message_thread_id` on its own is not enough to act on: in an ordinary
-    supergroup it also appears, meaning "this reply chain", and sendMessage
-    will not take it there. What makes it a topic is either flag - the message
-    marked `is_topic_message`, or the chat itself marked `is_forum`. Requiring
-    `is_topic_message` alone was too strict: clients do not always set it (a
-    reply inside a topic is the common case), and the reply then quietly went
-    to General, which is the one symptom this whole thing exists to avoid.
+    Deliberately trusting, after two attempts at being clever failed. The API
+    documents `is_topic_message` as "True, if the message is sent to a topic in
+    a forum supergroup" and `is_forum` as the marker on the chat - but neither
+    is reliably present on every client and every message shape, and each time
+    one was missing the answer went to General instead of the topic. Telegram
+    itself is the only authority on whether a thread id is usable here, so the
+    rule is now: if the message carries one, use it, and let sendMessage refuse
+    it if it cannot be used - send_reply then re-sends without it.
+
+    Only private chats are excluded outright: a 1:1 chat has no threads to
+    speak of, and the field there means something else entirely.
 
     The General topic carries no `message_thread_id` at all, so it comes back
     as None and the reply lands in General - which is where it belongs.
     """
-    thread = msg.get("message_thread_id")
-    if not thread:
+    if (msg.get("chat") or {}).get("type") == "private":
         return None
-    if msg.get("is_topic_message") or (msg.get("chat") or {}).get("is_forum"):
-        return thread
-    return None
+    return msg.get("message_thread_id") or None
 
 
 def send_reply(
@@ -1091,7 +1103,11 @@ def send_reply(
         # Off by default in 1:1 chats - a person answering their own chat just
         # writes back. In a group, quoting is how anyone knows who you mean.
         if reply_to and (QUOTE_REPLIES or quote):
-            params["reply_parameters"] = {"message_id": reply_to}
+            # allow_sending_without_reply: the message may have been deleted
+            # while the answer was being written, and losing the whole reply
+            # over a missing quote would be worse than quoting nothing.
+            params["reply_parameters"] = {"message_id": reply_to,
+                                          "allow_sending_without_reply": True}
             reply_to = None  # only the first chunk quotes
 
         data = tg_raw("sendMessage", **params)
@@ -2335,12 +2351,18 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     # No quoting, and no human-typing theatre: in a room full of people a
     # 25-second pause just means the conversation has moved on without you.
+    # Quoting only inside a topic, where it doubles as the anchor that keeps
+    # the answer out of General.
+    anchor = msg.get("message_id") if (thread_id and GROUP_QUOTE_IN_TOPICS) else None
+
     if GROUP_DELAY:
-        if not pace_and_send(None, chat_id, clean, answer, None,
-                             cancel, time.time() - started, thread_id=thread_id):
+        if not pace_and_send(None, chat_id, clean, answer, anchor,
+                             cancel, time.time() - started, quote=bool(anchor),
+                             thread_id=thread_id):
             return
     else:
-        send_reply(None, chat_id, answer, None, thread_id=thread_id)
+        send_reply(None, chat_id, answer, anchor, quote=bool(anchor),
+                   thread_id=thread_id)
         log.info("  -> replied: %r", answer[:60])
 
     remember(key, "model", answer)
