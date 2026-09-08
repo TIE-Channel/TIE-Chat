@@ -772,9 +772,42 @@ date line is replaced by this block, not doubled — and the character is not
 told the timezone by name, because naming his city only makes him talk about
 his city.
 
-Two settings, both in `.env.example`: `DM_CHAT_ENABLED=false` turns the chat off
-and leaves the commands working; `DM_CHAT_MEMORY=false` makes every message
-stand on its own.
+### Formatted answers, here only
+
+**Telegram takes a subset of HTML, not Markdown.** Bold, italic, underline,
+strike, spoiler, links, inline code, code blocks with a language, and
+blockquotes. There are **no headings, no tables and no nested lists**, and
+Markdown as a model writes it — `## Heading`, `| a | b |` — is not Telegram
+Markdown at all: handed straight to Telegram it either shows up as literal
+asterisks or fails to send.
+
+So the model writes ordinary Markdown and the bot converts it
+(`DM_CHAT_FORMAT`, on):
+
+| the model writes | you see |
+|---|---|
+| `**bold**`, `*italic*`, `~~strike~~`, `\|\|spoiler\|\|` | the real thing |
+| `` `code` `` and ```` ```python ```` blocks | inline code, and a code block with syntax colouring |
+| `## Heading` | bold — Telegram has no headings |
+| `- item` | a real • bullet |
+| `> quoted` | one quote block, not three |
+| a Markdown table | an aligned monospace block, which is the only way columns stay under each other |
+| `[text](url)` | a link |
+
+Two things make it safe rather than clever. **Code is lifted out first and put
+back last**, so nothing inside a snippet is ever treated as markup — the usual
+way this kind of converter mangles code. And **if Telegram refuses the markup
+anyway**, the same text is re-sent as plain: a stray asterisk can cost the
+formatting, never the answer. Long answers are split on the Markdown *before*
+conversion, so a chunk boundary cannot land inside a tag, and a code fence
+that spans a split is closed and reopened.
+
+**Customer chats and groups stay plain**, on purpose: the persona is a person
+typing, and people do not send each other bulleted lists.
+
+Settings, all in `.env.example`: `DM_CHAT_ENABLED=false` turns the chat off and
+leaves the commands working; `DM_CHAT_MEMORY=false` makes every message stand
+on its own; `DM_CHAT_FORMAT=false` sends the model's Markdown as literal text.
 
 Messages older than `MAX_MESSAGE_AGE` are ignored here too — on a host that
 sleeps, Telegram delivers everything it queued the moment the bot wakes up, and

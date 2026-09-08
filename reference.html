@@ -625,6 +625,8 @@ message in the chat is stuck on '…', inline feedback is off:
           <td>Отвечать ли на обычный текст в личке бота. Выключено — команды
           <code>/status</code>, <code>/check</code>, <code>/reset</code>
           продолжают работать.</td></tr>
+        <tr><td><span class="var">DM_CHAT_FORMAT</span></td><td class="def">true</td>
+          <td>Форматировать ответ. Telegram понимает <em>подмножество</em> HTML: жирный, курсив, подчёркивание, зачёркивание, спойлер, ссылки, код и блоки кода, цитаты. Заголовков, таблиц и вложенных списков нет вовсе, а markdown в том виде, в каком его пишет модель, Telegram не понимает совсем. Поэтому модель пишет обычный markdown, а бот его конвертирует: заголовок - в жирный, дефис - в настоящий буллет, таблица - в моноширинный блок с ровными колонками. Код вынимается первым и возвращается последним, так что разметка внутри сниппета не трогается. Если Telegram всё же откажется - тот же текст уйдёт без разметки: ответ не теряется никогда.</td></tr>
         <tr><td><span class="var">DM_CHAT_MEMORY</span></td><td class="def">true</td>
           <td>Держать нить разговора: ключ <code>dm:&lt;chat&gt;</code> (в треде - плюс <code>:&lt;тред&gt;</code>), длина по
           <code>HISTORY_TURNS</code>. Выключено — каждый вопрос сам по себе, как
@@ -735,7 +737,7 @@ They also said: сижу на macbook, до пятницы в Праге</pre>
     <div class="stat"><b>0</b><span>предупреждений pyflakes</span></div>
     <div class="stat"><b>0</b><span>функций без вызова</span></div>
     <div class="stat"><b>0</b><span>переменных-призраков в .env</span></div>
-    <div class="stat"><b>12</b><span>наборов тестов зелёные</span></div>
+    <div class="stat"><b>13</b><span>наборов тестов зелёные</span></div>
   </div>
   <h3>Удалено как мёртвое</h3>
   <div class="removed">

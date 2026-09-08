@@ -249,6 +249,22 @@ CONTEXT_PRIVATE_EVERYWHERE = os.environ.get(
 # How long the profile read from getChat is kept before asking again.
 PROFILE_HOURS = int(os.environ.get("PROFILE_HOURS", "24"))
 
+# Render the answer with formatting in the bot's own chat.
+#
+# Telegram takes a SUBSET of HTML - bold, italic, underline, strike, spoiler,
+# links, inline code, code blocks with a language, and blockquotes. It has no
+# headings, no tables and no nested lists, and Markdown as a model writes it
+# ("## Heading", "| a | b |") is not Telegram Markdown at all. So the model is
+# left to write ordinary Markdown and the bot converts it, which also means a
+# stray asterisk can never break a message: if Telegram rejects the markup the
+# same text is re-sent as plain, so an answer is never lost to formatting.
+#
+# Only this chat. Customer replies and group messages stay plain - the persona
+# is a person typing, and people do not send each other bulleted lists.
+DM_CHAT_FORMAT = os.environ.get("DM_CHAT_FORMAT", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
 # Optional: comma-separated Telegram user IDs that are never auto-answered.
 IGNORE_USER_IDS = {
     int(x) for x in os.environ.get("IGNORE_USER_IDS", "").replace(" ", "").split(",") if x
@@ -1369,6 +1385,184 @@ def typing_delay(text: str, already_spent: float) -> float:
     return max(0.0, seconds - already_spent)
 
 
+# --------------------------------------------------------------------------
+# Markdown -> Telegram HTML
+# --------------------------------------------------------------------------
+#
+# Telegram accepts only these, and nothing nests inside <pre> or <code>:
+#   <b> <i> <u> <s> <tg-spoiler> <a href> <code> <pre> <blockquote>
+# There are no headings, no tables and no lists. A heading becomes bold, a
+# bullet becomes a real bullet character, a table becomes a monospace block -
+# which is the one thing that keeps its columns lined up in a chat.
+
+FENCE_RE = re.compile(r"```([\w+.#-]*)[ \t]*\n?(.*?)```", re.S)
+TICK_RE = re.compile(r"`([^`\n]+)`")
+BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", re.S)
+BOLD2_RE = re.compile(r"__(?=\S)(.+?)(?<=\S)__", re.S)
+ITAL_RE = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
+ITAL2_RE = re.compile(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])")
+STRIKE_RE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~", re.S)
+SPOILER_RE = re.compile(r"\|\|(?=\S)(.+?)(?<=\S)\|\|", re.S)
+LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s()]+)\)")
+HEAD_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+NUMBER_RE = re.compile(r"^(\s*)(\d{1,3})[.)]\s+(.*)$")
+RULE_RE = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")
+QUOTE_RE = re.compile(r"^\s{0,3}&gt;\s?(.*)$")
+TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
+
+
+# The one instruction the formatted chat adds. Deliberately about the shape of
+# the answer and nothing else - it says nothing about how to behave, so "raw"
+# is still raw.
+FORMAT_NOTE = (
+    "Your answer is rendered in a Telegram chat. Write ordinary Markdown and "
+    "it will be converted: **bold**, *italic*, ~~strike~~, `code`, ```fenced "
+    "blocks with a language```, - bullets, 1. numbered lists, > quotes, "
+    "[text](url), and tables, which come out as an aligned monospace block. "
+    "Headings become bold - so keep them short and use them sparingly. Use "
+    "formatting where it makes the answer easier to read and not otherwise; a "
+    "one-line answer is still one line."
+)
+
+
+def md_to_html(text: str) -> str:
+    """Turn what a model writes into what Telegram will render.
+
+    Code is lifted out first and put back last, so nothing inside a code block
+    is ever treated as markup - that is the usual way this kind of converter
+    mangles a snippet.
+    """
+    kept: List[str] = []
+
+    def stash(html_fragment: str) -> str:
+        kept.append(html_fragment)
+        return f"\x00{len(kept) - 1}\x00"
+
+    def fence(m: "re.Match") -> str:
+        lang, body = m.group(1).strip(), m.group(2).rstrip("\n")
+        body = html.escape(body)
+        if lang:
+            return stash(f'<pre><code class="language-{html.escape(lang)}">'
+                         f"{body}</code></pre>")
+        return stash(f"<pre>{body}</pre>")
+
+    text = FENCE_RE.sub(fence, text)
+    text = TICK_RE.sub(lambda m: stash(f"<code>{html.escape(m.group(1))}</code>"),
+                       text)
+    text = html.escape(text)
+
+    out: List[str] = []
+    quoting: List[str] = []
+    table: List[str] = []
+
+    def close_quote() -> None:
+        if quoting:
+            out.append("<blockquote>" + "\n".join(quoting) + "</blockquote>")
+            quoting.clear()
+
+    def close_table() -> None:
+        # A table has no equivalent in Telegram. Monospace is the only thing
+        # that keeps the columns under each other, so that is what it becomes -
+        # but only for a REAL table. A markdown table always carries the
+        # |---|---| separator row; without one these are just lines that happen
+        # to contain a pipe, and they go back untouched.
+        if not table:
+            return
+        if any(TABLE_SEP_RE.match(r) for r in table):
+            rows = [r for r in table if not TABLE_SEP_RE.match(r)]
+            out.append("<pre>" + "\n".join(rows) + "</pre>")
+        else:
+            out.extend(table)
+        table.clear()
+
+    for line in text.split("\n"):
+        bare = line.strip()
+        if (bare.startswith("|") and not bare.startswith("||")
+                and bare.count("|") >= 2):
+            close_quote()
+            table.append(line.strip())
+            continue
+        close_table()
+
+        q = QUOTE_RE.match(line)
+        if q:
+            quoting.append(q.group(1))
+            continue
+        close_quote()
+
+        if RULE_RE.match(line):
+            out.append("─" * 20)
+            continue
+        h = HEAD_RE.match(line)
+        if h:
+            out.append(f"<b>{h.group(2)}</b>")
+            continue
+        b = BULLET_RE.match(line)
+        if b:
+            out.append(f"{b.group(1)}• {b.group(2)}")
+            continue
+        n = NUMBER_RE.match(line)
+        if n:
+            out.append(f"{n.group(1)}{n.group(2)}. {n.group(3)}")
+            continue
+        out.append(line)
+
+    close_quote()
+    close_table()
+    text = "\n".join(out)
+
+    text = BOLD_RE.sub(r"<b>\1</b>", text)
+    text = BOLD2_RE.sub(r"<b>\1</b>", text)
+    text = STRIKE_RE.sub(r"<s>\1</s>", text)
+    text = SPOILER_RE.sub(r"<tg-spoiler>\1</tg-spoiler>", text)
+    text = ITAL_RE.sub(r"<i>\1</i>", text)
+    text = ITAL2_RE.sub(r"<i>\1</i>", text)
+    text = LINK_RE.sub(r'<a href="\2">\1</a>', text)
+
+    for i, fragment in enumerate(kept):
+        text = text.replace(f"\x00{i}\x00", fragment)
+    return text
+
+
+def split_markdown(text: str, limit: int) -> List[str]:
+    """Cut a long answer into sendable pieces without breaking it.
+
+    Splitting happens on the Markdown, before conversion, so a cut can never
+    land in the middle of a tag. A code fence that spans a cut is closed and
+    reopened, so both halves still render as code.
+    """
+    chunks: List[str] = []
+    current: List[str] = []
+    size = 0
+    fence_lang: Optional[str] = None
+
+    def flush() -> None:
+        nonlocal size
+        if current:
+            body = "\n".join(current)
+            if fence_lang is not None:
+                body += "\n```"
+            chunks.append(body)
+            current.clear()
+            size = 0
+
+    for line in text.split("\n"):
+        if size and size + len(line) + 1 > limit:
+            reopen = fence_lang
+            flush()
+            if reopen is not None:
+                current.append("```" + reopen)
+                size = len(reopen) + 4
+        current.append(line)
+        size += len(line) + 1
+        if line.lstrip().startswith("```"):
+            fence_lang = None if fence_lang is not None else line.strip()[3:]
+
+    flush()
+    return chunks or [text]
+
+
 def thread_of(msg: dict) -> Optional[int]:
     """The forum topic a message was written in, if it was written in one.
 
@@ -1402,10 +1596,21 @@ def send_reply(
     reply_to: Optional[int],
     quote: bool = False,
     thread_id: Optional[int] = None,
+    markdown: bool = False,
 ) -> None:
-    # Telegram hard-limits messages to 4096 characters.
-    for chunk in [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]:
+    # Telegram hard-limits messages to 4096 characters. With formatting on, the
+    # cut is made on the Markdown and each piece converted separately, so a
+    # chunk boundary can never land inside a tag.
+    if markdown:
+        pieces = split_markdown(text, 3500)
+    else:
+        pieces = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]
+
+    for chunk in pieces:
         params: Dict[str, Any] = {"chat_id": chat_id, "text": chunk}
+        if markdown:
+            params["text"] = md_to_html(chunk)
+            params["parse_mode"] = "HTML"
         if connection_id:
             params["business_connection_id"] = connection_id
         # In a forum this is not decoration: without it the answer is posted to
@@ -1424,15 +1629,32 @@ def send_reply(
             reply_to = None  # only the first chunk quotes
 
         data = tg_raw("sendMessage", **params)
-        if data.get("ok") or not thread_id:
+        if data.get("ok"):
             continue
-        # The topic was closed or deleted while we were composing. Nothing was
-        # posted, so re-sending is safe - and General beats losing the answer.
-        if "thread" in str(data.get("description") or "").lower():
+        why = str(data.get("description") or "").lower()
+
+        # Two things can be re-sent, because a refusal means nothing was
+        # posted. Losing an answer to either would be much worse than the
+        # blemish of sending it without the trimming.
+        if thread_id and "thread" in why:
+            # The topic was closed or deleted while we were composing.
             log.warning("  -> topic %s is gone, posting to General instead",
                         thread_id)
             params.pop("message_thread_id")
             thread_id = None
+            data = tg_raw("sendMessage", **params)
+            if data.get("ok"):
+                continue
+            why = str(data.get("description") or "").lower()
+
+        if markdown and params.get("parse_mode") and (
+                "pars" in why or "entit" in why or "tag" in why):
+            # The converter produced something Telegram would not take. The
+            # text is fine; only the markup is not. Send the words.
+            log.warning("  -> Telegram refused the formatting (%s) - "
+                        "sending it plain", why[:80])
+            params.pop("parse_mode")
+            params["text"] = chunk
             tg("sendMessage", **params)
 
 
@@ -2897,7 +3119,8 @@ def handle_owner_dm(msg: dict) -> None:
         # max_chars=0 on purpose: REPLY_MAX_CHARS is a leash on the persona,
         # and there is no persona here. sendMessage splits anything over
         # Telegram's 4096 into several messages by itself.
-        answer = ask_ai(key, question, "", raw=True, max_chars=0,
+        answer = ask_ai(key, question, FORMAT_NOTE if DM_CHAT_FORMAT else "",
+                        raw=True, max_chars=0,
                         who=msg.get("from"), private=True,
                         where="your own chat with the bot")
 
@@ -2908,7 +3131,8 @@ def handle_owner_dm(msg: dict) -> None:
                    None, thread_id=thread_id)
         return
 
-    send_reply(None, chat_id, answer, None, thread_id=thread_id)
+    send_reply(None, chat_id, answer, None, thread_id=thread_id,
+               markdown=DM_CHAT_FORMAT)
     if DM_CHAT_MEMORY:
         remember(key, "model", answer)
         compact(key)
@@ -3098,6 +3322,7 @@ def status_report() -> str:
         "this chat: " + (
             "off (DM_CHAT_ENABLED=false)" if not DM_CHAT_ENABLED else
             "raw questions, no persona"
+            + (", formatted" if DM_CHAT_FORMAT else ", plain text")
             + (", remembering the thread" if DM_CHAT_MEMORY else ", one-shot")
         ),
         "judge (cheapest first): " + (
