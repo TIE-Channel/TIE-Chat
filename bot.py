@@ -142,13 +142,6 @@ INLINE_ACCESS = os.environ.get("INLINE_ACCESS", "shared").strip().lower()
 # What sits in the chat for the second or two between sending and the answer.
 INLINE_PLACEHOLDER = os.environ.get("INLINE_PLACEHOLDER", "...")
 
-# Keep the line you asked about above the answer, labelled with who asked. An
-# inline message cannot quote anything - Telegram gives it no reply parameters -
-# so without this the question disappears the moment the placeholder is
-# replaced, and the answer reads like a non sequitur to everyone else.
-INLINE_SHOW_QUESTION = os.environ.get(
-    "INLINE_SHOW_QUESTION", "true").strip().lower() not in ("0", "false", "no")
-
 # How each half is set off. Telegram has NO font size for bot messages - none
 # of these makes the letters bigger, they only change how much the block
 # stands out:
@@ -3706,6 +3699,18 @@ MD_SPECIAL = "\\`*_~|[]<>#=$"
 MD_ESCAPE = {ord(c): "\\" + c for c in MD_SPECIAL}
 
 
+# Said before FORMAT_NOTE when the character is the one answering, because his
+# own prompt tells him the opposite twice and the later instruction has to win
+# outright rather than argue with it.
+PERSONA_FORMAT_NOTE = (
+    "THIS OVERRIDES THE 'no lists, no headings, no bold' RULE ABOVE, and only "
+    "here: this one message is rendered by Telegram, which draws Markdown. "
+    "You are still yourself and you still write like a person - reach for "
+    "formatting only when the answer genuinely is a list or a table, never to "
+    "look thorough.\n\n"
+)
+
+
 def md_escape(text: str) -> str:
     """A person's words, shown as their words - not read as markup."""
     return text.translate(MD_ESCAPE)
@@ -3726,8 +3731,6 @@ def format_inline_markdown(name: str, question: str, body: str) -> str:
     Only the name and the question are escaped. The answer is the one part
     that is MEANT to be markup - that is the whole point of doing this.
     """
-    if not INLINE_SHOW_QUESTION:
-        return body
     quoted = "\n".join(">" + line for line in
                         [f"**{md_escape(name)}**"]
                         + md_escape(question).split("\n"))
@@ -3747,9 +3750,6 @@ def format_inline(name: str, question: str, body: str) -> tuple:
     decoration competing with it, and no label announcing a machine wrote it.
     """
     esc_body = html.escape(body)
-    if not INLINE_SHOW_QUESTION:
-        return wrap_block(esc_body, INLINE_BLOCK_ANSWER), "HTML"
-
     esc_name = f"<b>{html.escape(name)}</b>"
     # All of it shares one message, and Telegram's 4096-character ceiling is
     # the only thing that shortens anything.
@@ -3926,10 +3926,13 @@ def fill_inline_message(inline_message_id: Optional[str], text: str,
 
     extra, raw = next(((e, r) for sid, _, _, e, r in INLINE_STYLES
                        if sid == style_id), ("", False))
-    # Only the raw styles are told they may format. The character is told the
-    # opposite, everywhere, on purpose.
-    if raw and INLINE_FORMAT and RICH_MESSAGES and not rich_unavailable:
-        extra = (extra + "\n\n" + FORMAT_NOTE).strip()
+    if INLINE_FORMAT and RICH_MESSAGES and not rich_unavailable:
+        # The character carries a flat ban on formatting - written for a chat
+        # that could not render any. Telegram can now, so the ban is lifted
+        # here, and only here: it still holds in a group and in a customer
+        # chat, where he is meant to look like a person typing.
+        extra = (extra + "\n\n" + ("" if raw else PERSONA_FORMAT_NOTE)
+                 + FORMAT_NOTE).strip()
     log.info("inline %s%s from %s: %r", style_id or "reply",
              " (raw, no persona)" if raw else "", user_id, text[:60])
     started = time.time()

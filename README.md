@@ -549,8 +549,9 @@ plus whatever the answer does not use, so a two-word question next to a runaway
 answer is left alone. Trimming is escape-aware — one `<` becomes four
 characters once escaped, so cutting by raw length could still overflow. If some character upsets Telegram's
 parser the whole thing is re-sent as plain text, because the answer matters more
-than the styling. `INLINE_SHOW_QUESTION=false` drops everything but the answer;
-`INLINE_AI_LABEL` changes the `AI` label.
+than the styling. The header has no off switch: without it the question
+disappears when the placeholder is replaced, and the answer reads like a non
+sequitur to everyone else in the chat.
 
 ### Two routes in, one answer out
 
@@ -647,9 +648,18 @@ The question keeps its place above the answer, now as a Markdown quote:
 shown as their words — a `*` in the question stays a `*` — while the answer is
 the one part that is *meant* to be markup. That asymmetry is the whole feature.
 
-Only the two raw styles are affected. **Жёстко** is the character, and the
-character is told not to format at all: people do not send each other bulleted
-lists, and that rule is the point of him.
+**All three styles** get it, the character included. His prompt bans
+formatting twice — written for a chat that could not render any — so when he is
+the one answering, the ban is lifted in as many words, and only for this one
+message. It still holds in a group and in a customer chat, where he is meant to
+look like a person typing.
+
+**The header is not optional.** An inline message cannot quote anything —
+Telegram gives it no reply parameters — so without it the question disappears
+the moment the placeholder is replaced, and the answer reads like a non
+sequitur to everyone else in the chat. The name is the asker's, not whoever
+tapped the button, with the first letter capitalised and the rest left alone,
+so `МАКС` stays `МАКС`.
 
 Same three tiers as everywhere: rich, then the HTML block, then plain text.
 `INLINE_MAX_CHARS` (4000) caps the length — rich messages raised the protocol
