@@ -2337,6 +2337,9 @@ def status_report() -> str:
             else "PRIVACY MODE ON - only mentions and replies arrive, so he "
                  "cannot see jabs or topics (see /setprivacy in BotFather)"
         ),
+        "updates received: " + (", ".join(
+            f"{k} {n}" for k, n in sorted(update_counts.items())
+            if not k.startswith("_")) or "none yet"),
         "inline: " + (
             "off (INLINE_ENABLED=false)" if not INLINE_ENABLED else
             f"{INLINE_ACCESS}, {inline_offered} offered / {inline_sent} sent"
@@ -2638,6 +2641,14 @@ def warn_if_inline_feedback_off() -> None:
     if _inline_feedback_warned or inline_sent or inline_offered < 5:
         return
     _inline_feedback_warned = True
+    if _conflict_since or update_counts.get("_conflict"):
+        log.warning(
+            "offered %d inline replies and none were reported sent - but "
+            "another instance was polling this token during the run, and two "
+            "pollers split the updates between them. Fix that first: the tap "
+            "was very likely reported to the OTHER instance.", inline_offered,
+        )
+        return
     log.warning(
         "offered %d inline replies and Telegram never reported one being sent. "
         "Two different things look identical from here, so check the chat you "
@@ -2650,7 +2661,27 @@ def warn_if_inline_feedback_off() -> None:
     )
 
 
+# What Telegram has actually delivered this run, by kind. The single most
+# useful thing when something "does not work": it separates "the update never
+# arrived" from "it arrived and the bot mishandled it", which otherwise look
+# exactly the same from outside.
+update_counts: Dict[str, int] = defaultdict(int)
+
+FIRST_TIME_WORTH_SAYING = {
+    "chosen_inline_result": "inline feedback is ON and reaching this instance",
+    "callback_query": "a button on an inline message was tapped",
+    "business_message": "Telegram Business is wired up",
+}
+
+
 def handle_update(update: dict) -> None:
+    kind = next((k for k in update if k != "update_id"), "empty")
+    update_counts[kind] += 1
+    if update_counts[kind] == 1 and kind in FIRST_TIME_WORTH_SAYING:
+        log.info("first %s of this run - %s", kind, FIRST_TIME_WORTH_SAYING[kind])
+    else:
+        log.debug("update %s: %s", update.get("update_id"), kind)
+
     if "inline_query" in update:
         if INLINE_ENABLED:
             handle_inline_query(update["inline_query"])
@@ -2822,6 +2853,7 @@ def poll_updates(offset: int) -> Optional[list]:
     if "conflict" in description.lower():
         if not _conflict_since:
             _conflict_since = time.time()
+            update_counts["_conflict"] += 1
             log.error(
                 "ANOTHER INSTANCE OF THIS BOT IS RUNNING. Telegram delivers "
                 "each message to ONE poller, and it is not this one - which is "
