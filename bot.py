@@ -191,6 +191,23 @@ INLINE_TRUST_DM = os.environ.get("INLINE_TRUST_DM", "true").strip().lower() not 
     "0", "false", "no",
 )
 
+# Format the inline answer too. editMessageText takes a rich_message next to
+# an inline_message_id, so the message posted into somebody else's chat can
+# carry the same headings, tables and lists as the answers in your own.
+#
+# Only the two raw styles are affected. "Жёстко" is the character, and the
+# character is told not to format at all - people do not send each other
+# bulleted lists, and that rule is the point of him.
+INLINE_FORMAT = os.environ.get("INLINE_FORMAT", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# How long an inline answer may be. It shares one message with the question,
+# and until rich messages that message was capped at 4096 - now the ceiling is
+# 32768, but a wall of text posted into someone else's chat is still rude, so
+# the limit here is a matter of manners rather than of protocol.
+INLINE_MAX_CHARS = int(os.environ.get("INLINE_MAX_CHARS", "4000"))
+
 # One shared, permanently empty transcript. Inline answers carry no context:
 # there is no chat id to key one on, and a memory shared across every chat he
 # is summoned into would leak one conversation into the next.
@@ -3681,6 +3698,42 @@ def shrink_to(text: str, room: int) -> str:
     return cut.rstrip() + "..."
 
 
+# What has to be neutralised in text that is NOT markup: the characters that
+# would start markup, plus "<", because rich Markdown parses HTML tags inside
+# it. Deliberately not every punctuation mark - a stray backslash in front of
+# a full stop is uglier than the risk it avoids.
+MD_SPECIAL = "\\`*_~|[]<>#=$"
+MD_ESCAPE = {ord(c): "\\" + c for c in MD_SPECIAL}
+
+
+def md_escape(text: str) -> str:
+    """A person's words, shown as their words - not read as markup."""
+    return text.translate(MD_ESCAPE)
+
+
+def format_inline_markdown(name: str, question: str, body: str) -> str:
+    """The same shape as the HTML version, in Markdown Telegram parses itself.
+
+        >**Дмитрий**
+        >ну и что ты на это скажешь
+
+        Скажу, что вопрос звучит как приглашение на драку.
+
+    The blank line is syntax, not spacing: without it Markdown swallows the
+    answer into the quote as a lazy continuation. A block element follows a
+    block element, so nothing empty is rendered between them.
+
+    Only the name and the question are escaped. The answer is the one part
+    that is MEANT to be markup - that is the whole point of doing this.
+    """
+    if not INLINE_SHOW_QUESTION:
+        return body
+    quoted = "\n".join(">" + line for line in
+                        [f"**{md_escape(name)}**"]
+                        + md_escape(question).split("\n"))
+    return f"{quoted}\n\n{body}"
+
+
 def format_inline(name: str, question: str, body: str) -> tuple:
     """Who asked and what they asked, then the answer. Returns (text, mode).
 
@@ -3723,7 +3776,30 @@ def format_inline(name: str, question: str, body: str) -> tuple:
 
 def edit_inline(inline_message_id: str, name: str, question: str,
                 body: str) -> bool:
-    """Replace the stub with the finished message."""
+    """Replace the stub with the finished message.
+
+    Three tiers, same as everywhere else: a rich message, which Telegram
+    renders from Markdown itself; the hand-made HTML subset; and finally the
+    words with no styling at all. Whatever happens, the answer arrives.
+    """
+    global rich_unavailable
+    if INLINE_FORMAT and RICH_MESSAGES and not rich_unavailable:
+        markdown = format_inline_markdown(name, question, body)
+        if len(markdown) <= RICH_MAX_CHARS:
+            data = tg_raw("editMessageText", inline_message_id=inline_message_id,
+                          rich_message={"markdown": markdown})
+            if data.get("ok"):
+                return True
+            why = str(data.get("description") or "").lower()
+            if any(w in why for w in ("not found", "unsupported", "not supported",
+                                      "unknown method", "not available")):
+                rich_unavailable = True
+                log.warning("rich messages are not available (%s) - HTML from "
+                            "now on", why[:80])
+            else:
+                log.warning("  -> rich inline edit refused (%s), trying HTML",
+                            why[:80])
+
     text, mode = format_inline(name, question, body)
     if tg("editMessageText", inline_message_id=inline_message_id,
           text=text, parse_mode=mode) is not None:
@@ -3850,6 +3926,10 @@ def fill_inline_message(inline_message_id: Optional[str], text: str,
 
     extra, raw = next(((e, r) for sid, _, _, e, r in INLINE_STYLES
                        if sid == style_id), ("", False))
+    # Only the raw styles are told they may format. The character is told the
+    # opposite, everywhere, on purpose.
+    if raw and INLINE_FORMAT and RICH_MESSAGES and not rich_unavailable:
+        extra = (extra + "\n\n" + FORMAT_NOTE).strip()
     log.info("inline %s%s from %s: %r", style_id or "reply",
              " (raw, no persona)" if raw else "", user_id, text[:60])
     started = time.time()
@@ -3871,7 +3951,7 @@ def fill_inline_message(inline_message_id: Optional[str], text: str,
                     # question is read by a chat you cannot even see.
                     private=bool(OWNER_ID) and user_id == OWNER_ID,
                     where="some other chat - Telegram does not say which",
-                    max_chars=max(600, TELEGRAM_MAX_CHARS - len(text) - 200))
+                    max_chars=max(600, INLINE_MAX_CHARS - len(text) - 200))
 
     if not answer:
         log.warning("  -> nothing came back")

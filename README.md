@@ -623,6 +623,39 @@ groups tomorrow is not locked out until next week.
 
 `INLINE_MAX_PER_MIN` (6) caps each person, so an open bot cannot be drained.
 
+### Formatted inline answers
+
+`editMessageText` takes a `rich_message` next to an `inline_message_id`, so the
+message posted into somebody else's chat gets the same treatment as your own:
+Telegram renders the model's Markdown itself — headings, real tables, lists,
+math (`INLINE_FORMAT`, on).
+
+The question keeps its place above the answer, now as a Markdown quote:
+
+```markdown
+>**Дмитрий**
+>сколько стоит торт
+
+## Прайс
+
+| что  | цена |
+|:-----|-----:|
+| торт | 5000 |
+```
+
+**The name and the question are escaped, the answer is not.** Their words are
+shown as their words — a `*` in the question stays a `*` — while the answer is
+the one part that is *meant* to be markup. That asymmetry is the whole feature.
+
+Only the two raw styles are affected. **Жёстко** is the character, and the
+character is told not to format at all: people do not send each other bulleted
+lists, and that rule is the point of him.
+
+Same three tiers as everywhere: rich, then the HTML block, then plain text.
+`INLINE_MAX_CHARS` (4000) caps the length — rich messages raised the protocol
+ceiling to 32768, so that number is now about manners rather than protocol: a
+wall of text posted into someone else's chat is rude.
+
 ### What he can and cannot see
 
 He gets **only the text you typed after his name**. Inline queries carry no
