@@ -119,7 +119,7 @@ INLINE_ENABLED = os.environ.get("INLINE_ENABLED", "true").strip().lower() not in
 INLINE_ACCESS = os.environ.get("INLINE_ACCESS", "shared").strip().lower()
 
 # What sits in the chat for the second or two between sending and the answer.
-INLINE_PLACEHOLDER = os.environ.get("INLINE_PLACEHOLDER", "…")
+INLINE_PLACEHOLDER = os.environ.get("INLINE_PLACEHOLDER", "...")
 
 # Keep the line you asked about above the answer, labelled with who asked. An
 # inline message cannot quote anything - Telegram gives it no reply parameters -
@@ -156,10 +156,40 @@ INLINE_MEMBER_DAYS = int(os.environ.get("INLINE_MEMBER_DAYS", "7"))
 # tomorrow must not stay locked out for the rest of the week.
 INLINE_MISS_MINUTES = int(os.environ.get("INLINE_MISS_MINUTES", "15"))
 
+# Does a 1:1 chat with you count as "shared", the way a group does?
+#
+# It is the same evidence from a closer angle: a group only proves you are in
+# the same room as a hundred other people, while a private conversation proves
+# you actually talk to each other. It costs nothing either - every business
+# message already names the person, so no getChatMember is needed - and it is
+# the only route for a friend you have no group with.
+#
+# Both directions count: someone writing to you, and you writing to them.
+# Turn it off if your business account takes messages from strangers.
+INLINE_TRUST_DM = os.environ.get("INLINE_TRUST_DM", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
 # One shared, permanently empty transcript. Inline answers carry no context:
 # there is no chat id to key one on, and a memory shared across every chat he
 # is summoned into would leak one conversation into the next.
 INLINE_KEY = "inline"
+
+# --- talking to him in the bot's own chat ---------------------------------
+# Write to @thebot directly and it answers you. This is not the persona and
+# not a customer chat: the question goes to the model exactly as typed, with
+# no character, no house style and no instructions wrapped around it - the
+# same deal as the inline "Ответить" option. Only OWNER_ID gets this.
+DM_CHAT_ENABLED = os.environ.get("DM_CHAT_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# Unlike an inline summon, this is a conversation, so the thread is kept:
+# "а покороче?" needs the previous answer to mean anything. HISTORY_TURNS caps
+# it, /reset empties it. Turn it off to make every message stand on its own.
+DM_CHAT_MEMORY = os.environ.get("DM_CHAT_MEMORY", "true").strip().lower() not in (
+    "0", "false", "no",
+)
 
 # Optional: comma-separated Telegram user IDs that are never auto-answered.
 IGNORE_USER_IDS = {
@@ -491,6 +521,12 @@ Do not volunteer that your replies are automated. If someone asks directly \
 and sincerely whether they are talking to a bot, an AI, or a real person, \
 tell them the truth in one short line, keep it in voice, and carry on with \
 the conversation.
+
+Type the way a person types on a phone. Only the punctuation a phone keyboard \
+puts within reach: hyphen, not an em dash; straight quotes, not curly ones or \
+guillemets; three dots, not a single ellipsis character; no bullet characters, \
+no arrows, no non-breaking spaces. Anything fancier is a tell that a machine \
+wrote the line.
 """
 
 def now_line() -> str:
@@ -526,7 +562,8 @@ for _name, _why in RETIRED.items():
 # --------------------------------------------------------------------------
 
 # Transcripts, keyed by a string: "<business_connection_id>:<chat_id>" for a
-# 1:1 chat, "group:<chat_id>" for a room, and INLINE_KEY (which stays empty).
+# 1:1 chat, "group:<chat_id>" for a room, "dm:<chat_id>" for the bot's own chat
+# with you, and INLINE_KEY (which stays empty).
 history: Dict[str, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS))
 
 # business_connection_id -> owner's Telegram user id
@@ -1266,16 +1303,30 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
-DASHES = re.compile("[\u2012-\u2015\u2212]")   # figure/en/em/horizontal bar, minus
+# Typographic characters a model reaches for and a person on a phone does not.
+# Not "no Unicode" - the text is Russian, it is Unicode throughout. Just the
+# punctuation that no phone keyboard puts within easy reach, which is one of
+# the surest tells that a machine wrote the line.
+TYPOGRAPHY = {
+    "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-",  # dashes
+    "\u2212": "-", "\u2010": "-", "\u2011": "-",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',  # curly "
+    "\u00ab": '"', "\u00bb": '"', "\u2033": '"',
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u2032": "'",  # curly '
+    "\u2026": "...",                                             # ellipsis
+    "\u2022": "-", "\u2023": "-", "\u25aa": "-", "\u00b7": "-",  # bullets
+    "\u00a0": " ", "\u2007": " ", "\u2009": " ", "\u202f": " ",  # odd spaces
+    "\u200a": " ", "\u2005": " ", "\u3000": " ",
+    "\u200b": "", "\u200c": "", "\u200d": "", "\ufeff": "",     # invisible
+    "\u2116": "N", "\u2122": "", "\u00ae": "", "\u00a9": "",
+    "\u2190": "<-", "\u2192": "->",
+}
+TYPOGRAPHY_MAP = str.maketrans(TYPOGRAPHY)
 
 
-def plain_dashes(text: str) -> str:
-    """Every flavour of long dash down to a plain hyphen.
-
-    Models reach for em dashes constantly and almost nobody types one on a
-    phone, so they are one of the surest tells that a machine wrote the line.
-    """
-    return DASHES.sub("-", text)
+def plain_punctuation(text: str) -> str:
+    """Typographic punctuation down to what a phone keyboard actually types."""
+    return text.translate(TYPOGRAPHY_MAP)
 
 
 def trim_reply(text: str, limit: Optional[int] = None) -> str:
@@ -1286,13 +1337,13 @@ def trim_reply(text: str, limit: Optional[int] = None) -> str:
     number is the inline reply, which is edited into an existing message and so
     cannot spill into a second one.
     """
-    text = plain_dashes(text)
+    text = plain_punctuation(text)
     limit = REPLY_MAX_CHARS if limit is None else limit
     if limit <= 0 or len(text) <= limit:
         return text
     head = text[:limit]
     cut = max(head.rfind(". "), head.rfind("! "), head.rfind("? "),
-              head.rfind(".\n"), head.rfind("…"))
+              head.rfind(".\n"), head.rfind("... "))
     return (head[:cut + 1] if cut > limit // 3 else head).strip()
 
 
@@ -1404,7 +1455,7 @@ def openai_call(
     """One call to an OpenAI-compatible endpoint. Returns (text|None, status)."""
     body: Dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "system", "content": system}] + messages,
+        "messages": ([{"role": "system", "content": system}] if system else []) + messages,
         "temperature": 0.2 if json_mode else TEMPERATURE,
         "max_tokens": max_tokens,
     }
@@ -1475,8 +1526,8 @@ def gemini_call(model: str, system: str, contents: List[dict],
     try:
         r = session.post(
             gemini_url(model), headers=gemini_headers(),
-            json={"system_instruction": {"parts": [{"text": system}]},
-                  "contents": contents, "generationConfig": gen},
+            json=({"system_instruction": {"parts": [{"text": system}]}} if system else {}) | {
+                "contents": contents, "generationConfig": gen},
             timeout=GEMINI_TIMEOUT,
         )
     except Exception as exc:
@@ -1528,6 +1579,7 @@ def ask_ai(
     fast: bool = False,
     room: bool = False,
     max_chars: Optional[int] = None,
+    raw: bool = False,
 ) -> Optional[str]:
     """Answer with the best model still available, walking down the ladder.
 
@@ -1545,7 +1597,13 @@ def ask_ai(
     if max_chars is None:
         max_chars = ROOM_MAX_CHARS if room else REPLY_MAX_CHARS
 
-    system = PERSONA + SYSTEM_SUFFIX + extra_system + now_line()
+    # `raw` drops the character entirely: no persona, no house style, no date,
+    # no history. What is left is `extra_system` on its own - empty for a bare
+    # question, or a single instruction like "one short sentence". Everything
+    # mechanical still applies; the length cap and the punctuation cleanup are
+    # about what Telegram and a phone keyboard can do, not about how to behave.
+    system = (extra_system.strip() if raw
+              else PERSONA + SYSTEM_SUFFIX + extra_system + now_line())
     gem_contents = [{"role": h["role"], "parts": [{"text": h["text"]}]}
                     for h in history[key]]
     if user_text is not None:
@@ -1631,6 +1689,16 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
             return skip("cannot confirm whose business account this is")
         if owner_id != OWNER_ID:
             return skip("connection belongs to %s, not you - ignoring", owner_id)
+
+    # A 1:1 chat on your own account is proof you know this person - better
+    # proof than sharing a group with them, in fact. Recorded before the
+    # "sent by you" branch below, so writing to a friend counts as much as
+    # them writing to you. In a private chat the other person's user id IS
+    # the chat id, which is why this needs no lookup of any kind.
+    if INLINE_TRUST_DM and INLINE_ACCESS == "shared":
+        if allow_inline_for(chat_id, chat_id):
+            log.info("inline: %s writes with you in private - allowed for %d days",
+                     chat_id, INLINE_MEMBER_DAYS)
 
     if owner_id is not None and sender.get("id") == owner_id:
         # This is you writing to the customer - record it as context, don't reply.
@@ -2238,6 +2306,74 @@ def dispatch_business_message(msg: dict) -> None:
     run_off_poll_loop(run)
 
 
+def dm_key(chat_id: int) -> str:
+    """Where this chat's transcript lives.
+
+    With memory off it is the shared, permanently empty transcript - the same
+    one inline answers use. Nothing is ever written to it, so it stays empty,
+    and switching the setting off cannot leave an old thread behind to leak
+    into the next question.
+    """
+    return f"dm:{chat_id}" if DM_CHAT_MEMORY else INLINE_KEY
+
+
+def handle_owner_dm(msg: dict) -> None:
+    """You, talking to the bot in its own chat.
+
+    Deliberately not Ilya. The question goes to the model exactly as typed -
+    no persona, no house style, no date, no "answer in one line" - which is
+    what the inline "Ответить" option does, and what was asked for here. The
+    reply is sent the moment it is ready: nobody needs typing theatre from
+    their own bot.
+    """
+    chat_id = msg["chat"]["id"]
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    key = dm_key(chat_id)
+
+    log.info("dm from you: %r", text[:60])
+    started = time.time()
+    question = text[:MAX_INPUT_CHARS]
+
+    # With memory on the question goes into the transcript and ask_ai reads it
+    # from there, so the thread stays in one place; with memory off it is
+    # handed over directly and nothing is stored.
+    if DM_CHAT_MEMORY:
+        remember(key, "user", question)
+        question = None
+
+    with Typing(None, chat_id):
+        # max_chars=0 on purpose: REPLY_MAX_CHARS is a leash on the persona,
+        # and there is no persona here. sendMessage splits anything over
+        # Telegram's 4096 into several messages by itself.
+        answer = ask_ai(key, question, "", raw=True, max_chars=0)
+
+    if not answer:
+        log.warning("  -> nothing came back")
+        tg("sendMessage", chat_id=chat_id,
+           text="Ни одна модель не ответила. /check покажет, что с провайдерами.")
+        return
+
+    send_reply(None, chat_id, answer, None)
+    if DM_CHAT_MEMORY:
+        remember(key, "model", answer)
+    log.info("  -> answered in %.1fs: %r", time.time() - started, answer[:60])
+
+
+def dispatch_owner_dm(msg: dict) -> None:
+    """Off the poll loop, one at a time per chat - a model call takes seconds
+    and the polling thread must not spend them waiting."""
+    chat_id = (msg.get("chat") or {}).get("id")
+
+    def run() -> None:
+        with chat_lock(f"dm:{chat_id}"):
+            try:
+                handle_owner_dm(msg)
+            except Exception:
+                log.exception("error answering your DM")
+
+    run_off_poll_loop(run)
+
+
 def probe_provider(p: Provider) -> tuple:
     """One tiny real request. Returns (ok, detail, seconds)."""
     started = time.time()
@@ -2378,10 +2514,18 @@ def status_report() -> str:
             if not k.startswith("_")) or "none yet"),
         "inline: " + (
             "off (INLINE_ENABLED=false)" if not INLINE_ENABLED else
-            f"{INLINE_ACCESS}, {inline_offered} menus / {inline_spent} "
+            INLINE_ACCESS
+            + ("+dm" if INLINE_ACCESS == "shared" and INLINE_TRUST_DM else "")
+            + f", {inline_offered} menus / {inline_spent} "
             f"generated ({inline_sent} sends reported by Telegram)"
-            + (f", groups known: {len(known_groups)}"
+            + (f", groups known: {len(known_groups)}, "
+               f"people cleared: {sum(1 for v in inline_ok_cache.values() if v[0])}"
                if INLINE_ACCESS == "shared" else "")
+        ),
+        "this chat: " + (
+            "off (DM_CHAT_ENABLED=false)" if not DM_CHAT_ENABLED else
+            "raw questions, no persona"
+            + (", remembering the thread" if DM_CHAT_MEMORY else ", one-shot")
         ),
         "judge (cheapest first): " + (
             ", ".join(f"{c.provider.name}/{c.model}" for c in judge_order()[:3])
@@ -2467,42 +2611,54 @@ inline_filling: Dict[str, float] = {}
 _fill_guard = threading.Lock()
 
 # The menu you get after typing his name. Only the one you pick costs a call.
+# The last field says whether the question goes to the model bare - no persona,
+# no instructions, nothing. "Ответить" does: sometimes you want the model, not
+# the character.
 INLINE_STYLES = (
-    ("reply", "Ответить", "как обычно", ""),
-    ("short", "Коротко", "одна фраза, не длиннее", "\nKeep it to a single "
-     "short sentence. Fewer words than you think you need."),
+    ("reply", "Ответить", "напрямую, без персонажа", "", True),
+    ("short", "Коротко", "одна фраза, без персонажа",
+     "Answer the question in one short sentence. No preamble, no explanation, "
+     "no follow-up question, no sign-off. Reply in the language of the "
+     "question.", True),
     ("sharp", "Жёстко", "тот же ответ, но с зубами", "\nSharpen it. Be blunt "
      "and funny at the other person's expense, swear if the line you were "
      "given swore first, and never soften the ending. The limits above still "
      "hold: nothing about ethnicity, nationality, religion, gender, "
-     "sexuality, disability, illness or family, and no threats."),
+     "sexuality, disability, illness or family, and no threats.", False),
 )
 
 
 
-def allow_inline_for(user_id: int, chat_id: int) -> None:
-    """Record that this person shares a group with you.
+def allow_inline_for(user_id: int, chat_id: int) -> bool:
+    """Record that this person is somebody you share a chat with.
 
-    Called for free whenever somebody speaks in one of your groups - we already
-    know the room is yours by then, so no getChatMember is needed at all. That
-    means the people who actually talk are warm in the cache before they ever
-    try to summon him.
+    Called for free from two places, and neither one costs an API call because
+    the evidence is already in the update: somebody speaking in one of your
+    groups, and either side of a 1:1 chat on your business account. The people
+    you actually talk to are therefore warm in the cache long before they try
+    to summon him. Returns True if this is news.
     """
     if not user_id or user_id == OWNER_ID:
-        return
+        return False
     if inline_ok_cache.get(user_id, (False, 0))[0]:
-        return                                   # already known, don't re-write
+        return False                             # already known, don't re-write
     inline_ok_cache[user_id] = (True, time.time() + INLINE_MEMBER_DAYS * 86400)
     save_shared_member(user_id, chat_id)
+    return True
 
 
 def may_use_inline(user_id: Optional[int]) -> bool:
     """Is this person allowed to summon him?
 
-    "shared" means: do they sit in any room you sit in. A yes is kept for
-    INLINE_MEMBER_DAYS and mirrored into Redis, so it survives a restart and
-    the whole group keeps working; a no is kept for minutes, so somebody who
-    joins tomorrow is not locked out until next week.
+    "shared" means: is there a chat the two of you are both in - any room you
+    both sit in, or (with INLINE_TRUST_DM) a 1:1 conversation on your business
+    account. A yes is kept for INLINE_MEMBER_DAYS and mirrored into Redis, so
+    it survives a restart and the whole group keeps working; a no is kept for
+    minutes, so somebody who joins tomorrow is not locked out until next week.
+
+    Both cheap routes fill the cache on their own, before anyone tries to use
+    inline at all. This function only does the expensive thing - asking
+    Telegram, group by group - for a person neither route has covered.
     """
     if not user_id:
         return False
@@ -2575,11 +2731,11 @@ def shrink_to(text: str, room: int) -> str:
     cutting by raw length can still overflow.
     """
     if room <= 1:
-        return "…"
+        return "..."
     cut = text
     while cut and len(html.escape(cut)) + 1 > room:
         cut = cut[:int(len(cut) * 0.9)]
-    return cut.rstrip() + "…"
+    return cut.rstrip() + "..."
 
 
 def format_inline(name: str, question: str, body: str) -> tuple:
@@ -2663,7 +2819,7 @@ def handle_inline_query(q: dict) -> None:
 
     stub, stub_mode = format_inline(speaker_name(sender), text, INLINE_PLACEHOLDER)
     results = []
-    for style_id, title, blurb, _ in INLINE_STYLES:
+    for style_id, title, blurb, _, _raw in INLINE_STYLES:
         results.append({
             "type": "article",
             "id": f"{style_id}:{token}",
@@ -2749,8 +2905,10 @@ def fill_inline_message(inline_message_id: Optional[str], text: str,
         edit_inline(inline_message_id, name, text, "Слишком часто. Подожди минуту.")
         return
 
-    extra = next((e for sid, _, _, e in INLINE_STYLES if sid == style_id), "")
-    log.info("inline %s from %s: %r", style_id or "reply", user_id, text[:60])
+    extra, raw = next(((e, r) for sid, _, _, e, r in INLINE_STYLES
+                       if sid == style_id), ("", False))
+    log.info("inline %s%s from %s: %r", style_id or "reply",
+             " (raw, no persona)" if raw else "", user_id, text[:60])
     started = time.time()
     global inline_spent
     inline_spent += 1
@@ -2760,8 +2918,11 @@ def fill_inline_message(inline_message_id: Optional[str], text: str,
     # The quote and the answer share one message. Leave the answer a floor:
     # without it a very long question drives this negative, and a non-positive
     # limit means "do not trim at all" - the opposite of what is wanted.
-    answer = ask_ai(INLINE_KEY, text[:MAX_INPUT_CHARS], INLINE_NOTE + extra,
-                    fast=True, room=True,
+    # In raw mode `extra` IS the whole system prompt - INLINE_NOTE is part of
+    # the character, and the character is exactly what raw leaves out.
+    answer = ask_ai(INLINE_KEY, text[:MAX_INPUT_CHARS],
+                    extra if raw else INLINE_NOTE + extra,
+                    fast=True, room=True, raw=raw,
                     max_chars=max(600, TELEGRAM_MAX_CHARS - len(text) - 200))
 
     if not answer:
@@ -2867,8 +3028,8 @@ def handle_update(update: dict) -> None:
             dispatch_group_message(msg)
         return
 
-    # A normal DM to the bot itself - handy for checking it is alive.
-    text = (msg.get("text") or "").strip()
+    # A DM to the bot itself: commands, and - for you - an ordinary chat.
+    text = (msg.get("text") or msg.get("caption") or "").strip()
     sender_id = (msg.get("from") or {}).get("id")
     is_owner = not OWNER_ID or sender_id == OWNER_ID
 
@@ -2896,6 +3057,17 @@ def handle_update(update: dict) -> None:
         run_off_poll_loop(run_check)
     elif text.startswith("/status"):
         tg("sendMessage", chat_id=msg["chat"]["id"], text=status_report())
+    elif text.startswith("/reset"):
+        key = dm_key(msg["chat"]["id"])
+        had = len(history[key])
+        history[key].clear()
+        history_seen[key] = time.time()
+        with _history_lock:
+            dirty_keys.add(key)
+        history_dirty.set()
+        tg("sendMessage", chat_id=msg["chat"]["id"],
+           text=f"Забыл {had} реплик. Дальше с чистого листа."
+                if had else "И так пусто.")
     elif text.startswith("/start"):
         tg(
             "sendMessage",
@@ -2907,10 +3079,22 @@ def handle_update(update: dict) -> None:
                 f"'@{BOT_USERNAME} ' and the line you want answered. The reply "
                 "appears above the input box; tap it to send it as your own "
                 "message.\n\n"
+                "Write to me here and I'll answer you directly - plain "
+                "assistant, no character.\n\n"
                 "/status - what I currently know\n"
-                "/check  - test every AI provider key"
+                "/check  - test every AI provider key\n"
+                "/reset  - forget our conversation here"
             ),
         )
+    elif text and DM_CHAT_ENABLED and not text.startswith("/"):
+        # Anything that isn't a command: you are talking to him, so answer.
+        # Stale questions are not worth answering - on a host that sleeps,
+        # Telegram delivers everything it queued the moment the bot wakes up.
+        age = time.time() - float(msg.get("date") or 0) if msg.get("date") else 0.0
+        if age > MAX_MESSAGE_AGE:
+            log.info("dm %.0f min old, older than MAX_MESSAGE_AGE - ignored", age / 60)
+            return
+        dispatch_owner_dm(msg)
 
 
 # --------------------------------------------------------------------------

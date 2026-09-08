@@ -141,7 +141,7 @@ Size alone is not treated as quality, either: past ~120B the extra parameters
 buy little for a two-line chat reply and cost a lot of queueing on a free tier,
 so the curve flattens and then turns down.
 
-**One ladder, walked from both ends.** Replies in all three modes use
+**One ladder, walked from both ends.** Replies in all four modes use
 `ladder_order()` — cleverest rung first, stepping down as the good ones run out
 of quota. The **judge** walks the same ladder the other way: dumbest rung
 first, climbing only when one turns out unable to produce a usable verdict. A
@@ -424,9 +424,19 @@ input box:
 
 | | |
 |---|---|
-| **Ответить** | as he normally would |
-| **Коротко** | one sentence, no more |
-| **Жёстко** | the same answer with teeth |
+| **Ответить** | nothing at all — an empty system prompt, the question verbatim |
+| **Коротко** | one instruction: answer in one short sentence, no preamble, no sign-off |
+| **Жёстко** | the full character, sharpened |
+
+Three rungs of how much is wrapped around the question — **0 characters, ~150,
+~7900**. Sometimes what you want is the model, not the character: a fact, a
+translation, a bit of code. Wrapping that in a persona only gets in the way, so
+the first two leave it out entirely — no persona, no house style, no date, no
+history.
+
+Everything *mechanical* still applies to all three: the 4096-character ceiling
+and the punctuation cleanup are about what Telegram and a phone keyboard can
+do, not about how to behave.
 
 Tap one and it is posted **as your own message** ("via @yourbot"), showing the
 question you asked and a `⏳ ответить` button. Tap that button and it fills in
@@ -466,10 +476,17 @@ bigger; the only thing that renders large is a message of nothing but emoji. So
 Set it to any of the values above to set it off too. The character budget
 adapts to whichever tags the chosen styles use.
 
-**Em dashes become hyphens** everywhere — all three modes. Models reach for `—`
-constantly and almost nobody types one on a phone, so it is one of the surest
-tells that a machine wrote the line. Handled in `plain_dashes()`, which also
-covers en, figure and horizontal dashes and the minus sign.
+**Typographic punctuation is flattened** everywhere — all four modes. Em and
+en dashes become hyphens, curly quotes and guillemets become straight quotes,
+the single-character ellipsis becomes three dots, bullets become hyphens,
+non-breaking and hair spaces become ordinary spaces, zero-width characters are
+dropped.
+
+This is *not* "ASCII only" — the text is Russian and stays Russian. It is the
+punctuation no phone keyboard puts within reach, which is one of the surest
+tells that a machine wrote the line. The persona asks for the same thing;
+`plain_punctuation()` enforces it, because a prompt is a request and a
+translation table is not.
 
 The name is taken from whoever *asked*, not whoever taps the button (anyone in
 the chat can press it), with the first letter capitalised and the rest
@@ -514,7 +531,7 @@ most of the time — the button does it. That is why the button is there.
 | Value | Who |
 |---|---|
 | `owner` | only you |
-| `shared` *(default)* | you, plus anyone who is in one of the groups you are in |
+| `shared` *(default)* | you, plus anyone you demonstrably share a chat with — someone in one of your groups, or someone you write to in private |
 | `all` | anybody who knows the username |
 
 **A limit worth knowing:** Telegram never tells a bot *which chat* an inline
@@ -531,15 +548,28 @@ that is configured and in `GROUPS_FILE` otherwise, so a restart does not lock
 everyone but you out. `GROUP_ALLOWLIST` seeds it outright. `/status` shows the
 count.
 
-**Membership is cached for a week.** Once someone is known to share a group
-with you, that verdict lives in Redis under `<prefix>:member:<user id>` for
+**A private chat counts too** (`INLINE_TRUST_DM`, on by default). Anyone you
+have a 1:1 conversation with on your business account is cleared for inline on
+the spot — both directions, so writing to a friend counts as much as them
+writing to you. It is the same evidence from a closer angle: a group only
+proves you stand in the same room as a hundred other people, a private chat
+proves you two actually talk. It is also the **only** route to a friend you
+share no group with, and it costs nothing — the business message already names
+them, so nothing is asked of Telegram. Only *your* connection counts; somebody
+else's business account clears nobody.
+
+Turn it off if strangers write to your business account: with Secretary Mode
+the bot sees every 1:1 chat, so "anyone who ever messaged me" would include the
+spam.
+
+**Membership is cached for a week.** Once someone is known to share a chat with
+you, that verdict lives in Redis under `<prefix>:member:<user id>` for
 `INLINE_MEMBER_DAYS` (7) — so it survives a redeploy, and the people who could
 use the bot inline last week still can today without a single API call. Most of
-the cache fills in for *free*: anyone who writes in one of your groups is
-recorded on the spot, because the bot has already established that the room is
-yours. A **no** is deliberately cheap to forget — `INLINE_MISS_MINUTES` (15) —
-so somebody who joins one of your groups tomorrow is not locked out until next
-week.
+the cache fills in for *free* by the two routes above; `getChatMember` is only
+asked about someone neither of them has covered. A **no** is deliberately cheap
+to forget — `INLINE_MISS_MINUTES` (15) — so somebody who joins one of your
+groups tomorrow is not locked out until next week.
 
 `INLINE_MAX_PER_MIN` (6) caps each person, so an open bot cannot be drained.
 
@@ -602,6 +632,42 @@ one line back per jab, and drops it the moment someone is actually upset.
 So: **one line and no comebacks in your DMs; any length and full comebacks in
 groups and inline.** In the code that is `DEFAULT_PERSONA` versus `ROOM_RULES`,
 which `GROUP_NOTE` and `INLINE_NOTE` both append.
+
+---
+
+## Step 6e — Talking to the bot yourself
+
+Open `@yourbot` and write to it. It answers you, and only you: `OWNER_ID` is
+checked the same way it is everywhere else, and anyone else who finds the bot
+gets one line saying it is private.
+
+This is the **fourth mode, and the only one that is not the character.** The
+question goes to the model exactly as typed — no persona, no house style, no
+date, no "answer in one line" — which is the same treatment as the inline
+**Ответить** option. Whatever the model is like out of the box is what you get,
+so this is a plain assistant sitting in Telegram while Ilya keeps answering
+your customers.
+
+It is a conversation, not a series of one-shots: the thread is kept under its
+own history key (`dm:<chat id>`), capped by `HISTORY_TURNS`, so *"а покороче?"*
+has something to refer back to. It never touches a customer chat or a group.
+
+| you type | what happens |
+|---|---|
+| anything that is not a command | goes to the model bare, answer comes back |
+| `/reset` | forgets this thread, nothing else |
+| `/status` | ladder, judge order, what Telegram has delivered |
+| `/check` | one real request to every provider key |
+
+Two settings, both in `.env.example`: `DM_CHAT_ENABLED=false` turns the chat off
+and leaves the commands working; `DM_CHAT_MEMORY=false` makes every message
+stand on its own.
+
+Messages older than `MAX_MESSAGE_AGE` are ignored here too — on a host that
+sleeps, Telegram delivers everything it queued the moment the bot wakes up, and
+answering an hour-old question is worse than not answering it.
+
+---
 
 ---
 
@@ -742,11 +808,14 @@ came through, it stays quiet.
 |---|---|
 | Typed `@thebot ...` in a group the bot is **not in**, pressed Send, nothing happened | That was an ordinary text message, not an inline query. A bot receives **nothing** from a chat it is not a member of — the mention is just text there. To use it in such a chat: type `@thebot ` (with the trailing space), wait for the panel to appear **above the keyboard**, and **tap the result**. Only that sends it (as your own message, "via @thebot"). |
 | Nothing at all in the log, however much you write, and `Conflict: terminated by other getUpdates request` | **Two instances on one token.** Telegram hands each message to exactly one poller and it is not this one. Usually the previous Render deploy still shutting down — wait a minute. If it persists: a second Render service on the same `TELEGRAM_BOT_TOKEN`, or a copy still running on your laptop. Stop one. |
+| Wrote to the bot in its own chat, no answer | `DM_CHAT_ENABLED=false`, or you are writing from a different account than `OWNER_ID` — the log says `DM from <id> (not the owner)`. A message older than `MAX_MESSAGE_AGE` is also skipped, which is what you see right after a host wakes up. |
+| The bot's own chat answers like a plain AI, not like Ilya | That is the design: the question goes to the model bare, exactly as in the inline **Ответить** option. There is no setting to put the persona back — use a business chat or a group for that. |
 | Bot doesn't appear in the Chatbots list | Secretary Mode is off in @BotFather (step 2) |
 | Bot can read but replies silently fail | Telegram limits some actions to private chats with a *recent* incoming message — send it a fresh one |
 | `no reply rights` in the log | "Reply to messages" toggle off in Telegram Business settings |
 | Typing `@yourbot ...` in a chat finds nothing | Inline mode is off — `/setinline` in @BotFather (step 6c) |
-| Inline result is empty, with a "This bot is private." button | `INLINE_ACCESS=shared` and that person shares no known group with you — `/status` shows how many groups are known |
+| Inline result is empty, with a "This bot is private." button | `INLINE_ACCESS=shared` and the bot has no evidence you two share a chat. `/status` shows `groups known` and `people cleared`. Fastest fix: exchange one message with them in your business DM, or have them write in one of your groups — either clears them for 7 days. |
+| Fixed it, but they still get "This bot is private." | The **no** is cached twice: 15 minutes in the bot (`INLINE_MISS_MINUTES`) and 5 minutes in Telegram itself for that exact query text. Redeploy clears the bot's half; a different query text gets past Telegram's. |
 | Inline works for you but not for anyone else | No groups known yet. Let someone write in one of yours, or set `GROUP_ALLOWLIST` |
 | No `business_message` updates at all | Chat is excluded in the Chatbots screen, or account has no Premium |
 | `gemini 404` | Model name not available to your key — run `list_models.py` |

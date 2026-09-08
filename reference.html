@@ -1,0 +1,683 @@
+<title>Ilya Bot Reference</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+  :root{
+    --ink:#0d141c; --paper:#f4f7f9; --surface:#ffffff; --surface-2:#eef3f6;
+    --muted:#5b6b7c; --faint:#8496a6; --rule:#d9e2e9;
+    --accent:#0f5f7a; --accent-soft:#e2f0f5;
+    --dm:#9a5a12; --dm-bg:#faf0e2;
+    --room:#166f52; --room-bg:#e6f3ed;
+    --inline:#5d43a6; --inline-bg:#eeeaf9;
+    --self:#8a2b4d; --self-bg:#fbe9ef;
+    --on:#166f52; --off:#8496a6; --warn:#9a5a12;
+    --shadow:0 1px 2px rgba(13,20,28,.06), 0 8px 24px -16px rgba(13,20,28,.28);
+    --serif:"IBM Plex Serif",Georgia,"Times New Roman",serif;
+    --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --ink:#dce5ee; --paper:#0b1117; --surface:#121b24; --surface-2:#182430;
+      --muted:#8a9bab; --faint:#6b7d8e; --rule:#22303e;
+      --accent:#5cc0e0; --accent-soft:#12313e;
+      --dm:#dda05a; --dm-bg:#2b2013;
+      --room:#57c398; --room-bg:#122a22;
+      --inline:#ab95ec; --inline-bg:#211b35;
+      --self:#e78aa8; --self-bg:#2e1620;
+      --on:#57c398; --off:#6b7d8e; --warn:#dda05a;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ink:#dce5ee; --paper:#0b1117; --surface:#121b24; --surface-2:#182430;
+    --muted:#8a9bab; --faint:#6b7d8e; --rule:#22303e;
+    --accent:#5cc0e0; --accent-soft:#12313e;
+    --dm:#dda05a; --dm-bg:#2b2013;
+    --room:#57c398; --room-bg:#122a22;
+    --inline:#ab95ec; --inline-bg:#211b35;
+    --self:#e78aa8; --self-bg:#2e1620;
+    --on:#57c398; --off:#6b7d8e; --warn:#dda05a;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.8);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:var(--sans); font-size:15px; line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1120px; margin:0 auto; padding:40px 24px 96px;
+        display:flex; flex-direction:column; gap:56px}
+  p{margin:0; max-width:68ch}
+  a{color:var(--accent)}
+
+  /* ---------- header ---------- */
+  header{display:flex; flex-direction:column; gap:18px}
+  .kicker{
+    font-family:var(--mono); font-size:11.5px; letter-spacing:.14em;
+    text-transform:uppercase; color:var(--faint);
+  }
+  h1{
+    font-family:var(--serif); font-weight:600; font-size:clamp(30px,4.4vw,44px);
+    line-height:1.1; letter-spacing:-.02em; margin:0; text-wrap:balance;
+  }
+  .lede{color:var(--muted); font-size:17px; max-width:64ch}
+  .jump{display:flex; flex-wrap:wrap; gap:8px; margin-top:4px}
+  .jump a{
+    font-family:var(--mono); font-size:12px; text-decoration:none;
+    color:var(--muted); border:1px solid var(--rule); border-radius:999px;
+    padding:5px 12px; background:var(--surface);
+  }
+  .jump a:hover{color:var(--accent); border-color:var(--accent)}
+  .jump a:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+
+  /* ---------- sections ---------- */
+  section{display:flex; flex-direction:column; gap:20px; scroll-margin-top:24px}
+  h2{
+    font-family:var(--serif); font-weight:600; font-size:24px; letter-spacing:-.01em;
+    margin:0; padding-bottom:10px; border-bottom:2px solid var(--ink);
+  }
+  h3{
+    font-family:var(--sans); font-weight:600; font-size:13px; margin:0;
+    letter-spacing:.06em; text-transform:uppercase; color:var(--muted);
+  }
+  .note{font-size:14px; color:var(--muted); max-width:68ch}
+
+  /* ---------- mode cards ---------- */
+  .modes{display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px}
+  .mode{
+    background:var(--surface); border:1px solid var(--rule); border-radius:10px;
+    padding:20px; display:flex; flex-direction:column; gap:12px; box-shadow:var(--shadow);
+    border-top:3px solid var(--mc);
+  }
+  .mode.dm{--mc:var(--dm)} .mode.room{--mc:var(--room)} .mode.inline{--mc:var(--inline)}
+  .mode.self{--mc:var(--self)}
+  .mode-head{display:flex; align-items:baseline; gap:10px}
+  .mode-name{font-family:var(--serif); font-weight:600; font-size:19px}
+  .mode-tag{font-family:var(--mono); font-size:11px; color:var(--mc); letter-spacing:.06em}
+  .mode p{font-size:14px; color:var(--muted)}
+  .mode code{
+    font-family:var(--mono); font-size:12.5px; background:var(--surface-2);
+    padding:2px 5px; border-radius:4px; color:var(--ink);
+  }
+  .need{
+    font-family:var(--mono); font-size:11.5px; color:var(--muted);
+    border-top:1px dashed var(--rule); padding-top:10px; margin-top:auto;
+    display:flex; flex-direction:column; gap:3px;
+  }
+  .need b{color:var(--ink); font-weight:600}
+
+  /* ---------- tables ---------- */
+  .scroll{overflow-x:auto; border:1px solid var(--rule); border-radius:10px; background:var(--surface)}
+  table{border-collapse:collapse; width:100%; font-size:14px; min-width:640px}
+  caption{
+    text-align:left; font-family:var(--mono); font-size:11.5px; letter-spacing:.1em;
+    text-transform:uppercase; color:var(--faint); padding:14px 16px 0;
+  }
+  th,td{text-align:left; padding:10px 16px; border-bottom:1px solid var(--rule);
+        vertical-align:top}
+  thead th{
+    font-size:11.5px; letter-spacing:.07em; text-transform:uppercase;
+    color:var(--muted); font-weight:600; background:var(--surface-2);
+    border-bottom:1px solid var(--rule); white-space:nowrap;
+  }
+  tbody tr:last-child td{border-bottom:none}
+  .matrix th[scope="row"]{font-weight:600; white-space:nowrap; width:190px}
+  .matrix td{font-size:13.5px}
+  .matrix col.c-dm{background:var(--dm-bg)}
+  .matrix col.c-room{background:var(--room-bg)}
+  .matrix col.c-inline{background:var(--inline-bg)}
+  .matrix col.c-self{background:var(--self-bg)}
+  .matrix thead th.h-dm{color:var(--dm)}
+  .matrix thead th.h-room{color:var(--room)}
+  .matrix thead th.h-inline{color:var(--inline)}
+  .matrix thead th.h-self{color:var(--self)}
+
+  .vars td:first-child{white-space:nowrap}
+  .var{font-family:var(--mono); font-size:13px; font-weight:500}
+  .def{
+    font-family:var(--mono); font-size:12.5px; color:var(--muted);
+    font-variant-numeric:tabular-nums; white-space:nowrap;
+  }
+  .def.empty{color:var(--faint); font-style:italic}
+  .req{
+    font-family:var(--mono); font-size:10.5px; color:var(--warn);
+    letter-spacing:.08em; display:block; margin-top:2px;
+  }
+
+  /* ---------- mode dots ---------- */
+  .dots{display:flex; gap:4px; white-space:nowrap}
+  .dot{
+    width:19px; height:19px; border-radius:5px; display:grid; place-items:center;
+    font-family:var(--mono); font-size:10.5px; font-weight:600;
+    background:var(--surface-2); color:var(--faint);
+  }
+  .dot.on.d-dm{background:var(--dm-bg); color:var(--dm)}
+  .dot.on.d-room{background:var(--room-bg); color:var(--room)}
+  .dot.on.d-inline{background:var(--inline-bg); color:var(--inline)}
+  .dot.on.d-self{background:var(--self-bg); color:var(--self)}
+  .legend{
+    display:flex; flex-wrap:wrap; gap:16px; font-size:13px; color:var(--muted);
+    align-items:center;
+  }
+  .legend span{display:flex; align-items:center; gap:6px}
+
+  /* ---------- removed list ---------- */
+  .removed{display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px}
+  .rem{
+    background:var(--surface); border:1px solid var(--rule); border-radius:8px;
+    padding:14px 16px; display:flex; flex-direction:column; gap:4px;
+  }
+  .rem code{font-family:var(--mono); font-size:13px; color:var(--ink)}
+  .rem span{font-size:13px; color:var(--muted)}
+
+  .stats{display:flex; flex-wrap:wrap; gap:28px; padding:18px 20px;
+         background:var(--surface); border:1px solid var(--rule); border-radius:10px}
+  .stat{display:flex; flex-direction:column; gap:2px}
+  .stat b{font-family:var(--mono); font-size:22px; font-weight:600;
+          font-variant-numeric:tabular-nums}
+  .stat span{font-size:12px; color:var(--muted); letter-spacing:.03em}
+
+  pre{
+    font-family:var(--mono); font-size:12.5px; line-height:1.55; margin:0;
+    background:var(--surface); border:1px solid var(--rule); border-left:3px solid var(--accent);
+    border-radius:8px; padding:14px 16px; overflow-x:auto; color:var(--muted);
+  }
+  footer{font-size:13px; color:var(--faint); border-top:1px solid var(--rule); padding-top:20px}
+  @media (prefers-reduced-motion:no-preference){
+    .jump a{transition:color .15s, border-color .15s}
+  }
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="kicker">Telegram-бот «Илья» · справочник</div>
+  <h1>Четыре режима и всё, чем они настраиваются</h1>
+  <p class="lede">Один бот отвечает в четырёх разных положениях, и правила в них
+  намеренно разные. Ниже — чем именно они отличаются и какая переменная за что
+  отвечает. Значения по умолчанию взяты прямо из кода.</p>
+  <nav class="jump">
+    <a href="#modes">Режимы</a>
+    <a href="#matrix">Что различается</a>
+    <a href="#core">Основное</a>
+    <a href="#ai">Модели</a>
+    <a href="#dm">Бизнес-личка</a>
+    <a href="#group">Группы</a>
+    <a href="#inline">Инлайн</a>
+    <a href="#self">Чат с ботом</a>
+    <a href="#store">Хранение</a>
+    <a href="#cleanup">Что удалено</a>
+  </nav>
+</header>
+
+<section id="modes">
+  <h2>Четыре режима</h2>
+  <div class="modes">
+    <article class="mode dm">
+      <div class="mode-head"><span class="mode-name">Личка</span>
+        <span class="mode-tag">TELEGRAM BUSINESS</span></div>
+      <p>Бот подключён к твоему бизнес-аккаунту и отвечает тем, кто пишет тебе
+      лично — от твоего имени. Ждёт, «читает», потом «печатает». Если сообщение
+      удалили или поправили, черновик выбрасывается.</p>
+      <p>Проверка: подключение должно принадлежать <code>OWNER_ID</code>.
+      Если владельца установить не удалось — молчит.</p>
+      <div class="need"><b>Нужно:</b>
+        <span>Telegram Premium</span>
+        <span>Secretary Mode в @BotFather</span>
+        <span>«Reply to messages» в правах</span>
+      </div>
+    </article>
+
+    <article class="mode room">
+      <div class="mode-head"><span class="mode-name">Группа</span>
+        <span class="mode-tag">ОБЫЧНЫЙ УЧАСТНИК</span></div>
+      <p>Бот добавлен в чат и читает всё подряд, но говорит, только когда судья
+      решит, что к нему обратились или о нём говорят. Отвечает мгновенно, без
+      пауз: в комнате пауза значит, что разговор ушёл дальше.</p>
+      <p>Проверка: <code>getChatMember</code> — состоишь ли <em>ты</em> в этом
+      чате. Нет — бот не отвечает и ничего не запоминает.</p>
+      <div class="need"><b>Нужно:</b>
+        <span>/setprivacy → Disable</span>
+        <span>затем убрать и добавить бота заново</span>
+      </div>
+    </article>
+
+    <article class="mode inline">
+      <div class="mode-head"><span class="mode-name">Инлайн</span>
+        <span class="mode-tag">ЧАТ БЕЗ БОТА</span></div>
+      <p>Пишешь <code>@бот текст</code> в любом чате и отправляешь. Сообщение
+      уходит от твоего имени с пометкой «via @бот» и через секунду заполняется
+      ответом. Пока печатаешь — не стоит ничего.</p>
+      <p>Проверка: по человеку, а не по чату — Telegram не сообщает боту, откуда
+      пришёл запрос. Пропуск даёт общая группа <em>или</em> переписка с тобой
+      в личке.</p>
+      <div class="need"><b>Нужно:</b>
+        <span>/setinline</span>
+        <span>/setinlinefeedback → Enabled</span>
+      </div>
+    </article>
+
+    <article class="mode self">
+      <div class="mode-head"><span class="mode-name">Чат с ботом</span>
+        <span class="mode-tag">БЕЗ ПЕРСОНАЖА</span></div>
+      <p>Открываешь <code>@своего_бота</code> и пишешь ему. Отвечает тебе — и
+      только тебе. Единственный режим, где персонажа нет вообще: вопрос уходит
+      в модель ровно как набран, без личности, без стиля, без «отвечай одной
+      строкой». То же самое, что вариант <b>Ответить</b> в инлайне.</p>
+      <p>Проверка: отправитель = <code>OWNER_ID</code>. Всем остальным — одна
+      строка «This bot is private.»</p>
+      <div class="need"><b>Нужно:</b>
+        <span>ничего — работает сразу</span>
+        <span>/reset чистит нить</span>
+      </div>
+    </article>
+  </div>
+</section>
+
+<section id="matrix">
+  <h2>Что в них различается</h2>
+  <p class="note">Строки — то, что чаще всего путается. Пустой прочерк значит
+  «в этом режиме такого механизма нет вообще», а не «выключено».</p>
+  <div class="scroll">
+    <table class="matrix">
+      <colgroup><col><col class="c-dm"><col class="c-room"><col class="c-inline"><col class="c-self"></colgroup>
+      <thead><tr>
+        <th></th>
+        <th class="h-dm">Личка</th>
+        <th class="h-room">Группа</th>
+        <th class="h-inline">Инлайн</th>
+        <th class="h-self">Чат с ботом</th>
+      </tr></thead>
+      <tbody>
+        <tr><th scope="row">Кто запускает ответ</th>
+          <td>Любой, кто пишет тебе — но только через <em>твоё</em> подключение</td>
+          <td>Любой участник — но только в чате, где состоишь ты</td>
+          <td>По <code>INLINE_ACCESS</code>: ты / из общей группы или личной переписки / все</td><td>Только ты. Чужому — «This bot is private.»</td></tr>
+        <tr><th scope="row">Как проверяется, что это твоё</th>
+          <td><code>getBusinessConnection</code> → владелец = <code>OWNER_ID</code>. Не выяснили — молчим</td>
+          <td><code>getChatMember</code> → ты в чате. Кэш на час</td>
+          <td>По отправителю: есть ли общая группа <b>или</b> личная переписка. Кэш на неделю</td><td>Отправитель = <code>OWNER_ID</code>, без сети и без кэша</td></tr>
+        <tr><th scope="row">Длина ответа</th>
+          <td>Одна строка — правило промпта, не обрезка</td>
+          <td>Без ограничений, хоть пять абзацев</td>
+          <td>Без ограничений, но ≤ 4096 знаков</td><td>Без ограничений: сколько бы ни было, разобьётся на сообщения</td></tr>
+        <tr><th scope="row">Обрезка по символам</th>
+          <td>Нет</td>
+          <td>Нет — длиннее 4096 просто разбивается на сообщения</td>
+          <td>4000 — сообщение правится на месте, разбить нельзя</td><td>Нет</td></tr>
+        <tr><th scope="row">Оскорбления в ответ</th>
+          <td>Нет: разбирает реплику, а не человека. На той стороне может быть клиент</td>
+          <td>Да, с красными линиями</td>
+          <td>Да, те же красные линии</td><td>— личности нет, отвечает как обычный ИИ</td></tr>
+        <tr><th scope="row">Паузы перед ответом</th>
+          <td>«Дошёл до телефона» + «печатает» на скорости 5 зн/с</td>
+          <td>Мгновенно (<code>GROUP_DELAY=false</code>)</td>
+          <td>Мгновенно, сразу после отправки</td><td>Мгновенно, только «печатает» пока думает</td></tr>
+        <tr><th scope="row">Выбор модели</th>
+          <td>Терпеливый: качество важнее скорости</td>
+          <td>Спешный: медленнее <code>SLOW_SECONDS</code> — вниз по лестнице</td>
+          <td>Спешный</td><td>Терпеливый: качество важнее скорости</td></tr>
+        <tr><th scope="row">Удаление / правка сообщения</th>
+          <td>Отменяет или перезапускает ответ</td>
+          <td>— не отменяет: в комнате все продолжают говорить</td>
+          <td>—</td>
+          <td>— каждое сообщение отдельный вопрос</td></tr>
+        <tr><th scope="row">Судья «стоит ли влезать»</th>
+          <td>— всегда отвечает</td>
+          <td>Да, по той же лестнице, но с дешёвого конца вверх</td>
+          <td>— тебя уже позвали явно</td><td>— ты пишешь ему напрямую</td></tr>
+        <tr><th scope="row">История разговора</th>
+          <td>Ключ <code>&lt;conn&gt;:&lt;chat&gt;</code>, 20 реплик</td>
+          <td>Ключ <code>group:&lt;chat&gt;</code>, 20 реплик</td>
+          <td>Нет: нет id чата, память протекала бы между чатами</td><td>Ключ <code>dm:&lt;chat&gt;</code>, 20 реплик. <code>/reset</code> чистит</td></tr>
+        <tr><th scope="row">Цена в запросах</th>
+          <td>Один на сообщение</td>
+          <td>Судья + ответ, только когда судья сказал «да»</td>
+          <td>Один на отправленное сообщение. Набор текста бесплатен</td><td>Один на сообщение</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="core">
+  <h2>Переменные</h2>
+  <p class="note">Кружки справа показывают, на какие режимы влияет переменная.
+  Значения — умолчания из кода; пустое значение помечено как «пусто».</p>
+  <div class="legend">
+    <span><i class="dot on d-dm">Л</i> личка</span>
+    <span><i class="dot on d-room">Г</i> группа</span>
+    <span><i class="dot on d-inline">И</i> инлайн</span>
+    <span><i class="dot on d-self">Б</i> чат с ботом</span>
+    <span><i class="dot">Л</i> не влияет</span>
+  </div>
+
+  <div class="scroll">
+    <table class="vars">
+      <caption>Обязательное и общее</caption>
+      <thead><tr><th>Переменная</th><th>По умолчанию</th><th>Что делает</th><th>Режимы</th></tr></thead>
+      <tbody>
+        <tr><td><span class="var">TELEGRAM_BOT_TOKEN</span><span class="req">обязательна</span></td>
+          <td class="def empty">пусто</td>
+          <td>Токен от @BotFather. Без него бот не стартует.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">OWNER_ID</span><span class="req">поставь обязательно</span></td>
+          <td class="def">0</td>
+          <td>Твой Telegram user id. Без него любой может подцепить бота к своему бизнес-аккаунту и тратить твою квоту.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">PERSONA</span></td><td class="def empty">пусто</td>
+          <td>Заменяет всю личность целиком. Пусто — встроенный «Илья».</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">BOT_TZ</span></td><td class="def">Europe/Berlin</td>
+          <td>Где он «находится» — чтобы знать время и свой возраст. В промпте город не называется: назовёшь — начнёт про него говорить.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">WORKERS</span></td><td class="def">4</td>
+          <td>Сколько чатов обслуживается параллельно. 1 — всё по очереди.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">IGNORE_USER_IDS</span></td><td class="def empty">пусто</td>
+          <td>id через запятую, которым никогда не отвечать.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">MAX_INPUT_CHARS</span></td><td class="def">4000</td>
+          <td>Длиннее этого входящее сообщение обрезается перед отправкой в модель.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">MAX_MESSAGE_AGE</span></td><td class="def">3600</td>
+          <td>Игнорировать сообщения старше N секунд. Важно на хостинге, который засыпает: Telegram копит очередь и вываливает её при пробуждении.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">REPLY_COOLDOWN</span></td><td class="def">0</td>
+          <td>Секунд между двумя ответами в одном чате. Выключен: в личке старый черновик и так выбрасывается при новом сообщении, а в комнате двое обратившихся разом оба заслуживают ответа.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot">И</i><i class="dot d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">LOG_LEVEL</span></td><td class="def">INFO</td>
+          <td>Подробность логов.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">PORT</span></td><td class="def empty">от хостинга</td>
+          <td>Ставит сам Render. Есть — бот открывает health-эндпоинт, иначе деплой считается упавшим.</td>
+          <td><div class="dots"><i class="dot">Л</i><i class="dot">Г</i><i class="dot">И</i><i class="dot on d-self">Б</i></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="ai">
+  <h2>Модели и провайдеры</h2>
+  <p class="note"><code>AI_ORDER</code> решает <em>какие</em> провайдеры есть и с
+  какой модели каждый начинает. Порядок ответов он не задаёт: все модели всех
+  провайдеров складываются в одну лестницу по качеству и замеренной скорости.
+  По ней сверху вниз идут ответы во всех трёх режимах: начинаем с самой умной
+  живой ступени и спускаемся, только когда верхние кончились. Групповой судья
+  ходит по той же лестнице, но снизу вверх — вердикт «да/нет» умной модели не
+  требует, а каждый вызов судьи на ней отнят у настоящих ответов.</p>
+  <div class="scroll">
+    <table class="vars">
+      <caption>Лестница моделей</caption>
+      <thead><tr><th>Переменная</th><th>По умолчанию</th><th>Что делает</th><th>Режимы</th></tr></thead>
+      <tbody>
+        <tr><td><span class="var">AI_ORDER</span></td>
+          <td class="def">gemini, groq, cerebras,<br>openrouter, nvidia,<br>huggingface, mistral</td>
+          <td>Какие провайдеры вообще участвуют. Без ключа провайдер молча пропускается.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">GEMINI_API_KEY</span><br>
+          <span class="var">GROQ_API_KEY</span><br>
+          <span class="var">CEREBRAS_API_KEY</span><br>
+          <span class="var">OPENROUTER_API_KEY</span><br>
+          <span class="var">MISTRAL_API_KEY</span><br>
+          <span class="var">NVIDIA_API_KEY</span><br>
+          <span class="var">HF_TOKEN</span></td>
+          <td class="def empty">пусто</td>
+          <td>Ключи. Нужен хотя бы один. Два уже делают бота практически неубиваемым.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">GEMINI_MODEL</span><br>
+          <span class="var">GROQ_MODEL</span> и т.д.</td>
+          <td class="def">gemini-3.8-flash</td>
+          <td>Обычно трогать не надо: если имя модели умерло, бот спрашивает у провайдера живое и переключается сам, а в лог пишет, что выбрал.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">SLOW_SECONDS</span></td><td class="def">8</td>
+          <td>Модель, отвечающая дольше, резко падает вниз лестницы — но только там, где важна скорость.</td>
+          <td><div class="dots"><i class="dot">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">MODEL_COOLDOWN</span></td><td class="def">600</td>
+          <td>Упёршаяся в лимит модель отдыхает столько секунд, лестница шагает на ступень ниже.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">PARK_AFTER_FAILURES</span><br><span class="var">PARK_MINUTES</span></td>
+          <td class="def">3<br>10</td>
+          <td>Провайдер, упавший N раз подряд, пропускается целиком на N минут. Исчерпанная суточная квота не восстановится за минуту.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">MAX_OUTPUT_TOKENS</span></td><td class="def">4096</td>
+          <td>Потолок, а не цель. Включает и «размышление» модели: слишком мало — Gemini потратит всё на думание и вернёт пустоту.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">REPLY_MAX_CHARS</span><br><span class="var">ROOM_MAX_CHARS</span></td>
+          <td class="def">0<br>0</td>
+          <td>Жёсткая обрезка. 0 = выключена. Длину задаёт промпт; обрезка по счётчику только рубила фразу на полуслове.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">TEMPERATURE</span></td><td class="def">1.0</td>
+          <td>Разброс ответов.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">GEMINI_THINKING_LEVEL</span></td><td class="def">low</td>
+          <td><code>minimal | low | medium | high</code>. Реплике в чате глубокое рассуждение не нужно.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+        <tr><td><span class="var">GEMINI_TIMEOUT</span></td><td class="def">45</td>
+          <td>Секунд ожидания ответа Gemini.</td>
+          <td><div class="dots"><i class="dot on d-dm">Л</i><i class="dot on d-room">Г</i><i class="dot on d-inline">И</i><i class="dot on d-self">Б</i></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="dm">
+  <h2>Бизнес-личка: паузы как у человека</h2>
+  <p class="note">Сначала «пока дошёл до телефона и прочитал», и только потом
+  загорается «печатает» — и горит всё время набора. Именно в таком порядке:
+  индикатор, который вспыхивает через полсекунды после сообщения, выдаёт робота.</p>
+  <div class="scroll">
+    <table class="vars">
+      <caption>Только бизнес-личка</caption>
+      <thead><tr><th>Переменная</th><th>По умолчанию</th><th>Что делает</th></tr></thead>
+      <tbody>
+        <tr><td><span class="var">READ_MIN</span> / <span class="var">READ_MAX</span></td><td class="def">3 / 12</td>
+          <td>Случайная пауза «дошёл до телефона», секунды.</td></tr>
+        <tr><td><span class="var">READ_CPS</span></td><td class="def">25</td>
+          <td>Скорость чтения входящего, знаков в секунду.</td></tr>
+        <tr><td><span class="var">READ_CAP</span></td><td class="def">40</td>
+          <td>Потолок всей паузы «прочитал», секунды.</td></tr>
+        <tr><td><span class="var">TYPING_CPS</span></td><td class="def">5</td>
+          <td>Скорость набора — примерно 45 слов в минуту.</td></tr>
+        <tr><td><span class="var">TYPING_MIN</span> / <span class="var">TYPING_MAX</span></td><td class="def">2 / 45</td>
+          <td>Границы паузы набора, секунды.</td></tr>
+        <tr><td><span class="var">QUOTE_REPLIES</span></td><td class="def">false</td>
+          <td>Цитировать сообщение клиента. Выключено: человек, отвечающий в своей личке, просто пишет в ответ.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="group">
+  <h2>Группы: судья вместо ключевых слов</h2>
+  <p class="note">Бот читает всю комнату, но говорит только когда дешёвая модель
+  решит, что к нему обратились, о нём говорят или его задели. Судья идёт по той
+  же лестнице, но с дешёвого конца — вердикт «да/нет» не требует умной модели.</p>
+  <div class="scroll">
+    <table class="vars">
+      <caption>Только группы</caption>
+      <thead><tr><th>Переменная</th><th>По умолчанию</th><th>Что делает</th></tr></thead>
+      <tbody>
+        <tr><td><span class="var">GROUPS_ENABLED</span></td><td class="def">true</td>
+          <td>Работает ли он в группах вообще.</td></tr>
+        <tr><td><span class="var">GROUP_TRIGGER</span></td><td class="def">context</td>
+          <td><code>context</code> — решает судья. <code>all</code> — отвечает на всё.</td></tr>
+        <tr><td><span class="var">GROUP_JOIN_TOPICS</span></td><td class="def">true</td>
+          <td>Можно ли влезать в разговор не о нём, если есть что сказать.</td></tr>
+        <tr><td><span class="var">GROUP_NAMES</span></td><td class="def empty">илья, илье, бот…</td>
+          <td>Имена, на которые он откликается. Только целые слова: «бот» да, «ботинок» нет.</td></tr>
+        <tr><td><span class="var">GROUP_JUDGE_MODEL</span></td><td class="def empty">пусто</td>
+          <td>Пусто — судья начинает с дешёвого конца лестницы. Имя модели — пробовать её первой; нет такой на лестнице, бот скажет об этом при старте.</td></tr>
+        <tr><td><span class="var">GROUP_JUDGE_TURNS</span></td><td class="def">12</td>
+          <td>Сколько последних реплик видит судья.</td></tr>
+        <tr><td><span class="var">GROUP_JUDGE_MIN_CHARS</span></td><td class="def">10</td>
+          <td>Короче этого — судью не звать.</td></tr>
+        <tr><td><span class="var">GROUP_JUDGE_MAX_PER_MIN</span></td><td class="def">8</td>
+          <td>Потолок обращений к судье в минуту на чат.</td></tr>
+        <tr><td><span class="var">GROUP_JUDGE_RECENT_TURNS</span></td><td class="def">6</td>
+          <td>Работает только при <code>GROUP_JOIN_TOPICS=false</code>.</td></tr>
+        <tr><td><span class="var">GROUP_COOLDOWN</span></td><td class="def">0</td>
+          <td>Молчание после своей реплики. 0 — не нужно: он и так говорит, только когда с ним говорят.</td></tr>
+        <tr><td><span class="var">GROUP_REPLY_ALL</span></td><td class="def">false</td>
+          <td>Отвечать на каждое сообщение. Сжигает квоту в живом чате.</td></tr>
+        <tr><td><span class="var">GROUP_DELAY</span></td><td class="def">false</td>
+          <td>Включить человеческие паузы и в группах.</td></tr>
+        <tr><td><span class="var">GROUP_ALLOWLIST</span></td><td class="def empty">пусто</td>
+          <td>Ограничить конкретными чатами по id. Заодно сразу заполняет список твоих групп для инлайна.</td></tr>
+        <tr><td><span class="var">GROUP_AUTO_LEAVE</span></td><td class="def">false</td>
+          <td>Выходить из чужих чатов, а не просто молчать в них.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="inline">
+  <h2>Инлайн: почему проверяется человек, а не чат</h2>
+  <p class="note">Telegram не сообщает боту, из какого чата пришёл инлайн-запрос:
+  в апдейте есть отправитель, текст и грубый тип чата — id чата нет по замыслу.
+  Поэтому «только в чатах, где я состою» проверить нельзя. Можно проверить
+  человека — и это та же гарантия с другого конца.</p>
+  <div class="scroll">
+    <table class="vars">
+      <caption>Только инлайн</caption>
+      <thead><tr><th>Переменная</th><th>По умолчанию</th><th>Что делает</th></tr></thead>
+      <tbody>
+        <tr><td><span class="var">INLINE_ENABLED</span></td><td class="def">true</td>
+          <td>Включён ли режим.</td></tr>
+        <tr><td><span class="var">INLINE_ACCESS</span></td><td class="def">shared</td>
+          <td><code>owner</code> — только ты. <code>shared</code> — ты и все, кто состоит в одной из твоих групп. <code>all</code> — кто угодно.</td></tr>
+        <tr><td><span class="var">INLINE_MEMBER_DAYS</span></td><td class="def">7</td>
+          <td>Сколько дней помнить «этот человек в одной группе со мной». Лежит в Redis под <code>tgbot:member:&lt;id&gt;</code> и переживает редеплой.</td></tr>
+        <tr><td><span class="var">INLINE_MISS_MINUTES</span></td><td class="def">15</td>
+          <td>Сколько помнить отказ. Намеренно мало: кто вступит в твою группу завтра, не должен сидеть запертым неделю.</td></tr>
+        <tr><td><span class="var">INLINE_TRUST_DM</span></td><td class="def">true</td>
+          <td>Считать ли переписку с тобой в личке таким же пропуском, как общую группу. Считается в обе стороны — и когда пишут тебе, и когда пишешь ты. Бесплатно: имя человека уже есть в апдейте. Выключи, если в бизнес-аккаунт пишут посторонние.</td></tr>
+        <tr><td><span class="var">INLINE_MAX_PER_MIN</span></td><td class="def">6</td>
+          <td>Потолок на человека в минуту, чтобы открытого бота не выдоили.</td></tr>
+        <tr><td><span class="var">INLINE_PLACEHOLDER</span></td><td class="def">…</td>
+          <td>Что висит в чате секунду между отправкой и ответом.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note"><b>Общая группа — не единственный пропуск.</b> Личная
+  переписка на твоём бизнес-аккаунте засчитывается так же
+  (<code>INLINE_TRUST_DM</code>) и по сути доказывает больше: группа значит лишь,
+  что вы стоите в одной комнате со ста другими, а личка — что вы правда общаетесь.
+  Для друга, с которым у тебя нет общих групп, это вообще единственный путь.
+  Стоит это ноль запросов: в бизнес-сообщении человек уже назван.</p>
+  <p class="note">Список твоих групп бот узнаёт по мере того, как в них пишут —
+  Bot API не умеет спрашивать «в каких чатах я состою». Список сохраняется, так
+  что перезапуск не запирает всех, кроме тебя.</p>
+  <p class="note">Сам вердикт «мы в одной группе» кэшируется на неделю в Redis,
+  так что после редеплоя все, кто пользовался инлайном вчера, пользуются и
+  сегодня — без единого запроса к Telegram. Причём большая часть кэша набирается
+  <em>бесплатно</em>: любой, кто написал в твоей группе, тем самым уже доказал,
+  что он в ней, и записывается на месте. Спрашивать <code>getChatMember</code>
+  приходится только про тех, кто молчал.</p>
+  <pre>offered 9 inline replies and Telegram never said one was sent. If the
+message in the chat is stuck on '…', inline feedback is off:
+@BotFather -&gt; /setinlinefeedback -&gt; @yourbot -&gt; Enabled.</pre>
+</section>
+
+<section id="self">
+  <h2>Чат с самим ботом</h2>
+  <p class="note">Пишешь боту в его собственную личку — он отвечает тебе как
+  обычный ИИ. Персонажа здесь нет: вопрос уходит в модель ровно как набран, без
+  личности, без правил стиля, без даты. Это тот же вариант, что <b>Ответить</b>
+  в инлайне, только разговором и с памятью.</p>
+  <div class="scroll">
+    <table class="vars">
+      <caption>Только чат с ботом</caption>
+      <thead><tr><th>Переменная</th><th>По умолчанию</th><th>Что делает</th></tr></thead>
+      <tbody>
+        <tr><td><span class="var">DM_CHAT_ENABLED</span></td><td class="def">true</td>
+          <td>Отвечать ли на обычный текст в личке бота. Выключено — команды
+          <code>/status</code>, <code>/check</code>, <code>/reset</code>
+          продолжают работать.</td></tr>
+        <tr><td><span class="var">DM_CHAT_MEMORY</span></td><td class="def">true</td>
+          <td>Держать нить разговора: ключ <code>dm:&lt;chat&gt;</code>, длина по
+          <code>HISTORY_TURNS</code>. Выключено — каждый вопрос сам по себе, как
+          в инлайне.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note"><code>/reset</code> забывает нить и ничего больше:
+  бизнес-чаты и группы её не видят и не теряют. Сообщения старше
+  <code>MAX_MESSAGE_AGE</code> здесь тоже пропускаются — иначе после пробуждения
+  хостинга бот отвечает на вопрос часовой давности.</p>
+</section>
+
+<section id="store">
+  <h2>Хранение</h2>
+  <p class="note">Upstash Redis выигрывает, если заданы обе переменные — и это
+  единственный вариант, переживающий редеплой на хостинге с эфемерным диском.
+  Файлы переживают падение, но не деплой.</p>
+  <div class="scroll">
+    <table class="vars">
+      <caption>История и список групп</caption>
+      <thead><tr><th>Переменная</th><th>По умолчанию</th><th>Что делает</th></tr></thead>
+      <tbody>
+        <tr><td><span class="var">UPSTASH_REDIS_REST_URL</span><br>
+          <span class="var">UPSTASH_REDIS_REST_TOKEN</span></td><td class="def empty">пусто</td>
+          <td>Заданы обе — история пишется в Redis, отдельным ключом на чат.</td></tr>
+        <tr><td><span class="var">REDIS_PREFIX</span></td><td class="def">tgbot</td>
+          <td>Префикс ключей: <code>tgbot:hist:*</code>, <code>tgbot:groups</code>.</td></tr>
+        <tr><td><span class="var">HISTORY_TTL_DAYS</span></td><td class="def">30</td>
+          <td>Через сколько дней Redis сам забудет чат.</td></tr>
+        <tr><td><span class="var">HISTORY_TURNS</span></td><td class="def">20</td>
+          <td>Реплик контекста на чат — твои и его вместе.</td></tr>
+        <tr><td><span class="var">HISTORY_FILE</span></td><td class="def">history.json</td>
+          <td>Запасной вариант: один файл, внутри разделы по чатам. Пусто — только память.</td></tr>
+        <tr><td><span class="var">HISTORY_SAVE_EVERY</span></td><td class="def">20</td>
+          <td>Секунд между записями — всплеск сообщений собирается в одну.</td></tr>
+        <tr><td><span class="var">HISTORY_MAX_CHATS</span></td><td class="def">300</td>
+          <td>Сколько чатов хранить, начиная с самых свежих.</td></tr>
+        <tr><td><span class="var">GROUPS_FILE</span></td><td class="def">groups.json</td>
+          <td>Список твоих групп, если Redis не настроен. Пусто — забывать при каждом перезапуске.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+
+<section id="cleanup">
+  <h2>Что убрано при чистке</h2>
+  <div class="stats">
+    <div class="stat"><b>0</b><span>предупреждений pyflakes</span></div>
+    <div class="stat"><b>0</b><span>функций без вызова</span></div>
+    <div class="stat"><b>0</b><span>переменных-призраков в .env</span></div>
+    <div class="stat"><b>9</b><span>наборов тестов зелёные</span></div>
+  </div>
+  <h3>Удалено как мёртвое</h3>
+  <div class="removed">
+    <div class="rem"><code>PRIMARY_MODEL</code><span>Присваивалась дважды, не читалась нигде. Остаток от старой схемы «закрепить модель на N минут».</span></div>
+    <div class="rem"><code>PINNED_UNTIL</code><span>Встречалась в файле ровно один раз — в собственном присваивании.</span></div>
+    <div class="rem"><code>FALLBACK_MINUTES</code><span>Читала переменную окружения, которую никто потом не смотрел.</span></div>
+    <div class="rem"><code>Provider.searched</code><span>Слот записывался в конструкторе и не читался: поиск живой модели каждый раз идёт заново.</span></div>
+    <div class="rem"><code>Provider.__repr__</code><span>Провайдер нигде не форматировался напрямую — логи берут <code>.name</code> и <code>.model</code>.</span></div>
+    <div class="rem"><code>GROUP_KEYWORD_COOLDOWN</code><span>Запасное старое имя переменной, которым ты ни разу не пользовался.</span></div>
+  </div>
+  <h3>Свёрнуто в общие помощники</h3>
+  <div class="removed">
+    <div class="rem"><code>ladder_order()</code><span>Порядок моделей вычислялся в двух местах вручную. Теперь одна функция: ответы читают её сверху, судья — снизу.</span></div>
+    <div class="rem"><code>rate_ok()</code><span>Скользящее окно на 60 секунд было написано дважды — для судьи и для инлайна.</span></div>
+    <div class="rem"><code>run_off_poll_loop()</code><span>Идиома «в пул, если воркеров больше одного» повторялась в четырёх местах.</span></div>
+    <div class="rem"><code>provider_headers()</code><span>Заголовки, которых требует OpenRouter, были скопированы в двух местах.</span></div>
+    <div class="rem"><code>gemini_url()</code>, <code>gemini_headers()</code>, <code>gemini_text()</code><span>URL, ключ и выкидывание «мыслей» из ответа дублировались в трёх местах.</span></div>
+  </div>
+  <h3>Комментарии, разошедшиеся с кодом</h3>
+  <div class="removed">
+    <div class="rem"><code>«первый ответивший выигрывает»</code><span>Провайдеры давно не перебираются по порядку — работает лестница по качеству и скорости.</span></div>
+    <div class="rem"><code>«ничего не обрезается»</code><span>Не упоминало единственное исключение — инлайн.</span></div>
+    <div class="rem"><code>history[(conn, chat)]</code><span>Ключ описан как кортеж, хотя это строка.</span></div>
+    <div class="rem"><code>GROUP_JUDGE_MODEL</code><span>Была задокументирована, но в самом судействе не использовалась — влияла только на подпись в <code>/status</code>. Теперь работает.</span></div>
+  </div>
+</section>
+
+<footer>
+  Значения по умолчанию и поведение вычитаны из <code>bot.py</code> напрямую,
+  не по памяти. Отдельный тест сверяет <code>.env.example</code> с кодом в обе
+  стороны, так что расхождение в этой таблице сломает сборку.
+</footer>
+
+</div>
