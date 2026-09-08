@@ -437,25 +437,40 @@ with the reply. Typing costs nothing — the model runs once, on the tap.
 An inline message cannot quote anything: Telegram gives it no reply
 parameters. So without help, the moment the placeholder is replaced the line he
 was answering is gone from the chat and the reply reads like a non sequitur to
-everyone else. The question is therefore carried inside the message, labelled
-with who asked:
+everyone else. The question is therefore carried inside the message:
 
-```
-Дмитрий: ну и что ты на это скажешь
-AI: Скажу, что вопрос звучит как приглашение на драку.
-```
+> **Дмитрий**
+> > ну и что ты на это скажешь
+>
+> **AI:** Скажу, что вопрос звучит как приглашение на драку.
 
-Two lines, no blank line between them, plain text — no markup means nothing has
-to be escaped and no stray character can make Telegram refuse the message. The
-name is taken from whoever *asked*, not whoever taps the button (anyone in the
-chat can press it), with the first letter capitalised and the rest untouched,
-so `МАКС` stays `МАКС`.
+Bold name, the question in a real Telegram quote block, bold label, plain
+answer — the answer stays the easiest thing to read. No blank lines: the quote
+block supplies the separation on its own.
+
+The name is taken from whoever *asked*, not whoever taps the button (anyone in
+the chat can press it), with the first letter capitalised and the rest
+untouched, so `МАКС` stays `МАКС`.
 
 The question goes in **whole**. The only thing that can shorten it is Telegram's
 own 4096-character ceiling on the entire message, and even then only by as much
 as it takes to fit — the answer is what has to survive, so it keeps a floor of
-600 characters and the question yields. `INLINE_SHOW_QUESTION=false` drops the
-first line entirely; `INLINE_AI_PREFIX` changes the `AI: ` label.
+600 characters and the question yields. If some character upsets Telegram's
+parser the whole thing is re-sent as plain text, because the answer matters more
+than the styling. `INLINE_SHOW_QUESTION=false` drops everything but the answer;
+`INLINE_AI_LABEL` changes the `AI` label.
+
+### Two routes in, one answer out
+
+The stub can be filled in by either event — Telegram's sampled
+`chosen_inline_result`, or the tap on the button — and both can arrive for the
+same message. Whichever claims it first generates the answer; the other one
+sees the message is already taken and quietly shows a toast instead. It used to
+overwrite the winner's answer-in-progress with "this request has expired",
+which looked exactly like a bug because it was one.
+
+A button from before a restart still gets a toast saying the request is stale —
+but the message in the chat is never touched.
 
 ### One setting in @BotFather
 

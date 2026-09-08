@@ -12,6 +12,7 @@ Runs with plain long-polling: no public URL, no webhook, no framework.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import os
@@ -128,7 +129,7 @@ INLINE_SHOW_QUESTION = os.environ.get(
     "INLINE_SHOW_QUESTION", "true").strip().lower() not in ("0", "false", "no")
 
 # What the bot's own line is labelled with.
-INLINE_AI_PREFIX = os.environ.get("INLINE_AI_PREFIX", "AI: ")
+INLINE_AI_LABEL = os.environ.get("INLINE_AI_LABEL", "AI")
 
 # Per-person ceiling, so an open inline bot cannot be drained in a minute.
 INLINE_MAX_PER_MIN = int(os.environ.get("INLINE_MAX_PER_MIN", "6"))
@@ -2434,6 +2435,12 @@ inline_seen = False        # has any inline query ever arrived this run?
 # chat can press the button - the line belongs to whoever asked.
 inline_pending: Dict[str, Tuple[str, str]] = {}
 
+# Messages already being filled in, so the two routes cannot both pay for the
+# same answer - and, more visibly, so the loser of that race does not report
+# the winner's work as a stale request.
+inline_filling: Dict[str, float] = {}
+_fill_guard = threading.Lock()
+
 # The menu you get after typing his name. Only the one you pick costs a call.
 INLINE_STYLES = (
     ("reply", "Ответить", "как обычно", ""),
@@ -2523,34 +2530,45 @@ def speaker_name(user: dict) -> str:
     return name[:1].upper() + name[1:]
 
 
-def format_inline(name: str, question: str, body: str) -> str:
-    """Two labelled lines, back to back:
+def format_inline(name: str, question: str, body: str) -> tuple:
+    """Who asked, what they asked, and the answer. Returns (text, parse_mode).
 
-        Дмитрий: ну и что ты на это скажешь
+        Дмитрий
+        > ну и что ты на это скажешь
         AI: Скажу, что вопрос звучит как приглашение на драку.
 
-    Plain text on purpose. Naming who asked is more use in a room than a quote
-    marker, and with no markup nothing has to be escaped, so no stray character
-    can make Telegram refuse the whole message.
+    The name and the label are bold, the question sits in a real Telegram
+    quote block, and the answer is plain so it stays the easiest thing to read.
+    No blank lines - the quote block supplies the separation by itself.
     """
     if not INLINE_SHOW_QUESTION:
-        return body
+        return html.escape(body), "HTML"
 
-    tail = f"{INLINE_AI_PREFIX}{body}"
-    # The two lines share one message. Only Telegram's own 4096-character
+    head = f"<b>{html.escape(name)}</b>"
+    tail = f"<b>{html.escape(INLINE_AI_LABEL)}:</b> {html.escape(body)}"
+    # All three parts share one message. Only Telegram's own 4096-character
     # ceiling can shorten the question, and only by as much as it takes to fit.
-    room = TELEGRAM_MAX_CHARS - len(tail) - len(name) - 4
-    if len(question) > room:
-        question = question[:max(room, 0)].rstrip() + "…"
+    room = TELEGRAM_MAX_CHARS - len(head) - len(tail) - 40
+    q = question
+    while q and len(html.escape(q)) > room:
+        q = q[:int(len(q) * 0.9)]
+    if len(q) < len(question):
+        q = q.rstrip() + "…"
         log.info("  -> question trimmed to fit Telegram's 4096 limit")
-    return f"{name}: {question}\n{tail}"
+    return f"{head}\n<blockquote>{html.escape(q)}</blockquote>\n{tail}", "HTML"
 
 
 def edit_inline(inline_message_id: str, name: str, question: str,
                 body: str) -> bool:
-    """Replace the stub with the finished pair of lines."""
+    """Replace the stub with the finished message."""
+    text, mode = format_inline(name, question, body)
+    if tg("editMessageText", inline_message_id=inline_message_id,
+          text=text, parse_mode=mode) is not None:
+        return True
+    # Some character upset the parser. The answer matters more than the styling.
+    log.warning("  -> formatted edit refused, retrying as plain text")
     return tg("editMessageText", inline_message_id=inline_message_id,
-              text=format_inline(name, question, body)) is not None
+              text=f"{name}\n{question}\n{INLINE_AI_LABEL}: {body}") is not None
 
 
 def handle_inline_query(q: dict) -> None:
@@ -2579,7 +2597,7 @@ def handle_inline_query(q: dict) -> None:
         for k in list(inline_pending)[:250]:
             inline_pending.pop(k, None)
 
-    stub = format_inline(speaker_name(sender), text, INLINE_PLACEHOLDER)
+    stub, stub_mode = format_inline(speaker_name(sender), text, INLINE_PLACEHOLDER)
     results = []
     for style_id, title, blurb, _ in INLINE_STYLES:
         results.append({
@@ -2587,7 +2605,8 @@ def handle_inline_query(q: dict) -> None:
             "id": f"{style_id}:{token}",
             "title": title,
             "description": f"{blurb} — «{text[:60]}»",
-            "input_message_content": {"message_text": stub},
+            "input_message_content": {"message_text": stub,
+                                      "parse_mode": stub_mode},
             # The keyboard earns its place twice: without it Telegram hands
             # back no inline_message_id at all, and tapping it is the reliable
             # way to fill the stub in - the "user chose this" report is only
@@ -2621,17 +2640,21 @@ def handle_chosen_inline_result(chosen: dict) -> None:
 
 def handle_callback_query(cb: dict) -> None:
     """The button on a stub. This is the path that always works."""
-    tg("answerCallbackQuery", callback_query_id=cb.get("id"), text="Секунду.")
     inline_message_id = cb.get("inline_message_id")
     style_id, token = split_token(cb.get("data"))
     pending = inline_pending.pop(token, None)
-    if not inline_message_id:
-        return
+
     if pending is None:
-        # Restarted since, or the other route already filled it in.
-        tg("editMessageText", inline_message_id=inline_message_id,
-           text="Этот запрос уже протух - набери заново.")
+        # Either the sampled chosen_inline_result beat us to it and is already
+        # generating, or this really is an old button from before a restart.
+        # Either way the message itself is left alone: overwriting somebody
+        # else's answer-in-progress with "expired" is exactly the wrong move.
+        busy = inline_message_id in inline_filling
+        note = "Уже отвечаю." if busy else "Запрос протух - набери заново."
+        tg("answerCallbackQuery", callback_query_id=cb.get("id"), text=note)
         return
+
+    tg("answerCallbackQuery", callback_query_id=cb.get("id"), text="Секунду.")
     text, name = pending
     fill_inline_message(inline_message_id, text, name, style_id,
                         (cb.get("from") or {}).get("id"))
@@ -2645,6 +2668,18 @@ def fill_inline_message(inline_message_id: Optional[str], text: str,
         return
     if not inline_message_id or not text:
         return
+
+    # Both routes can fire for the same message. Whoever claims it answers; the
+    # other one leaves quietly instead of paying for a second identical call.
+    with _fill_guard:
+        if inline_message_id in inline_filling:
+            log.debug("  -> %s is already being filled in", inline_message_id)
+            return
+        inline_filling[inline_message_id] = time.time()
+        if len(inline_filling) > 300:
+            for k in sorted(inline_filling, key=inline_filling.get)[:150]:
+                inline_filling.pop(k, None)
+
     if not rate_ok(inline_calls, user_id, INLINE_MAX_PER_MIN):
         log.info("inline: %s is over %d/min", user_id, INLINE_MAX_PER_MIN)
         edit_inline(inline_message_id, name, text, "Слишком часто. Подожди минуту.")
