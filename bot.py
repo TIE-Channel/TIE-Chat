@@ -230,6 +230,15 @@ GROUP_JUDGE_MIN_CHARS = int(os.environ.get("GROUP_JUDGE_MIN_CHARS", "10"))
 # quietly drain the free tier.
 GROUP_JUDGE_MAX_PER_MIN = int(os.environ.get("GROUP_JUDGE_MAX_PER_MIN", "8"))
 
+# The judge starts at the cheap end of the ladder, and that end collects models
+# for two different reasons: being small, and being unrecognisable. A name the
+# quality heuristic cannot place at all scores near zero - that is where an
+# Arabic-only model, an agentic "compound" system and a reasoning model all
+# landed, and each was picked as judge ahead of any ordinary 8B chat model.
+# Anything under this floor is skipped: not because it is stupid, but because
+# the bot does not actually know what it is.
+GROUP_JUDGE_MIN_QUALITY = int(os.environ.get("GROUP_JUDGE_MIN_QUALITY", "40"))
+
 # Seconds of enforced silence after he speaks in a group. 0 = no cooldown at
 # all, which is the right default now that he only answers when the room is
 # actually talking to him or about him - there is nothing to ration.
@@ -1850,14 +1859,16 @@ def judge_order() -> List[Candidate]:
     tried before everything else.
     """
     usable = [c for c in LADDER if c.usable and not c.bad_judge]
-    # The cheap end of the ladder is where models land for two different
-    # reasons: being small, and being unsuitable. A reasoning model scores low
-    # because it is wordy and slow - which puts it first in line for the judge,
-    # the one job it is worst at. Skip them here; they are still fine for
-    # replies. If somehow nothing else is left, a bad judge beats no judge.
-    plain = [c for c in usable
-             if not any(m in c.model.lower() for m in REASONING_MARKERS)]
-    order = sorted(plain or usable, key=lambda c: c.quality)
+    # The cheap end of the ladder collects models for two different reasons:
+    # being small, and being unsuitable. Anything under the quality floor, or
+    # that narrates its reasoning, is skipped here - those score low because
+    # the heuristic cannot place them, not because they are small-but-fine.
+    # They stay on the ladder for replies. If nothing clears the bar, a bad
+    # judge still beats no judge.
+    fit = [c for c in usable
+           if c.quality >= GROUP_JUDGE_MIN_QUALITY
+           and not any(m in c.model.lower() for m in REASONING_MARKERS)]
+    order = sorted(fit or usable, key=lambda c: c.quality)
     if GROUP_JUDGE_MODEL:
         pinned = [c for c in order if c.model == GROUP_JUDGE_MODEL]
         if pinned:
@@ -2400,6 +2411,13 @@ inline_offered = 0
 inline_sent = 0
 inline_seen = False        # has any inline query ever arrived this run?
 
+# token -> the text that was typed. The token is both the result id and the
+# button's callback_data, so the message can be filled in from EITHER event:
+# chosen_inline_result (needs /setinlinefeedback) or a tap on the button
+# (needs nothing). Whichever arrives first pops the token, so it is filled in
+# exactly once.
+inline_pending: Dict[str, str] = {}
+
 
 def allow_inline_for(user_id: int, chat_id: int) -> None:
     """Record that this person shares a group with you.
@@ -2492,6 +2510,12 @@ def handle_inline_query(q: dict) -> None:
 
     global inline_offered
     inline_offered += 1
+    token = hashlib.md5(text.encode("utf-8")).hexdigest()[:32]
+    inline_pending[token] = text
+    if len(inline_pending) > 500:
+        for k in list(inline_pending)[:250]:
+            inline_pending.pop(k, None)
+
     tg(
         "answerInlineQuery",
         inline_query_id=query_id,
@@ -2499,32 +2523,67 @@ def handle_inline_query(q: dict) -> None:
         is_personal=True,
         results=[{
             "type": "article",
-            "id": hashlib.md5(text.encode("utf-8")).hexdigest(),
+            "id": token,
             "title": "Ответить",
             "description": text[:120],
             "input_message_content": {"message_text": INLINE_PLACEHOLDER},
-            # Required: without a keyboard Telegram reports neither the choice
-            # nor the inline_message_id, and the stub could never be filled in.
+            # The keyboard is load-bearing twice over. Without it Telegram
+            # reports neither the choice nor the inline_message_id needed to
+            # edit the stub. And when /setinlinefeedback is off - which cannot
+            # be read back from the API - tapping this button is the only way
+            # left to tell the bot the message exists, so the label says so.
             "reply_markup": {"inline_keyboard": [[
-                {"text": "⏳", "callback_data": "wait"}]]},
+                {"text": "⏳ ответить", "callback_data": token}]]},
         }],
     )
 
 
 def handle_chosen_inline_result(chosen: dict) -> None:
-    """Sent. Now the model runs and the posted stub becomes the reply."""
+    """Telegram reported the send. The happy path, when feedback is on."""
     global inline_sent
     inline_sent += 1
+    inline_pending.pop(chosen.get("result_id") or "", None)
+    fill_inline_message(
+        chosen.get("inline_message_id"),
+        (chosen.get("query") or "").strip(),
+        (chosen.get("from") or {}).get("id"),
+    )
 
-    inline_message_id = chosen.get("inline_message_id")
-    text = (chosen.get("query") or "").strip()
-    user_id = (chosen.get("from") or {}).get("id")
 
+def handle_callback_query(cb: dict) -> None:
+    """Somebody tapped the button on a stub that is still sitting there.
+
+    This is the escape hatch for /setinlinefeedback being off: no report of the
+    send ever arrives, so the message would stay on the placeholder forever.
+    The tap carries the inline_message_id, and callback_data carries the token
+    for the text that was typed - between them that is everything needed.
+    """
+    tg("answerCallbackQuery", callback_query_id=cb.get("id"), text="Секунду.")
+    inline_message_id = cb.get("inline_message_id")
+    token = cb.get("data") or ""
+    text = inline_pending.pop(token, None)
+    if not inline_message_id:
+        return
+    if text is None:
+        # Restarted since, or already filled in by the other route.
+        tg("editMessageText", inline_message_id=inline_message_id,
+           text="Этот запрос уже протух - набери заново.")
+        return
+    log.info("inline filled in from a button tap - /setinlinefeedback is "
+             "probably off, which is why nothing happened by itself")
+    fill_inline_message(inline_message_id, text, (cb.get("from") or {}).get("id"))
+
+
+def fill_inline_message(inline_message_id: Optional[str], text: str,
+                        user_id: Optional[int]) -> None:
+    """Run the model and turn the posted placeholder into the reply."""
     if not may_use_inline(user_id) or user_id in IGNORE_USER_IDS:
         return
     if not inline_message_id:
-        log.warning("chosen inline result without inline_message_id - the result "
-                    "was built without a keyboard, so it cannot be filled in")
+        log.warning("no inline_message_id - the result was built without a "
+                    "keyboard, so it cannot be filled in")
+        return
+    if not text:
         return
     if not rate_ok(inline_calls, user_id, INLINE_MAX_PER_MIN):
         log.info("inline: %s is over %d/min", user_id, INLINE_MAX_PER_MIN)
@@ -2554,10 +2613,10 @@ def handle_chosen_inline_result(chosen: dict) -> None:
     log.info("  -> inline answer in %.1fs: %r", time.time() - started, answer[:60])
 
 
-def dispatch_inline_choice(chosen: dict) -> None:
+def dispatch_inline(handler, payload: dict) -> None:
     def run() -> None:
         try:
-            handle_chosen_inline_result(chosen)
+            handler(payload)
         except Exception:
             log.exception("error answering an inline query")
 
@@ -2580,10 +2639,14 @@ def warn_if_inline_feedback_off() -> None:
         return
     _inline_feedback_warned = True
     log.warning(
-        "offered %d inline replies and Telegram never said one was sent. If the "
-        "message in the chat is stuck on '%s', inline feedback is off: "
-        "@BotFather -> /setinlinefeedback -> @%s -> Enabled.",
-        inline_offered, INLINE_PLACEHOLDER, BOT_USERNAME,
+        "offered %d inline replies and Telegram never reported one being sent. "
+        "Two different things look identical from here, so check the chat you "
+        "typed in. A '%s' is sitting there: you did tap, but inline feedback "
+        "is OFF and nothing came back to fill it in - fix with @BotFather -> "
+        "/setinlinefeedback -> @%s -> Enabled. Nothing was posted at all: the "
+        "result was never tapped - typing '@%s ...' and pressing Send posts "
+        "plain text, you have to tap the line in the panel above the keyboard.",
+        inline_offered, INLINE_PLACEHOLDER, BOT_USERNAME, BOT_USERNAME,
     )
 
 
@@ -2594,13 +2657,11 @@ def handle_update(update: dict) -> None:
         return
     if "chosen_inline_result" in update:
         if INLINE_ENABLED:
-            dispatch_inline_choice(update["chosen_inline_result"])
+            dispatch_inline(handle_chosen_inline_result, update["chosen_inline_result"])
         return
     if "callback_query" in update:
-        # The hourglass on a stub that is still being filled in. Acknowledge it
-        # so the sender's client stops spinning.
-        tg("answerCallbackQuery", callback_query_id=update["callback_query"].get("id"),
-           text="Секунду.")
+        if INLINE_ENABLED:
+            dispatch_inline(handle_callback_query, update["callback_query"])
         return
     if "business_connection" in update:
         remember_connection(update["business_connection"])

@@ -425,9 +425,22 @@ runs once, at the moment you send.
 | `/setinlinefeedback` | pick your bot, then **Enabled** |
 
 The second one is the one everybody misses. Without it Telegram never reports
-that the message was sent, so the `…` is posted and simply stays there — no
-error in the log, no error on your phone, nothing. The bot watches for exactly
-that pattern:
+that the message was sent, so the `…` would be posted and simply stay there —
+no error in the log, no error on your phone, nothing.
+
+**There is a way out without it.** The stub carries a `⏳ ответить` button, and
+tapping that button hands the bot the message id and the query directly — no
+feedback needed. So a bot with the toggle off still works; it just takes one
+extra tap per message, and the log says why:
+
+```
+inline filled in from a button tap - /setinlinefeedback is probably off,
+which is why nothing happened by itself
+```
+
+Turn the toggle on and the button never gets seen: the message is filled in
+within a second and the keyboard is removed with it. The bot also watches for
+the pattern that means it is off:
 
 ```
 offered 9 inline replies and Telegram never said one was sent. If the message
