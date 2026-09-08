@@ -774,7 +774,42 @@ his city.
 
 ### Formatted answers, here only
 
-**Telegram takes a subset of HTML, not Markdown.** Bold, italic, underline,
+**Telegram renders Markdown natively now.** Bot API 10.1 (11 June 2026) added
+**Rich Messages**: `sendRichMessage` takes a field literally called `markdown`
+and Telegram parses it itself — headings, **real tables** with `|:---|---:|`
+column alignment, task lists, footnotes, LaTeX, nested formatting. Nothing is
+converted on our side and nothing is imitated in monospace. The ceiling also
+goes from 4096 characters to **32768**, so a long answer arrives as one message
+instead of four.
+
+That is what the bot uses in your chat (`RICH_MESSAGES`, on):
+
+```markdown
+## Смета
+
+| позиция | цена  |
+|:--------|------:|
+| торт    | 5000  |
+| капкейки| 1200  |
+
+- [x] согласовано
+- [ ] оплачено
+
+$E = mc^2$
+```
+
+goes to Telegram exactly like that, and comes out as a real table with a real
+checklist.
+
+**Three tiers, and an answer is never lost.** If `sendRichMessage` is refused
+the bot falls back to the older path below; if Telegram then refuses the markup
+too, the same text goes as plain. A refusal that will still be true next time —
+"method not found", "not available" — is remembered, so the extra round trip is
+not spent on every answer afterwards; a one-off refusal is not.
+
+#### The fallback: HTML
+
+**Telegram's plain `sendMessage` takes a subset of HTML, not Markdown.** Bold, italic, underline,
 strike, spoiler, links, inline code, code blocks with a language, and
 blockquotes. There are **no headings, no tables and no nested lists**, and
 Markdown as a model writes it — `## Heading`, `| a | b |` — is not Telegram
@@ -791,8 +826,43 @@ So the model writes ordinary Markdown and the bot converts it
 | `## Heading` | bold — Telegram has no headings |
 | `- item` | a real • bullet |
 | `> quoted` | one quote block, not three |
-| a Markdown table | an aligned monospace block, which is the only way columns stay under each other |
+| a Markdown table | see below — Telegram has no tables |
 | `[text](url)` | a link |
+
+#### Tables in the fallback
+
+The fallback has no tables to work with, so there are two shapes and the bot
+picks by width. (With Rich Messages on, none of this applies — Telegram draws
+the actual table.)
+
+**Narrow enough for a phone** (`TABLE_MAX_WIDTH`, 34 characters) — aligned
+monospace columns. The cells are **padded**, which is the whole trick: dumping
+the raw `| a | b |` lines into a code block lines up nothing at all.
+
+```
+товар     цена
+────────  ────
+торт      5000
+капкейки  1200
+макаронс  900
+```
+
+**Wider than that** — one small block per row, because a monospace block does
+not wrap: past the width of the screen Telegram makes it scroll sideways, and a
+table you have to drag to read is worse than no table.
+
+```
+торт свадебный трёхъярусный
+  цена: 15000
+  срок: 5 дней
+  комментарий: нужен аванс
+```
+
+Nothing is lost in either shape — every cell keeps its own heading. Width is
+measured as it *looks*, not as it is stored: an escaped `&lt;` counts as one
+column, not four, and wide CJK glyphs count as two, so the rows still line up.
+
+This only matters when rich messages are unavailable.
 
 Two things make it safe rather than clever. **Code is lifted out first and put
 back last**, so nothing inside a snippet is ever treated as markup — the usual

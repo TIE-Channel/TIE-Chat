@@ -22,6 +22,7 @@ import signal
 import sys
 import threading
 import time
+import unicodedata
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -264,6 +265,34 @@ PROFILE_HOURS = int(os.environ.get("PROFILE_HOURS", "24"))
 DM_CHAT_FORMAT = os.environ.get("DM_CHAT_FORMAT", "true").strip().lower() not in (
     "0", "false", "no",
 )
+
+# Use sendRichMessage (Bot API 10.1, June 2026) instead of sendMessage.
+#
+# This is the real answer to "does Telegram do tables". A rich message takes
+# ordinary Markdown - the field is literally called `markdown` - and renders
+# headings, REAL tables with column alignment, task lists, footnotes, nested
+# formatting and LaTeX natively. No conversion, no monospace imitation.
+#
+# It also lifts the ceiling from 4096 characters to 32768, so an answer that
+# used to arrive as four messages arrives as one.
+#
+# Off, or refused by Telegram, and the bot falls back to the old path:
+# Markdown converted to the HTML subset by hand. Nothing is ever lost.
+RICH_MESSAGES = os.environ.get("RICH_MESSAGES", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# Telegram's own ceiling for one rich message.
+RICH_MAX_CHARS = 32768
+
+# How wide a table may be, in characters, before it is turned into a list
+# instead of aligned columns.
+#
+# A monospace block does not wrap: past the width of the screen Telegram makes
+# it scroll sideways, and a table you have to drag to read is worse than no
+# table. On a phone about 34 characters fit. Anything wider is rendered as one
+# small block per row - which is how a phone wants to show a wide table anyway.
+TABLE_MAX_WIDTH = int(os.environ.get("TABLE_MAX_WIDTH", "34"))
 
 # Optional: comma-separated Telegram user IDs that are never auto-answered.
 IGNORE_USER_IDS = {
@@ -1416,14 +1445,77 @@ TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
 # the answer and nothing else - it says nothing about how to behave, so "raw"
 # is still raw.
 FORMAT_NOTE = (
-    "Your answer is rendered in a Telegram chat. Write ordinary Markdown and "
-    "it will be converted: **bold**, *italic*, ~~strike~~, `code`, ```fenced "
-    "blocks with a language```, - bullets, 1. numbered lists, > quotes, "
-    "[text](url), and tables, which come out as an aligned monospace block. "
-    "Headings become bold - so keep them short and use them sparingly. Use "
-    "formatting where it makes the answer easier to read and not otherwise; a "
-    "one-line answer is still one line."
+    "Your answer is rendered in a Telegram chat, which renders Markdown "
+    "natively. You may use: # headings, **bold**, *italic*, ~~strike~~, "
+    "==marked==, ||spoiler||, `code`, ```fenced blocks with a language```, "
+    "- bullets, 1. numbered lists, - [ ] task lists, > quotes, --- rules, "
+    "[text](url), $inline math$ and $$display math$$, footnotes[^1], and "
+    "REAL tables with |:---|---:| column alignment. Nesting works. "
+    "Use formatting where it makes the answer easier to read and not "
+    "otherwise; a one-line answer is still one line, with no heading over it."
 )
+
+
+def cell_width(cell: str) -> int:
+    """How wide this cell looks, not how many bytes it is.
+
+    The text is already HTML-escaped by the time a table is assembled, so it
+    is unescaped for measuring - otherwise "&lt;" counts as four columns and
+    every row below it is misaligned. Wide CJK glyphs and most emoji take two.
+    """
+    plain = html.unescape(cell)
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in plain)
+
+
+def pad(cell: str, width: int) -> str:
+    return cell + " " * max(0, width - cell_width(cell))
+
+
+def render_table(rows: List[List[str]]) -> List[str]:
+    """A markdown table, in the two shapes Telegram can actually show.
+
+    Telegram has no tables. Monospace is the only thing that puts columns under
+    each other - but only if the cells are padded, which is the whole job here;
+    dumping the raw "| a | b |" lines into <pre> lines up nothing.
+
+    A block that does not fit the screen scrolls sideways instead of wrapping,
+    so past TABLE_MAX_WIDTH the table becomes one small labelled block per row.
+    That is the shape a phone wants for a wide table, and nothing is lost:
+    every cell keeps its own heading.
+    """
+    if not rows:
+        return []
+    columns = max(len(r) for r in rows)
+    rows = [r + [""] * (columns - len(r)) for r in rows]
+    widths = [max(cell_width(r[i]) for r in rows) for i in range(columns)]
+
+    # Two spaces between columns: one is too tight to read, three wastes the
+    # width that decides whether this fits on a phone at all.
+    if sum(widths) + 2 * (columns - 1) <= TABLE_MAX_WIDTH or columns < 2:
+        head, body = rows[0], rows[1:]
+        lines = ["  ".join(pad(c, w) for c, w in zip(head, widths)).rstrip()]
+        if body:
+            lines.append("  ".join("─" * w for w in widths))
+            lines += ["  ".join(pad(c, w) for c, w in zip(r, widths)).rstrip()
+                      for r in body]
+        return ["<pre>" + "\n".join(lines) + "</pre>"]
+
+    # Too wide. One block per row: the first cell names the row, the rest are
+    # "heading: value" underneath it.
+    head, body = rows[0], rows[1:]
+    if not body:
+        return ["<pre>" + "  ".join(head).rstrip() + "</pre>"]
+    out: List[str] = []
+    for r in body:
+        out.append(f"<b>{r[0]}</b>")
+        for name, value in zip(head[1:], r[1:]):
+            if value.strip():
+                out.append(f"  {name}: {value}" if name.strip() else f"  {value}")
+        out.append("")
+    if out and not out[-1]:
+        out.pop()
+    return out
 
 
 def md_to_html(text: str) -> str:
@@ -1462,16 +1554,15 @@ def md_to_html(text: str) -> str:
             quoting.clear()
 
     def close_table() -> None:
-        # A table has no equivalent in Telegram. Monospace is the only thing
-        # that keeps the columns under each other, so that is what it becomes -
-        # but only for a REAL table. A markdown table always carries the
-        # |---|---| separator row; without one these are just lines that happen
-        # to contain a pipe, and they go back untouched.
+        # Only a REAL table is rendered as one. A markdown table always carries
+        # the |---|---| separator row; without it these are just lines that
+        # happen to contain a pipe, and they go back untouched.
         if not table:
             return
         if any(TABLE_SEP_RE.match(r) for r in table):
-            rows = [r for r in table if not TABLE_SEP_RE.match(r)]
-            out.append("<pre>" + "\n".join(rows) + "</pre>")
+            cells = [[c.strip() for c in r.strip().strip("|").split("|")]
+                     for r in table if not TABLE_SEP_RE.match(r)]
+            out.extend(render_table(cells))
         else:
             out.extend(table)
         table.clear()
@@ -1589,6 +1680,56 @@ def thread_of(msg: dict) -> Optional[int]:
     return msg.get("message_thread_id") or None
 
 
+# Set once Telegram tells us rich messages are not on offer here, so the extra
+# round trip is not spent on every single answer afterwards.
+rich_unavailable = False
+
+
+def send_rich(connection_id: Optional[str], chat_id: int, text: str,
+              reply_to: Optional[int], thread_id: Optional[int]) -> bool:
+    """Send the answer as a rich message. True if Telegram took it.
+
+    The whole conversion problem disappears here: the model writes Markdown
+    and the Markdown IS the payload. Telegram parses headings, tables, lists
+    and formulas itself.
+
+    Only attempted for a message that fits in one rich message, which is
+    everything the model can produce - the cap is 32768 characters against a
+    4096-token answer. That keeps the failure case simple: either Telegram
+    takes the whole answer or nothing was sent and the caller falls back.
+    """
+    global rich_unavailable
+    if not RICH_MESSAGES or rich_unavailable or len(text) > RICH_MAX_CHARS:
+        return False
+
+    params: Dict[str, Any] = {"chat_id": chat_id, "rich_message": {"markdown": text}}
+    if connection_id:
+        params["business_connection_id"] = connection_id
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    if reply_to:
+        params["reply_parameters"] = {"message_id": reply_to,
+                                      "allow_sending_without_reply": True}
+
+    data = tg_raw("sendRichMessage", **params)
+    if data.get("ok"):
+        return True
+
+    why = str(data.get("description") or "").lower()
+    # "no such method" or "not allowed here" will be just as true next time;
+    # a 429 or a network blip will not. Only the first kind is worth latching.
+    if any(w in why for w in ("not found", "unsupported", "not supported",
+                              "unknown method", "can't send rich",
+                              "not available")):
+        rich_unavailable = True
+        log.warning("rich messages are not available here (%s) - using the "
+                    "HTML fallback from now on", why[:90])
+    else:
+        log.warning("  -> sendRichMessage refused (%s), falling back to HTML",
+                    why[:90])
+    return False
+
+
 def send_reply(
     connection_id: Optional[str],
     chat_id: int,
@@ -1601,6 +1742,10 @@ def send_reply(
     # Telegram hard-limits messages to 4096 characters. With formatting on, the
     # cut is made on the Markdown and each piece converted separately, so a
     # chunk boundary can never land inside a tag.
+    # Best first: Telegram renders the Markdown itself, tables and all.
+    if markdown and send_rich(connection_id, chat_id, text, reply_to, thread_id):
+        return
+
     if markdown:
         pieces = split_markdown(text, 3500)
     else:
