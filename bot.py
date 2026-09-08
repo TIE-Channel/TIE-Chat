@@ -117,15 +117,18 @@ INLINE_ENABLED = os.environ.get("INLINE_ENABLED", "true").strip().lower() not in
 #   all    - anybody who knows the username. Burns your quota on strangers.
 INLINE_ACCESS = os.environ.get("INLINE_ACCESS", "shared").strip().lower()
 
-# Telegram re-queries on EVERY keystroke. Wait this long before spending a
-# request: if another key was pressed meanwhile the older query is abandoned,
-# so a burst of twenty keystrokes costs one model call instead of twenty.
-INLINE_DEBOUNCE = float(os.environ.get("INLINE_DEBOUNCE", "1.2"))
+# What sits in the chat for the second or two between sending and the answer.
+INLINE_PLACEHOLDER = os.environ.get("INLINE_PLACEHOLDER", "…")
 
-# Keep each answer this long, keyed by the exact text. Re-opening the same
-# query is then free, and so is a retry after a generation that overran
-# Telegram's ~10-second answer window.
-INLINE_CACHE_SECONDS = float(os.environ.get("INLINE_CACHE_SECONDS", "300"))
+# Keep the line you asked about above the answer, labelled with who asked. An
+# inline message cannot quote anything - Telegram gives it no reply parameters -
+# so without this the question disappears the moment the placeholder is
+# replaced, and the answer reads like a non sequitur to everyone else.
+INLINE_SHOW_QUESTION = os.environ.get(
+    "INLINE_SHOW_QUESTION", "true").strip().lower() not in ("0", "false", "no")
+
+# What the bot's own line is labelled with.
+INLINE_AI_PREFIX = os.environ.get("INLINE_AI_PREFIX", "AI: ")
 
 # Per-person ceiling, so an open inline bot cannot be drained in a minute.
 INLINE_MAX_PER_MIN = int(os.environ.get("INLINE_MAX_PER_MIN", "6"))
@@ -2349,8 +2352,8 @@ def status_report() -> str:
             if not k.startswith("_")) or "none yet"),
         "inline: " + (
             "off (INLINE_ENABLED=false)" if not INLINE_ENABLED else
-            f"{INLINE_ACCESS}, {inline_offered} answered / {inline_spent} "
-            f"generated ({inline_sent} sends sampled by Telegram)"
+            f"{INLINE_ACCESS}, {inline_offered} menus / {inline_spent} "
+            f"generated ({inline_sent} sends reported by Telegram)"
             + (f", groups known: {len(known_groups)}"
                if INLINE_ACCESS == "shared" else "")
         ),
@@ -2423,11 +2426,25 @@ inline_spent = 0       # model calls actually made
 inline_sent = 0        # sends Telegram happened to report - a sample, not a total
 inline_seen = False        # has any inline query ever arrived this run?
 
-# Answers waiting to be tapped: exact query text -> (answer, when).
-inline_cache: Dict[str, Tuple[str, float]] = {}
+# token -> (what was typed, who typed it). The token travels in the result id
+# AND in the button's callback_data, so the stub can be filled in from either
+# event: chosen_inline_result (which Telegram only samples) or a tap on the
+# button (which always arrives). Whichever comes first pops it, so it fills in
+# once. The name is stored rather than read off the tap, because anyone in the
+# chat can press the button - the line belongs to whoever asked.
+inline_pending: Dict[str, Tuple[str, str]] = {}
 
-# Newest query serial per person, so an older one knows it was superseded.
-inline_seq: Dict[int, int] = {}
+# The menu you get after typing his name. Only the one you pick costs a call.
+INLINE_STYLES = (
+    ("reply", "Ответить", "как обычно", ""),
+    ("short", "Коротко", "одна фраза, не длиннее", "\nKeep it to a single "
+     "short sentence. Fewer words than you think you need."),
+    ("sharp", "Жёстко", "тот же ответ, но с зубами", "\nSharpen it. Be blunt "
+     "and funny at the other person's expense, swear if the line you were "
+     "given swore first, and never soften the ending. The limits above still "
+     "hold: nothing about ethnicity, nationality, religion, gender, "
+     "sexuality, disability, illness or family, and no threats."),
+)
 
 
 
@@ -2497,30 +2514,48 @@ def answer_nothing(query_id: str, note: str, seconds: int = 0) -> None:
        button={"text": note, "start_parameter": "inline"})
 
 
-def cached_answer(text: str) -> Optional[str]:
-    hit = inline_cache.get(text)
-    if not hit:
-        return None
-    if time.time() - hit[1] > INLINE_CACHE_SECONDS:
-        inline_cache.pop(text, None)
-        return None
-    return hit[0]
+def speaker_name(user: dict) -> str:
+    """Their name with the first letter capitalised - and nothing else touched.
+
+    Not .capitalize(), which lowercases the rest and would turn MAX into Max.
+    """
+    name = display_name(user or {})
+    return name[:1].upper() + name[1:]
+
+
+def format_inline(name: str, question: str, body: str) -> str:
+    """Two labelled lines, back to back:
+
+        Дмитрий: ну и что ты на это скажешь
+        AI: Скажу, что вопрос звучит как приглашение на драку.
+
+    Plain text on purpose. Naming who asked is more use in a room than a quote
+    marker, and with no markup nothing has to be escaped, so no stray character
+    can make Telegram refuse the whole message.
+    """
+    if not INLINE_SHOW_QUESTION:
+        return body
+
+    tail = f"{INLINE_AI_PREFIX}{body}"
+    # The two lines share one message. Only Telegram's own 4096-character
+    # ceiling can shorten the question, and only by as much as it takes to fit.
+    room = TELEGRAM_MAX_CHARS - len(tail) - len(name) - 4
+    if len(question) > room:
+        question = question[:max(room, 0)].rstrip() + "…"
+        log.info("  -> question trimmed to fit Telegram's 4096 limit")
+    return f"{name}: {question}\n{tail}"
+
+
+def edit_inline(inline_message_id: str, name: str, question: str,
+                body: str) -> bool:
+    """Replace the stub with the finished pair of lines."""
+    return tg("editMessageText", inline_message_id=inline_message_id,
+              text=format_inline(name, question, body)) is not None
 
 
 def handle_inline_query(q: dict) -> None:
-    """Have the answer ready BEFORE it is tapped.
-
-    The obvious design is to post a placeholder and fill it in when Telegram
-    reports the send. It does not work: that report - chosen_inline_result -
-    is sampled, not guaranteed. Telegram's own documentation offers to deliver
-    "1/10, 1/100 or 1/1000 of the results", so the same tap fills the message
-    in one minute and leaves an ellipsis sitting in someone's chat the next.
-
-    So nothing is posted until the text is final. Typing still costs nothing:
-    a debounce collapses a burst of keystrokes into one query, and a cache on
-    the exact text makes a repeat free.
-    """
-    global inline_seen
+    """Instant and free: a menu of three. Nothing is generated until you pick."""
+    global inline_seen, inline_offered
     query_id = q.get("id")
     sender = q.get("from") or {}
     user_id = sender.get("id")
@@ -2538,93 +2573,116 @@ def handle_inline_query(q: dict) -> None:
     if not may_use_inline(user_id) or user_id in IGNORE_USER_IDS:
         return answer_nothing(query_id, "This bot is private.", 300)
 
-    ready = cached_answer(text)
-    if ready:
-        return serve_inline(query_id, text, ready)
+    token = hashlib.md5(text.encode("utf-8")).hexdigest()[:32]
+    inline_pending[token] = (text, speaker_name(sender))
+    if len(inline_pending) > 500:
+        for k in list(inline_pending)[:250]:
+            inline_pending.pop(k, None)
 
-    seq = inline_seq[user_id] = inline_seq.get(user_id, 0) + 1
+    stub = format_inline(speaker_name(sender), text, INLINE_PLACEHOLDER)
+    results = []
+    for style_id, title, blurb, _ in INLINE_STYLES:
+        results.append({
+            "type": "article",
+            "id": f"{style_id}:{token}",
+            "title": title,
+            "description": f"{blurb} — «{text[:60]}»",
+            "input_message_content": {"message_text": stub},
+            # The keyboard earns its place twice: without it Telegram hands
+            # back no inline_message_id at all, and tapping it is the reliable
+            # way to fill the stub in - the "user chose this" report is only
+            # sampled by Telegram, so it cannot be waited on.
+            "reply_markup": {"inline_keyboard": [[
+                {"text": "⏳ ответить", "callback_data": f"{style_id}:{token}"}]]},
+        })
+
+    inline_offered += 1
+    tg("answerInlineQuery", inline_query_id=query_id, results=results,
+       cache_time=0, is_personal=True)
+
+
+def split_token(raw: str) -> tuple:
+    """"sharp:ab12..." -> ("sharp", "ab12...")"""
+    style_id, _, token = (raw or "").partition(":")
+    return style_id, token
+
+
+def handle_chosen_inline_result(chosen: dict) -> None:
+    """Telegram reported the send. Nice when it happens - it only samples it."""
+    global inline_sent
+    inline_sent += 1
+    style_id, token = split_token(chosen.get("result_id"))
+    sender = chosen.get("from") or {}
+    text, name = inline_pending.pop(
+        token, ((chosen.get("query") or "").strip(), speaker_name(sender)))
+    fill_inline_message(chosen.get("inline_message_id"), text, name, style_id,
+                        sender.get("id"))
+
+
+def handle_callback_query(cb: dict) -> None:
+    """The button on a stub. This is the path that always works."""
+    tg("answerCallbackQuery", callback_query_id=cb.get("id"), text="Секунду.")
+    inline_message_id = cb.get("inline_message_id")
+    style_id, token = split_token(cb.get("data"))
+    pending = inline_pending.pop(token, None)
+    if not inline_message_id:
+        return
+    if pending is None:
+        # Restarted since, or the other route already filled it in.
+        tg("editMessageText", inline_message_id=inline_message_id,
+           text="Этот запрос уже протух - набери заново.")
+        return
+    text, name = pending
+    fill_inline_message(inline_message_id, text, name, style_id,
+                        (cb.get("from") or {}).get("id"))
+
+
+def fill_inline_message(inline_message_id: Optional[str], text: str,
+                        name: str, style_id: str,
+                        user_id: Optional[int]) -> None:
+    """Run the model and turn the posted placeholder into the reply."""
+    if not may_use_inline(user_id) or user_id in IGNORE_USER_IDS:
+        return
+    if not inline_message_id or not text:
+        return
+    if not rate_ok(inline_calls, user_id, INLINE_MAX_PER_MIN):
+        log.info("inline: %s is over %d/min", user_id, INLINE_MAX_PER_MIN)
+        edit_inline(inline_message_id, name, text, "Слишком часто. Подожди минуту.")
+        return
+
+    extra = next((e for sid, _, _, e in INLINE_STYLES if sid == style_id), "")
+    log.info("inline %s from %s: %r", style_id or "reply", user_id, text[:60])
     started = time.time()
+    global inline_spent
+    inline_spent += 1
+    # Same rules as a room he actually sits in - minus the parts that assume he
+    # can see it. One message, so 4096 is a real ceiling, and the quote above
+    # the answer eats into it.
+    # The quote and the answer share one message. Leave the answer a floor:
+    # without it a very long question drives this negative, and a non-positive
+    # limit means "do not trim at all" - the opposite of what is wanted.
+    answer = ask_ai(INLINE_KEY, text[:MAX_INPUT_CHARS], INLINE_NOTE + extra,
+                    fast=True, room=True,
+                    max_chars=max(600, TELEGRAM_MAX_CHARS - len(text) - 200))
 
+    if not answer:
+        log.warning("  -> nothing came back")
+        edit_inline(inline_message_id, name, text, "Не сейчас.")
+        return
+    if not edit_inline(inline_message_id, name, text, answer):
+        log.warning("  -> could not fill in the message")
+        return
+    log.info("  -> inline answer in %.1fs: %r", time.time() - started, answer[:60])
+
+
+def dispatch_inline(handler, payload: dict) -> None:
     def run() -> None:
         try:
-            generate_inline(query_id, user_id, seq, text, started)
+            handler(payload)
         except Exception:
             log.exception("error answering an inline query")
 
     run_off_poll_loop(run)
-
-
-def generate_inline(query_id: str, user_id: int, seq: int, text: str,
-                    started: float) -> None:
-    if INLINE_DEBOUNCE > 0:
-        time.sleep(INLINE_DEBOUNCE)
-        if inline_seq.get(user_id) != seq:
-            # Still typing. Only the query after the last keystroke is worth
-            # paying for; this one is abandoned before it costs anything.
-            return
-
-    ready = cached_answer(text)
-    if ready:
-        return serve_inline(query_id, text, ready)
-
-    if not rate_ok(inline_calls, user_id, INLINE_MAX_PER_MIN):
-        log.info("inline: %s is over %d/min", user_id, INLINE_MAX_PER_MIN)
-        return answer_nothing(query_id, "Слишком часто. Подожди минуту.", 30)
-
-    global inline_spent
-    inline_spent += 1
-    log.info("inline from %s: %r", user_id, text[:60])
-    # Same rules as a room he actually sits in - minus the parts that assume he
-    # can see it. An inline result is one message, so 4096 is a real ceiling.
-    answer = ask_ai(INLINE_KEY, text[:MAX_INPUT_CHARS], INLINE_NOTE, fast=True,
-                    room=True, max_chars=TELEGRAM_MAX_CHARS - 96)
-    if not answer:
-        log.warning("  -> nothing came back")
-        return answer_nothing(query_id, "Модели молчат. Попробуй ещё раз.", 5)
-
-    # Cache before serving: if generation overran Telegram's ~10s window the
-    # answer is useless right now but instant on the next keystroke.
-    inline_cache[text] = (answer, time.time())
-    if len(inline_cache) > 200:
-        for k in sorted(inline_cache, key=lambda k: inline_cache[k][1])[:100]:
-            inline_cache.pop(k, None)
-
-    log.info("  -> inline answer ready in %.1fs: %r",
-             time.time() - started, answer[:60])
-    serve_inline(query_id, text, answer)
-
-
-def serve_inline(query_id: str, text: str, answer: str) -> None:
-    """One result, already final. Tapping it posts exactly this."""
-    global inline_offered
-    inline_offered += 1
-    first = answer.split("\n", 1)[0]
-    ok = tg(
-        "answerInlineQuery",
-        inline_query_id=query_id,
-        cache_time=0,
-        is_personal=True,
-        results=[{
-            "type": "article",
-            "id": hashlib.md5(text.encode("utf-8")).hexdigest(),
-            "title": first[:70] + ("…" if len(first) > 70 else ""),
-            "description": answer[len(first):].strip()[:120] or "отправить",
-            # No keyboard and no placeholder: there is nothing left to edit
-            # afterwards, so nothing depends on Telegram reporting the send.
-            "input_message_content": {"message_text": answer},
-        }],
-    )
-    if ok is None:
-        log.info("  -> Telegram would not take it (query expired); the answer "
-                 "is cached, so the next keystroke serves it instantly")
-
-
-def handle_chosen_inline_result(chosen: dict) -> None:
-    """Nothing depends on this - Telegram only samples it. Purely a log line."""
-    global inline_sent
-    inline_sent += 1
-    log.debug("inline result sent by %s: %r", (chosen.get("from") or {}).get("id"),
-              (chosen.get("query") or "")[:60])
 
 
 # What Telegram has actually delivered this run, by kind. The single most
@@ -2654,7 +2712,12 @@ def handle_update(update: dict) -> None:
             handle_inline_query(update["inline_query"])
         return
     if "chosen_inline_result" in update:
-        handle_chosen_inline_result(update["chosen_inline_result"])
+        if INLINE_ENABLED:
+            dispatch_inline(handle_chosen_inline_result, update["chosen_inline_result"])
+        return
+    if "callback_query" in update:
+        if INLINE_ENABLED:
+            dispatch_inline(handle_callback_query, update["callback_query"])
         return
     if "business_connection" in update:
         remember_connection(update["business_connection"])
@@ -2842,11 +2905,12 @@ ALLOWED_UPDATES = [
     "business_message",
     "edited_business_message",
     "deleted_business_messages",
-    # Inline mode. Only inline_query matters: the answer is final before it is
-    # tapped, so nothing waits on Telegram reporting the send - which it only
-    # samples anyway. chosen_inline_result is kept for the log, nothing more.
+    # Inline mode. chosen_inline_result fills the stub in when Telegram happens
+    # to report the send - it only samples those - and callback_query does it
+    # when you tap the button, which always arrives.
     "inline_query",
     "chosen_inline_result",
+    "callback_query",
 ]
 
 

@@ -417,36 +417,55 @@ The message goes out **as your own** (with a small "via @yourbot" label), shows
 `…` for a second, and fills in with the reply. Typing costs nothing — the model
 runs once, at the moment you send.
 
+### How it looks
+
+Type his name and the line you want answered. A menu of three appears above the
+input box:
+
+| | |
+|---|---|
+| **Ответить** | as he normally would |
+| **Коротко** | one sentence, no more |
+| **Жёстко** | the same answer with teeth |
+
+Tap one and it is posted **as your own message** ("via @yourbot"), showing the
+question you asked and a `⏳ ответить` button. Tap that button and it fills in
+with the reply. Typing costs nothing — the model runs once, on the tap.
+
+### The question travels with the answer
+
+An inline message cannot quote anything: Telegram gives it no reply
+parameters. So without help, the moment the placeholder is replaced the line he
+was answering is gone from the chat and the reply reads like a non sequitur to
+everyone else. The question is therefore carried inside the message, labelled
+with who asked:
+
+```
+Дмитрий: ну и что ты на это скажешь
+AI: Скажу, что вопрос звучит как приглашение на драку.
+```
+
+Two lines, no blank line between them, plain text — no markup means nothing has
+to be escaped and no stray character can make Telegram refuse the message. The
+name is taken from whoever *asked*, not whoever taps the button (anyone in the
+chat can press it), with the first letter capitalised and the rest untouched,
+so `МАКС` stays `МАКС`.
+
+The question goes in **whole**. The only thing that can shorten it is Telegram's
+own 4096-character ceiling on the entire message, and even then only by as much
+as it takes to fit — the answer is what has to survive, so it keeps a floor of
+600 characters and the question yields. `INLINE_SHOW_QUESTION=false` drops the
+first line entirely; `INLINE_AI_PREFIX` changes the `AI: ` label.
+
 ### One setting in @BotFather
 
 `/setinline` → pick your bot → send a placeholder line, e.g. `что ответить...`
 
-That is all. **`/setinlinefeedback` is deliberately not relied on**, and this is
-the important part: Telegram only *samples* the "user chose this result"
-update. Its own documentation offers to deliver "1/10, 1/100 or 1/1000 of the
-results". So any design that posts a placeholder and waits for that report
-works one minute and leaves an ellipsis sitting in someone else's chat the
-next — which is exactly what happened here, twice, with the toggle switched on.
-
-The bot therefore never waits for it. The answer is finished *before* the
-result is tapped, so tapping posts the real text and nothing has to be edited
-afterwards.
-
-### One model call per settled query, not per keystroke
-
-Telegram re-queries the bot on **every keystroke**, and now the answer has to
-be ready up front. Two things keep that honest:
-
-- **Debounce** (`INLINE_DEBOUNCE`, 1.2 s). A query waits; if another keystroke
-  lands meanwhile it is abandoned before it costs anything. Typing a
-  twenty-character line costs one call.
-- **Cache** (`INLINE_CACHE_SECONDS`, 5 min) on the exact text. Reopening the
-  same query is free — and if generation overran Telegram's ~10-second answer
-  window, the answer is already cached, so the next keystroke serves it
-  instantly instead of paying again.
-
-The trade is a second of delay before the result appears in the panel, and an
-occasional wasted generation when you type something and never send it.
+**`/setinlinefeedback` can be on or off — nothing depends on it.** Telegram only
+*samples* the "user chose this result" update; its own documentation offers to
+report "1/10, 1/100 or 1/1000 of the results". So when that report does arrive
+the message fills itself in with no tap needed, and when it does not — which is
+most of the time — the button does it. That is why the button is there.
 
 ### Who may use it
 
