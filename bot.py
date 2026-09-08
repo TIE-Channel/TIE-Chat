@@ -39,8 +39,28 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 # Model to use. Overridable; if it 404s we auto-pick a working flash model.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
-# How many previous messages (user + bot) to keep per chat.
+# How many previous messages (user + bot) to keep per chat, word for word.
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "20"))
+
+# What happens to the messages that fall off the end of that window.
+#
+# Without this they were simply forgotten: a chat that ran past 20 turns lost
+# the beginning, along with the name, the price and the decision agreed there.
+# With it, a batch of the oldest turns is folded into a running set of notes
+# before it is dropped, and those notes travel with every later question. So
+# the bot keeps the recent conversation verbatim AND the gist of everything
+# before it, at a fixed cost in prompt size.
+SUMMARY_ENABLED = os.environ.get("SUMMARY_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# How many turns are folded in at a time. Bigger means fewer, better-informed
+# summarisation calls; smaller means the notes are updated more often.
+SUMMARY_BATCH = int(os.environ.get("SUMMARY_BATCH", "8"))
+
+# The ceiling on the notes themselves. They ride along with every question in
+# the chat, so they have to stay small enough to be worth their space.
+SUMMARY_MAX_CHARS = int(os.environ.get("SUMMARY_MAX_CHARS", "1200"))
 
 # Minimum seconds between two auto-replies in the same chat (anti-spam).
 # 0 = off, which is the default. It existed to stop a burst of messages
@@ -613,7 +633,15 @@ for _name, _why in RETIRED.items():
 # Transcripts, keyed by a string: "<business_connection_id>:<chat_id>" for a
 # 1:1 chat, "group:<chat_id>" for a room, "dm:<chat_id>" for the bot's own chat
 # with you, and INLINE_KEY (which stays empty).
-history: Dict[str, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS))
+# The window is kept one batch wider than HISTORY_TURNS: those extra slots are
+# where turns wait to be summarised. If summarising fails they are not lost
+# early - the deque simply evicts them as it always did.
+HISTORY_ROOM = HISTORY_TURNS + (SUMMARY_BATCH if SUMMARY_ENABLED else 0)
+
+history: Dict[str, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=HISTORY_ROOM))
+
+# key -> running notes on everything that has scrolled out of the window.
+summaries: Dict[str, str] = defaultdict(str)
 
 # business_connection_id -> owner's Telegram user id
 owner_of_connection: Dict[str, int] = {}
@@ -970,6 +998,19 @@ def load_known_groups() -> None:
     log.info("remembered %d group(s) you are in", len(known_groups))
 
 
+def read_chat_blob(data: Any) -> tuple:
+    """One stored chat, in either shape. Returns (turns, summary).
+
+    Before summaries a chat was stored as a bare list of turns. Upgrading must
+    not throw those away, so both shapes are read and only the new one written.
+    """
+    if isinstance(data, list):
+        return data, ""
+    if isinstance(data, dict):
+        return list(data.get("turns") or []), str(data.get("summary") or "")
+    return [], ""
+
+
 def load_from_redis() -> bool:
     index = f"{REDIS_PREFIX}:chats"
     # The index is a sorted set scored by last activity, so this is "the N most
@@ -990,10 +1031,12 @@ def load_from_redis() -> bool:
         if not blob:
             continue
         try:
-            turns = json.loads(blob)
+            turns, recap = read_chat_blob(json.loads(blob))
         except Exception:
             continue
-        history[key] = deque(turns[-HISTORY_TURNS:], maxlen=HISTORY_TURNS)
+        history[key] = deque(turns[-HISTORY_ROOM:], maxlen=HISTORY_ROOM)
+        if recap:
+            summaries[key] = recap
         history_seen[key] = time.time()
         loaded += 1
     log.info("loaded %d chat(s) from redis", loaded)
@@ -1006,9 +1049,12 @@ def save_to_redis(keys: List[str]) -> bool:
     cmds: List[list] = []
     for k in keys:
         turns = list(history[k])
-        if not turns:
+        recap = summaries.get(k, "")
+        if not turns and not recap:
             continue
-        blob = json.dumps(turns, ensure_ascii=False)
+        # A dict now, a bare list before summaries existed. Written as a dict,
+        # read as either - an old key must not lose its transcript on upgrade.
+        blob = json.dumps({"turns": turns, "summary": recap}, ensure_ascii=False)
         cmd = ["SET", f"{REDIS_PREFIX}:hist:{k}", blob]
         if HISTORY_TTL_DAYS:
             cmd += ["EX", str(HISTORY_TTL_DAYS * 86400)]
@@ -1035,8 +1081,10 @@ def load_history() -> None:
         return
     chats = data.get("chats") or {}
     for key, entry in chats.items():
-        turns = entry.get("turns") or []
-        history[key] = deque(turns[-HISTORY_TURNS:], maxlen=HISTORY_TURNS)
+        turns, recap = read_chat_blob(entry)
+        history[key] = deque(turns[-HISTORY_ROOM:], maxlen=HISTORY_ROOM)
+        if recap:
+            summaries[key] = recap
         history_seen[key] = float(entry.get("seen") or 0)
     log.info("loaded %d chat(s) from %s", len(chats), HISTORY_FILE)
 
@@ -1059,8 +1107,9 @@ def save_history() -> None:
         keys = keys[:HISTORY_MAX_CHATS]
         payload = {
             "saved": time.time(),
-            "chats": {k: {"seen": history_seen.get(k, 0), "turns": list(history[k])}
-                      for k in keys if history[k]},
+            "chats": {k: {"seen": history_seen.get(k, 0), "turns": list(history[k]),
+                          "summary": summaries.get(k, "")}
+                      for k in keys if history[k] or summaries.get(k)},
         }
         tmp = f"{HISTORY_FILE}.tmp"
         try:
@@ -1952,11 +2001,21 @@ def ask_ai(
     # else. `private` decides whether the unpublished half - your pin, your
     # /ctx note - is included; see context_block.
     facts = context_block(who, private=private, where=where, plain=raw)
+
+    # Everything this chat said before the window starts. Same block in every
+    # mode, and it is the only reason a conversation past HISTORY_TURNS still
+    # knows the name agreed on its first day.
+    recap = summaries.get(key, "")
+    if recap:
+        recap = ("Earlier in this conversation, before the messages below - "
+                 "your own notes, not something they said just now:\n" + recap)
+
     if raw:
-        system = "\n\n".join(p for p in (facts, extra_system.strip()) if p)
+        system = "\n\n".join(p for p in (facts, recap, extra_system.strip()) if p)
     else:
         system = (PERSONA + SYSTEM_SUFFIX + extra_system
-                  + (f"\n{facts}\n" if facts else now_line()))
+                  + (f"\n{facts}\n" if facts else now_line())
+                  + (f"\n{recap}\n" if recap else ""))
     gem_contents = [{"role": h["role"], "parts": [{"text": h["text"]}]}
                     for h in history[key]]
     if user_text is not None:
@@ -2113,6 +2172,7 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
 
     remember(key, "user", user_text)
     remember(key, "model", answer)
+    compact(key)
     last_reply_at[key] = time.time()
 
     with _pending_guard:
@@ -2336,6 +2396,88 @@ def judge_order() -> List[Candidate]:
         if pinned:
             order = pinned + [c for c in order if c not in pinned]
     return order
+
+
+SUMMARY_PROMPT = (
+    "You keep notes on a conversation so that nothing important is lost when "
+    "old messages scroll out of the window.\n"
+    "You are given the notes so far and the messages that are about to be "
+    "dropped. Rewrite the notes so they cover both.\n"
+    "\n"
+    "KEEP: names, numbers, prices, dates, addresses, decisions taken, things "
+    "promised, preferences and dislikes stated, open questions, anything the "
+    "person asked to be remembered, and how the relationship stands.\n"
+    "DROP: greetings, small talk, pleasantries, anything already implied by "
+    "what is kept, and anything that was only true at the time.\n"
+    "\n"
+    "Write it as compact prose in the language of the conversation - no "
+    "bullets, no headings, no preamble. If the old notes and the new messages "
+    "disagree, the new messages win. Output the notes and nothing else."
+)
+
+
+def summarise(old: str, turns: List[Dict[str, str]]) -> Optional[str]:
+    """Fold a batch of turns into the running notes.
+
+    Runs on the CHEAP end of the ladder, like the judge: condensing is
+    mechanical work, and a summarisation call made on the clever model is one
+    the actual answers no longer have.
+    """
+    lines = [("them: " if t["role"] == "user" else "you: ") + t["text"]
+             for t in turns]
+    question = (
+        (f"NOTES SO FAR:\n{old}\n\n" if old else "")
+        + "MESSAGES ABOUT TO BE DROPPED:\n" + "\n".join(lines)
+        + f"\n\n---\nRewrite the notes. At most {SUMMARY_MAX_CHARS} characters."
+    )
+
+    for c in judge_order():
+        if c.provider.name == "gemini":
+            text, _ = gemini_call(
+                c.model, SUMMARY_PROMPT,
+                [{"role": "user", "parts": [{"text": question}]}],
+                max_tokens=1200, max_chars=SUMMARY_MAX_CHARS)
+        else:
+            text, _ = openai_call(
+                c.provider, c.model, SUMMARY_PROMPT,
+                [{"role": "user", "content": question}],
+                max_tokens=1200, timeout=25, max_chars=SUMMARY_MAX_CHARS)
+        if text and text.strip():
+            log.info("  notes rewritten by %s/%s: %d chars",
+                     c.provider.name, c.model, len(text))
+            return text.strip()[:SUMMARY_MAX_CHARS]
+    log.warning("  could not rewrite the notes - the turns stay in the window "
+                "and it will be tried again")
+    return None
+
+
+def compact(key: str) -> None:
+    """Make room in the window by turning its oldest turns into notes.
+
+    Called after a reply has already gone out, so the wait costs the person
+    nothing: they have their answer, and the tidying happens before the next
+    message in this chat is handled.
+    """
+    if not SUMMARY_ENABLED or not key or key == INLINE_KEY:
+        return
+    extra = len(history[key]) - HISTORY_TURNS
+    if extra <= 0:
+        return
+
+    turns = list(history[key])[:extra]
+    fresh = summarise(summaries.get(key, ""), turns)
+    if not fresh:
+        return                      # leave them in place and try again later
+
+    for _ in range(min(extra, len(history[key]))):
+        history[key].popleft()
+    summaries[key] = fresh
+    history_seen[key] = time.time()
+    with _history_lock:
+        dirty_keys.add(key)
+    history_dirty.set()
+    log.info("  %s: %d oldest turns folded into notes, %d kept verbatim",
+             key, extra, len(history[key]))
 
 
 def judge_model() -> str:
@@ -2650,6 +2792,7 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
         log.info("  -> replied: %r", answer[:60])
 
     remember(key, "model", answer)
+    compact(key)
     last_reply_at[key] = time.time()
     if not reason.startswith(("mentioned", "replying")):
         last_interjection[key] = time.time()
@@ -2768,6 +2911,7 @@ def handle_owner_dm(msg: dict) -> None:
     send_reply(None, chat_id, answer, None, thread_id=thread_id)
     if DM_CHAT_MEMORY:
         remember(key, "model", answer)
+        compact(key)
     log.info("  -> answered in %.1fs: %r", time.time() - started, answer[:60])
 
 
@@ -2934,6 +3078,12 @@ def status_report() -> str:
             + (f", groups known: {len(known_groups)}, "
                f"people cleared: {sum(1 for v in inline_ok_cache.values() if v[0])}"
                if INLINE_ACCESS == "shared" else "")
+        ),
+        "memory: " + (
+            f"{HISTORY_TURNS} turns verbatim"
+            + (f" + notes on what fell out ({sum(1 for v in summaries.values() if v)}"
+               f" chat(s) have them, folded {SUMMARY_BATCH} turns at a time)"
+               if SUMMARY_ENABLED else ", nothing kept past that")
         ),
         "every mode is told: " + (
             "nothing (RAW_CONTEXT=false)" if not RAW_CONTEXT else
@@ -3512,6 +3662,12 @@ def handle_update(update: dict) -> None:
             say(f"Сейчас держу в виду: {owner_note}" if owner_note else
                 "Пусто. /ctx <текст> - что мне держать в виду в каждом ответе "
                 "(город, чем занят, какой ноутбук). /ctx - убрать.")
+    elif text.startswith("/memory"):
+        key = dm_key(chat_id, thread_id)
+        recap = summaries.get(key, "")
+        say(f"Дословно помню {len(history[key])} реплик.\n\n"
+            + (f"Конспект того, что уже вышло из окна:\n{recap}"
+               if recap else "Конспекта пока нет - окно ещё не переполнялось."))
     elif text.startswith("/where"):
         block = context_block(msg.get("from"), private=True,
                               where="your own chat with the bot")
@@ -3536,8 +3692,9 @@ def handle_update(update: dict) -> None:
         say(status_report())
     elif text.startswith("/reset"):
         key = dm_key(chat_id, thread_id)
-        had = len(history[key])
+        had = len(history[key]) + (1 if summaries.get(key) else 0)
         history[key].clear()
+        summaries.pop(key, None)
         history_seen[key] = time.time()
         with _history_lock:
             dirty_keys.add(key)
@@ -3557,6 +3714,7 @@ def handle_update(update: dict) -> None:
             "/status - what I currently know\n"
             "/check  - test every AI provider key\n"
             "/reset  - forget this thread\n"
+            "/memory - what I remember here, word for word and in note form\n"
             "/ctx    - a line about you I keep in mind every time\n"
             "/where  - exactly what I tell the model about the here and now\n\n"
             "Share a location (paperclip -> Location) and I will use it until "

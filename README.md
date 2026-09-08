@@ -903,10 +903,54 @@ came through, it stays quiet.
   called off: deleting the message cancels it silently, editing it starts the
   answer again from the new text, and a newer message supersedes the old one.
 
+## Memory: the window, and the notes behind it
+
+`HISTORY_TURNS` (20) messages of each chat are kept **word for word**. What
+used to happen past that was simple and lossy: the oldest turn fell off the end
+and was gone, taking the name, the price and the decision agreed on day one
+with it.
+
+Now the turns that fall out are **folded into running notes first**
+(`SUMMARY_ENABLED`, on). Every later question in that chat carries them:
+
+```
+Earlier in this conversation, before the messages below - your own notes, not
+something they said just now:
+Зовут Марина, делает свадебные торты. Просила смету на 60 персон, ...
+```
+
+So the bot has both halves — the recent conversation verbatim, and the gist of
+everything before it — at a fixed cost in prompt size.
+
+How it behaves:
+
+- **The window is one batch wider than it looks.** `HISTORY_TURNS +
+  SUMMARY_BATCH` slots exist; the extra ones are where turns wait to be
+  summarised. If the summariser is unavailable the turns are **not** dropped
+  early — they sit there and the next reply tries again.
+- **The cheap end of the ladder writes them**, like the group judge.
+  Condensing is mechanical, and a call spent on the clever model is one the
+  answers no longer have.
+- **It runs after the reply is already sent**, so the person waiting pays
+  nothing for it. In a group it runs after a reply rather than after every
+  message: summarising a room the bot never speaks in would burn quota for
+  nothing.
+- **Notes are per key**, exactly like the transcript — per business chat, per
+  group topic, per thread in the bot's own chat. Nothing bleeds between them.
+- **They persist** with the history, in Redis or the file. Chats stored by an
+  older version load unchanged; the reader takes both shapes.
+
+`/memory` in the bot's chat prints both halves. `/reset` clears both.
+`SUMMARY_BATCH` (8) is how many turns are folded at a time — bigger means
+fewer, better-informed calls. `SUMMARY_MAX_CHARS` (1200) caps the notes, which
+matters because they ride along with every question in that chat.
+
 ## Known limits
 
-- **History is in memory.** A redeploy or crash forgets ongoing conversations.
-  Fine for support chats; add Redis or SQLite if you need it durable.
+- **The last `HISTORY_TURNS` messages are verbatim; everything older is notes.**
+  Notes are lossy by design — they keep names, numbers, decisions and promises,
+  and drop the small talk. Raise `HISTORY_TURNS` if you need more said exactly
+  as it was said.
 - **Text only.** Photos, voice notes and stickers are ignored rather than
   guessed at.
 - **It answers everyone, instantly.** Telegram's own Chatbots screen is where
