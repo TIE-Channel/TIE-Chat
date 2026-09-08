@@ -417,55 +417,36 @@ The message goes out **as your own** (with a small "via @yourbot" label), shows
 `…` for a second, and fills in with the reply. Typing costs nothing — the model
 runs once, at the moment you send.
 
-### Two settings in @BotFather, and it needs both
+### One setting in @BotFather
 
-| Command | Answer |
-|---|---|
-| `/setinline` | pick your bot, then send a placeholder line, e.g. `что ответить...` |
-| `/setinlinefeedback` | pick your bot, then **Enabled** |
+`/setinline` → pick your bot → send a placeholder line, e.g. `что ответить...`
 
-The second one is the one everybody misses. Without it Telegram never reports
-that the message was sent, so the `…` would be posted and simply stay there —
-no error in the log, no error on your phone, nothing.
+That is all. **`/setinlinefeedback` is deliberately not relied on**, and this is
+the important part: Telegram only *samples* the "user chose this result"
+update. Its own documentation offers to deliver "1/10, 1/100 or 1/1000 of the
+results". So any design that posts a placeholder and waits for that report
+works one minute and leaves an ellipsis sitting in someone else's chat the
+next — which is exactly what happened here, twice, with the toggle switched on.
 
-**There is a way out without it.** The stub carries a `⏳ ответить` button, and
-tapping that button hands the bot the message id and the query directly — no
-feedback needed. So a bot with the toggle off still works; it just takes one
-extra tap per message, and the log says why:
+The bot therefore never waits for it. The answer is finished *before* the
+result is tapped, so tapping posts the real text and nothing has to be edited
+afterwards.
 
-```
-inline filled in from a button tap - /setinlinefeedback is probably off,
-which is why nothing happened by itself
-```
+### One model call per settled query, not per keystroke
 
-Turn the toggle on and the button never gets seen: the message is filled in
-within a second and the keyboard is removed with it. The bot also watches for
-the pattern that means it is off:
+Telegram re-queries the bot on **every keystroke**, and now the answer has to
+be ready up front. Two things keep that honest:
 
-```
-offered 9 inline replies and Telegram never said one was sent. If the message
-in the chat is stuck on '…', inline feedback is off:
-@BotFather -> /setinlinefeedback -> @yourbot -> Enabled.
-```
+- **Debounce** (`INLINE_DEBOUNCE`, 1.2 s). A query waits; if another keystroke
+  lands meanwhile it is abandoned before it costs anything. Typing a
+  twenty-character line costs one call.
+- **Cache** (`INLINE_CACHE_SECONDS`, 5 min) on the exact text. Reopening the
+  same query is free — and if generation overran Telegram's ~10-second answer
+  window, the answer is already cached, so the next keystroke serves it
+  instantly instead of paying again.
 
-Whether inline mode itself is on *is* readable from the API, so that is checked
-at startup:
-
-```
-inline mode on (access: shared) - type '@yourbot ...' in ANY chat, even one
-this bot was never added to
-```
-
-### Why "send first, answer after"
-
-The alternative is to have the reply ready before you tap it — which means
-generating while you type. Telegram re-queries the bot on **every keystroke**,
-so that costs a request per letter unless you bolt on debouncing and a cache,
-and it still has to finish inside Telegram's ~10-second answer window.
-
-Sending first removes all of it. Typing is free; the model runs exactly once
-per message you actually send; there is no window to race. The price is the
-`…` for a second and the `/setinlinefeedback` switch above.
+The trade is a second of delay before the result appears in the panel, and an
+occasional wasted generation when you type something and never send it.
 
 ### Who may use it
 
@@ -706,7 +687,6 @@ came through, it stays quiet.
 | Bot can read but replies silently fail | Telegram limits some actions to private chats with a *recent* incoming message — send it a fresh one |
 | `no reply rights` in the log | "Reply to messages" toggle off in Telegram Business settings |
 | Typing `@yourbot ...` in a chat finds nothing | Inline mode is off — `/setinline` in @BotFather (step 6c) |
-| The inline message is posted but stays on `…` forever | Inline feedback is off — `/setinlinefeedback` → Enabled (step 6c) |
 | Inline result is empty, with a "This bot is private." button | `INLINE_ACCESS=shared` and that person shares no known group with you — `/status` shows how many groups are known |
 | Inline works for you but not for anyone else | No groups known yet. Let someone write in one of yours, or set `GROUP_ALLOWLIST` |
 | No `business_message` updates at all | Chat is excluded in the Chatbots screen, or account has no Premium |
