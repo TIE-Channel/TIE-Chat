@@ -1058,6 +1058,11 @@ def pick_working_model() -> str:
 
 # Model names churn constantly, and a provider's catalogue is full of things
 # that are not chatbots. These never are.
+# Models that narrate their reasoning before answering. Fine for a reply, but
+# ruinous for the judge: the monologue eats its whole token budget and the
+# verdict never arrives.
+REASONING_MARKERS = ("reasoning", "thinking", "-r1", "deepthink")
+
 NOT_A_CHAT_MODEL = (
     "guard", "whisper", "tts", "embed", "rerank", "moderation", "safety",
     "ocr", "asr", "transcribe", "diffusion", "image", "vision", "audio",
@@ -1107,7 +1112,7 @@ def model_quality(name: str) -> int:
         if small in n:
             q -= penalty
     # Chain-of-thought models are slow and wordy for a one-line persona.
-    if any(x in n for x in ("reasoning", "thinking", "-r1", "deepthink")):
+    if any(x in n for x in REASONING_MARKERS):
         q -= 45
     if any(x in n for x in ("instruct", "chat", "-it", "versatile")):
         q += 10
@@ -1132,7 +1137,7 @@ def score_model(name: str, provider: str) -> int:
         score += 2
     # Chain-of-thought models spend ten seconds and 900 characters on a one-line
     # reply, and burn the judge's token budget before reaching a verdict.
-    if any(slow in n for slow in ("reasoning", "thinking", "-r1", "deepthink")):
+    if any(slow in n for slow in REASONING_MARKERS):
         score -= 4
 
     size = re.search(r"(\d+)\s*b\b", n)
@@ -1844,8 +1849,15 @@ def judge_order() -> List[Candidate]:
     GROUP_JUDGE_MODEL, when set to a model that is actually on the ladder, is
     tried before everything else.
     """
-    order = sorted((c for c in LADDER if c.usable and not c.bad_judge),
-                   key=lambda c: c.quality)
+    usable = [c for c in LADDER if c.usable and not c.bad_judge]
+    # The cheap end of the ladder is where models land for two different
+    # reasons: being small, and being unsuitable. A reasoning model scores low
+    # because it is wordy and slow - which puts it first in line for the judge,
+    # the one job it is worst at. Skip them here; they are still fine for
+    # replies. If somehow nothing else is left, a bad judge beats no judge.
+    plain = [c for c in usable
+             if not any(m in c.model.lower() for m in REASONING_MARKERS)]
+    order = sorted(plain or usable, key=lambda c: c.quality)
     if GROUP_JUDGE_MODEL:
         pinned = [c for c in order if c.model == GROUP_JUDGE_MODEL]
         if pinned:
@@ -2386,6 +2398,7 @@ known_groups: set = set()
 
 inline_offered = 0
 inline_sent = 0
+inline_seen = False        # has any inline query ever arrived this run?
 
 
 def allow_inline_for(user_id: int, chat_id: int) -> None:
@@ -2456,10 +2469,21 @@ def answer_nothing(query_id: str, note: str, seconds: int = 0) -> None:
 
 def handle_inline_query(q: dict) -> None:
     """Instant and free. Nothing is generated until the message is actually sent."""
+    global inline_seen
     query_id = q.get("id")
     sender = q.get("from") or {}
     user_id = sender.get("id")
     text = (q.get("query") or "").strip()
+
+    # The first one is worth an INFO line: it is the only proof that inline
+    # mode is wired up at all, and "I typed @thebot and nothing happened" is
+    # otherwise indistinguishable from a bot that never got the query.
+    if not inline_seen:
+        inline_seen = True
+        log.info("inline query received from %s (%r) - the panel is working; "
+                 "tap the result to actually send it", user_id, text[:40])
+    else:
+        log.debug("inline query from %s: %r", user_id, text[:60])
 
     if not text:
         return answer_nothing(query_id, "Напиши, на что ответить")
