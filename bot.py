@@ -11,6 +11,7 @@ Runs with plain long-polling: no public URL, no webhook, no framework.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import requests
 
@@ -53,12 +54,28 @@ MAX_MESSAGE_AGE = int(os.environ.get("MAX_MESSAGE_AGE", "3600"))
 # Gemini generation settings. maxOutputTokens covers thinking AND the answer,
 # so keep it comfortably above what a short reply needs.
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "2048"))
+# The token ceiling is the other way a reply gets cut mid-sentence, so it has
+# headroom rather than being sized to the expected answer. It is a ceiling, not
+# a target: the one-line persona keeps 1:1 replies short regardless, and the
+# spare budget also stops Gemini spending the whole allowance on thinking and
+# returning nothing.
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "4096"))
 GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "45"))
 
-# Hard ceiling on what actually gets sent. The persona asks for one line; this
-# is the seatbelt for when a model ignores that entirely.
-REPLY_MAX_CHARS = int(os.environ.get("REPLY_MAX_CHARS", "1200"))
+# Hard ceilings on what actually gets sent, in characters. Both are off.
+#
+# The 1:1 persona still asks for one line, and that is where the brevity comes
+# from - but a rule in the prompt and a knife in the code are different things.
+# Truncating at a character count cuts mid-sentence, which reads as a bug
+# rather than as a short answer, so nothing is cut: when he does run long, the
+# whole thing arrives. sendMessage splits anything over Telegram's 4096 into
+# several messages either way.
+REPLY_MAX_CHARS = int(os.environ.get("REPLY_MAX_CHARS", "0"))
+ROOM_MAX_CHARS = int(os.environ.get("ROOM_MAX_CHARS", "0"))
+
+# Telegram's own ceiling for a single message. An inline reply is edited into a
+# message that already exists, so it cannot be split - that one is truly capped.
+TELEGRAM_MAX_CHARS = 4096
 
 # "minimal" | "low" | "medium" | "high", or empty to let the model decide.
 # A one-line chat reply does not need deep reasoning; low keeps it fast.
@@ -79,6 +96,34 @@ GROUP_AUTO_LEAVE = os.environ.get("GROUP_AUTO_LEAVE", "").strip().lower() in (
     "1", "true", "yes",
 )
 
+# --- inline mode: summon him anywhere -------------------------------------
+# Typing "@thebot something" in ANY chat - a group he was never added to, a
+# channel, someone else's DM - offers a reply you can post yourself. Telegram
+# routes the query to the bot without it being a member anywhere.
+INLINE_ENABLED = os.environ.get("INLINE_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# Who may summon him inline.
+#   owner  - only you
+#   shared - you, plus anyone who is in one of the groups you are in. Telegram
+#            never tells a bot WHICH chat an inline query came from, so the chat
+#            itself cannot be checked; the person can, and "someone I share a
+#            room with" is the closest true equivalent.
+#   all    - anybody who knows the username. Burns your quota on strangers.
+INLINE_ACCESS = os.environ.get("INLINE_ACCESS", "shared").strip().lower()
+
+# What sits in the chat for the second or two between sending and the answer.
+INLINE_PLACEHOLDER = os.environ.get("INLINE_PLACEHOLDER", "…")
+
+# Per-person ceiling, so an open inline bot cannot be drained in a minute.
+INLINE_MAX_PER_MIN = int(os.environ.get("INLINE_MAX_PER_MIN", "6"))
+
+# One shared, permanently empty transcript. Inline answers carry no context:
+# there is no chat id to key one on, and a memory shared across every chat he
+# is summoned into would leak one conversation into the next.
+INLINE_KEY = "inline"
+
 # Optional: comma-separated Telegram user IDs that are never auto-answered.
 IGNORE_USER_IDS = {
     int(x) for x in os.environ.get("IGNORE_USER_IDS", "").replace(" ", "").split(",") if x
@@ -98,6 +143,10 @@ HISTORY_TTL_DAYS = int(os.environ.get("HISTORY_TTL_DAYS", "30"))
 HISTORY_FILE = os.environ.get("HISTORY_FILE", "history.json").strip()
 HISTORY_SAVE_EVERY = int(os.environ.get("HISTORY_SAVE_EVERY", "20"))   # seconds
 HISTORY_MAX_CHATS = int(os.environ.get("HISTORY_MAX_CHATS", "300"))
+
+# Which groups you are in - the set the inline access test is measured against.
+# Goes to Redis when it is configured; this file is only the fallback.
+GROUPS_FILE = os.environ.get("GROUPS_FILE", "groups.json").strip()
 
 # Timezone the persona lives in - used to tell the model today's date.
 BOT_TZ = os.environ.get("BOT_TZ", "Europe/Berlin").strip()
@@ -170,11 +219,7 @@ GROUP_JUDGE_MAX_PER_MIN = int(os.environ.get("GROUP_JUDGE_MAX_PER_MIN", "8"))
 # Seconds of enforced silence after he speaks in a group. 0 = no cooldown at
 # all, which is the right default now that he only answers when the room is
 # actually talking to him or about him - there is nothing to ration.
-GROUP_COOLDOWN = float(
-    os.environ.get("GROUP_COOLDOWN")
-    or os.environ.get("GROUP_KEYWORD_COOLDOWN")   # previous name, still honoured
-    or "0"
-)
+GROUP_COOLDOWN = float(os.environ.get("GROUP_COOLDOWN", "0") or 0)
 
 # May he join a conversation that is not about him, when the judge thinks he
 # has something worth adding? With several providers behind him, quota is no
@@ -201,18 +246,21 @@ GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 
 # --------------------------------------------------------------------------
 # AI providers. Gemini speaks its own dialect; everything else below is
-# OpenAI-compatible, so one client covers all of them. Providers are tried in
-# order and the first one that answers wins, which means a 429 on the free tier
-# is a half-second detour instead of a dead chat.
+# OpenAI-compatible, so one client covers all of them.
+#
+# AI_ORDER only decides which providers exist and which model each one starts
+# on. It is NOT the order replies are tried in: build_ladder() pools every
+# model from every provider into one list ranked by quality and measured speed,
+# and ask_ai() walks that. So a 429 on the best free tier is a step down to the
+# next-cleverest model anywhere, not a dead chat.
 # --------------------------------------------------------------------------
 
 class Provider:
-    __slots__ = ("name", "base", "key", "model", "searched", "fails",
+    __slots__ = ("name", "base", "key", "model", "fails",
                  "parked_until", "no_json", "no_reasoning_param")
 
     def __init__(self, name: str, base: str, key: str, model: str) -> None:
         self.name, self.base, self.key, self.model = name, base, key, model
-        self.searched = False        # have we already hunted for a live model?
         self.no_json = False         # strict JSON mode is broken here
         self.no_reasoning_param = False
         self.fails = 0               # consecutive failures
@@ -235,9 +283,6 @@ class Provider:
     @property
     def parked(self) -> bool:
         return time.time() < self.parked_until
-
-    def __repr__(self) -> str:
-        return f"{self.name}({self.model})"
 
 
 # name -> (base url, env var for the key, env var for the model, default model)
@@ -270,6 +315,8 @@ PARK_MINUTES = int(os.environ.get("PARK_MINUTES", "10"))
 # A single model hitting its own rate limit rests this long; the ladder simply
 # steps down to the next one meanwhile.
 MODEL_COOLDOWN = int(os.environ.get("MODEL_COOLDOWN", "600"))
+# Above this, a model is "slow" and gets demoted where speed matters (groups).
+SLOW_SECONDS = float(os.environ.get("SLOW_SECONDS", "8"))
 
 AI_ORDER = [
     n.strip().lower()
@@ -432,7 +479,8 @@ for _name, _why in RETIRED.items():
 # State
 # --------------------------------------------------------------------------
 
-# history[(business_connection_id, chat_id)] -> deque of {"role","text"}
+# Transcripts, keyed by a string: "<business_connection_id>:<chat_id>" for a
+# 1:1 chat, "group:<chat_id>" for a room, and INLINE_KEY (which stays empty).
 history: Dict[str, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS))
 
 # business_connection_id -> owner's Telegram user id
@@ -496,6 +544,51 @@ def redis_pipeline(commands: List[list]) -> Optional[list]:
     except Exception as exc:
         log.warning("redis gave unusable output: %s", exc)
         return None
+
+
+def save_known_groups() -> None:
+    """Persist the set of your groups.
+
+    Without this the inline "shares a group with me" test starts every restart
+    knowing nothing, so everyone but you is locked out until somebody happens
+    to write in one of your groups. On a free host that restarts daily, that is
+    most of the day.
+    """
+    if not known_groups:
+        return
+    blob = json.dumps(sorted(known_groups))
+    if redis_on():
+        redis_pipeline([["SET", f"{REDIS_PREFIX}:groups", blob]])
+        return
+    if GROUPS_FILE:
+        try:
+            tmp = f"{GROUPS_FILE}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(blob)
+            os.replace(tmp, GROUPS_FILE)
+        except Exception as exc:
+            log.warning("could not save the group list: %s", exc)
+
+
+def load_known_groups() -> None:
+    blob = None
+    if redis_on():
+        got = redis_pipeline([["GET", f"{REDIS_PREFIX}:groups"]])
+        blob = (got or [None])[0]
+    elif GROUPS_FILE and os.path.exists(GROUPS_FILE):
+        try:
+            with open(GROUPS_FILE, encoding="utf-8") as f:
+                blob = f.read()
+        except Exception:
+            blob = None
+    if not blob:
+        return
+    try:
+        known_groups.update(int(x) for x in json.loads(blob))
+    except Exception as exc:
+        log.warning("stored group list is unusable (%s) - ignoring", exc)
+        return
+    log.info("remembered %d group(s) you are in", len(known_groups))
 
 
 def load_from_redis() -> bool:
@@ -611,14 +704,58 @@ last_rights_check: Dict[str, float] = {}
 
 STARTED_AT = time.time()
 
-# Primary model first, lighter flash models behind it as live fallbacks.
+# The Gemini model to use, with lighter flash models behind it as live
+# fallbacks for when Google answers 503 "overloaded".
 MODEL_CANDIDATES: List[str] = []
-PRIMARY_MODEL = GEMINI_MODEL
-PINNED_UNTIL = 0.0
-FALLBACK_MINUTES = int(os.environ.get("FALLBACK_MINUTES", "15"))
 
 EXECUTOR = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="reply")
 ASYNC_REPLIES = WORKERS > 1
+
+
+def run_off_poll_loop(fn) -> None:
+    """Answering takes seconds; getUpdates must not wait for it.
+
+    With WORKERS=1 there is no pool and the work runs inline, which is what the
+    tests want too - they assert on what was sent by the time the call returns.
+    """
+    EXECUTOR.submit(fn) if ASYNC_REPLIES else fn()
+
+
+def rate_ok(bucket: Dict[Any, Deque[float]], key: Any, per_minute: int) -> bool:
+    """A 60-second sliding window, shared by the group judge and inline mode."""
+    calls = bucket[key]
+    now = time.time()
+    while calls and now - calls[0] > 60:
+        calls.popleft()
+    if len(calls) >= per_minute:
+        return False
+    calls.append(now)
+    return True
+
+
+def provider_headers(p: Provider) -> Dict[str, str]:
+    """Auth for an OpenAI-compatible provider, plus whatever it insists on."""
+    headers = {"Authorization": f"Bearer {p.key}",
+               "Content-Type": "application/json"}
+    if p.name == "openrouter":                      # OpenRouter asks for these
+        headers["HTTP-Referer"] = "https://t.me"
+        headers["X-Title"] = "telegram-business-bot"
+    return headers
+
+
+def gemini_headers(key: str = "") -> Dict[str, str]:
+    return {"x-goog-api-key": key or GEMINI_API_KEY,
+            "Content-Type": "application/json"}
+
+
+def gemini_url(model: str) -> str:
+    return f"{GEMINI_API}/models/{model}:generateContent"
+
+
+def gemini_text(candidate: dict) -> str:
+    """The visible answer only - Gemini returns its reasoning in the same list."""
+    parts = (candidate.get("content") or {}).get("parts") or []
+    return "".join(x.get("text", "") for x in parts if not x.get("thought")).strip()
 
 _chat_locks: Dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
@@ -845,11 +982,11 @@ def pace_and_send(
 
 def pick_working_model() -> str:
     """Confirm GEMINI_MODEL works and build the fallback list behind it."""
-    global GEMINI_MODEL, MODEL_CANDIDATES, PRIMARY_MODEL
+    global GEMINI_MODEL, MODEL_CANDIDATES
     try:
         r = session.get(
             f"{GEMINI_API}/models",
-            headers={"x-goog-api-key": GEMINI_API_KEY},
+            headers=gemini_headers(),
             timeout=30,
         )
         models = [
@@ -880,7 +1017,6 @@ def pick_working_model() -> str:
     # Google's servers hand out 503 "overloaded" under load, and the newest
     # model is the busiest one. Keep the lighter models as a live fallback.
     MODEL_CANDIDATES = [GEMINI_MODEL] + [m for m in flash if m != GEMINI_MODEL]
-    PRIMARY_MODEL = GEMINI_MODEL
     log.info("using Gemini model %s (fallbacks: %s)",
              GEMINI_MODEL, ", ".join(MODEL_CANDIDATES[1:3]) or "none")
     return GEMINI_MODEL
@@ -918,7 +1054,14 @@ def model_quality(name: str) -> int:
             q += weight
             break
     size = model_size(n)
-    q += min(size, 200) if size != 999 else 35      # unnamed size: assume mid
+    if size == 999:
+        q += 35                                     # unnamed size: assume mid
+    else:
+        # Past ~120B the extra parameters buy little for a chat line and cost a
+        # lot of queueing on a free tier, so the curve flattens and then turns.
+        q += min(size, 120)
+        if size > 250:
+            q -= 25
     for small, penalty in (("lite", 35), ("mini", 30), ("nano", 40),
                            ("small", 25), ("tiny", 50), ("instant", 20),
                            ("flash", 8), ("scout", 15)):
@@ -1047,20 +1190,28 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
-def trim_reply(text: str) -> str:
-    """Last-resort length guard, cutting at a sentence end where possible."""
-    if len(text) <= REPLY_MAX_CHARS:
+def trim_reply(text: str, limit: Optional[int] = None) -> str:
+    """Last-resort length guard, cutting at a sentence end where possible.
+
+    `limit` of 0 means no guard at all, which is the default everywhere now:
+    length is the prompt's business. The only caller that still passes a real
+    number is the inline reply, which is edited into an existing message and so
+    cannot spill into a second one.
+    """
+    limit = REPLY_MAX_CHARS if limit is None else limit
+    if limit <= 0 or len(text) <= limit:
         return text
-    head = text[:REPLY_MAX_CHARS]
+    head = text[:limit]
     cut = max(head.rfind(". "), head.rfind("! "), head.rfind("? "),
               head.rfind(".\n"), head.rfind("…"))
-    return (head[:cut + 1] if cut > REPLY_MAX_CHARS // 3 else head).strip()
+    return (head[:cut + 1] if cut > limit // 3 else head).strip()
 
 
 class Candidate:
     """One (provider, model) rung of the ladder."""
 
-    __slots__ = ("provider", "model", "quality", "dead", "cool_until", "bad_judge")
+    __slots__ = ("provider", "model", "quality", "dead", "cool_until",
+                 "bad_judge", "seconds")
 
     def __init__(self, provider: Provider, model: str) -> None:
         self.provider = provider
@@ -1069,6 +1220,26 @@ class Candidate:
         self.dead = False           # gone for good: 404 / 402 / 410
         self.cool_until = 0.0       # rate limited: come back later
         self.bad_judge = False      # cannot produce a usable verdict
+        self.seconds = 0.0          # rolling average response time, 0 = untried
+
+    def timed(self, elapsed: float) -> None:
+        self.seconds = elapsed if not self.seconds else self.seconds * 0.6 + elapsed * 0.4
+
+    def rank(self, fast: bool) -> int:
+        """Quality, discounted by how long this rung actually takes.
+
+        In a group a brilliant answer 40 seconds late is worse than a good one
+        now - the conversation has moved on. In a 1:1 chat the bot is pretending
+        to type anyway, so patience is free and quality wins.
+        """
+        t = self.seconds
+        if not t:
+            return self.quality
+        if fast:
+            penalty = 0 if t < 4 else 40 if t < 8 else 110 if t < 15 else 220
+        else:
+            penalty = 0 if t < 10 else 25 if t < 25 else 90
+        return self.quality - penalty
 
     @property
     def usable(self) -> bool:
@@ -1122,6 +1293,7 @@ def openai_call(
     max_tokens: int,
     json_mode: bool = False,
     timeout: Optional[int] = None,
+    max_chars: Optional[int] = None,
 ) -> tuple:
     """One call to an OpenAI-compatible endpoint. Returns (text|None, status)."""
     body: Dict[str, Any] = {
@@ -1136,10 +1308,7 @@ def openai_call(
         # Groq can drop a reasoning model's monologue server-side, which is both
         # cheaper and safer than us cleaning it up afterwards.
         body["reasoning_format"] = "hidden"
-    headers = {"Authorization": f"Bearer {p.key}", "Content-Type": "application/json"}
-    if p.name == "openrouter":                      # OpenRouter asks for these
-        headers["HTTP-Referer"] = "https://t.me"
-        headers["X-Title"] = "telegram-business-bot"
+    headers = provider_headers(p)
 
     started = time.time()
     try:
@@ -1183,7 +1352,7 @@ def openai_call(
         log.warning("  -> %s returned an empty message", p.name)
         return None, 0
     if not json_mode:
-        text = trim_reply(text)
+        text = trim_reply(text, max_chars)
     log.info("  -> %s/%s 200 in %.1fs, %d chars",
              p.name, model, time.time() - started, len(text))
     return text, 200
@@ -1199,7 +1368,8 @@ def openai_chat(p: Provider, system: str, messages: List[dict], max_tokens: int,
 
 
 def gemini_call(model: str, system: str, contents: List[dict],
-                max_tokens: int, thinking: bool = True) -> tuple:
+                max_tokens: int, thinking: bool = True,
+                max_chars: Optional[int] = None) -> tuple:
     """One Gemini generateContent call. Returns (text|None, status)."""
     gen: Dict[str, Any] = {"temperature": TEMPERATURE, "maxOutputTokens": max_tokens}
     if thinking and THINKING_LEVEL:
@@ -1207,8 +1377,7 @@ def gemini_call(model: str, system: str, contents: List[dict],
     started = time.time()
     try:
         r = session.post(
-            f"{GEMINI_API}/models/{model}:generateContent",
-            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            gemini_url(model), headers=gemini_headers(),
             json={"system_instruction": {"parts": [{"text": system}]},
                   "contents": contents, "generationConfig": gen},
             timeout=GEMINI_TIMEOUT,
@@ -1218,7 +1387,7 @@ def gemini_call(model: str, system: str, contents: List[dict],
         return None, 0
 
     if r.status_code == 400 and thinking and "think" in r.text.lower():
-        return gemini_call(model, system, contents, max_tokens, thinking=False)
+        return gemini_call(model, system, contents, max_tokens, False, max_chars)
     if r.status_code != 200:
         log.warning("  -> gemini/%s %s: %s", model, r.status_code,
                     r.text[:120].replace("\n", " "))
@@ -1230,17 +1399,16 @@ def gemini_call(model: str, system: str, contents: List[dict],
         log.warning("  -> gemini: no candidates (%s)", data.get("promptFeedback"))
         return None, 0
     cand = cands[0]
-    parts = (cand.get("content") or {}).get("parts") or []
-    text = "".join(x.get("text", "") for x in parts if not x.get("thought")).strip()
+    text = gemini_text(cand)
     if not text:
         reason = cand.get("finishReason")
         log.warning("  -> gemini/%s produced no text (finishReason=%s)", model, reason)
         if reason == "MAX_TOKENS" and max_tokens < 4096:
-            return gemini_call(model, system, contents, 4096, thinking=False)
+            return gemini_call(model, system, contents, 4096, False, max_chars)
         return None, 0
     log.info("  -> gemini/%s 200 in %.1fs, %d chars",
              model, time.time() - started, len(text))
-    return trim_reply(text), 200
+    return trim_reply(text, max_chars), 200
 
 
 def note_failure(c: Candidate, status: int) -> None:
@@ -1260,11 +1428,25 @@ def ask_ai(
     user_text: Optional[str],
     extra_system: str = "",
     cancel: Optional[threading.Event] = None,
+    fast: bool = False,
+    room: bool = False,
+    max_chars: Optional[int] = None,
 ) -> Optional[str]:
-    """Answer with the best model still available, walking down the ladder."""
+    """Answer with the best model still available, walking down the ladder.
+
+    `room` is a group or an inline summon, where the prompt tells him to write
+    as long as the subject deserves; a 1:1 chat keeps the one-line persona.
+    Length is the prompt's business: by default nothing is truncated, because
+    cutting at a character count only ever chopped somebody off mid-sentence.
+    The one caller that passes a real `max_chars` is the inline reply, which is
+    edited into an existing message and so cannot spill into a second one.
+    """
     if not LADDER:
         log.error("no models available at all")
         return None
+
+    if max_chars is None:
+        max_chars = ROOM_MAX_CHARS if room else REPLY_MAX_CHARS
 
     system = PERSONA + SYSTEM_SUFFIX + extra_system + now_line()
     gem_contents = [{"role": h["role"], "parts": [{"text": h["text"]}]}
@@ -1273,19 +1455,26 @@ def ask_ai(
         gem_contents.append({"role": "user", "parts": [{"text": user_text}]})
     oai_messages = openai_turns(key, user_text)
 
-    best = LADDER[0]
-    for c in LADDER:
+    order = sorted(LADDER, key=lambda c: -c.rank(fast))
+    best = order[0]
+    for c in order:
         if cancel is not None and cancel.is_set():
             return None
         if not c.usable:
             continue
 
+        started = time.time()
         if c.provider.name == "gemini":
-            text, status = gemini_call(c.model, system, gem_contents, MAX_OUTPUT_TOKENS)
+            text, status = gemini_call(c.model, system, gem_contents,
+                                       MAX_OUTPUT_TOKENS, max_chars=max_chars)
         else:
             text, status = openai_call(c.provider, c.model, system, oai_messages,
-                                       MAX_OUTPUT_TOKENS)
+                                       MAX_OUTPUT_TOKENS, max_chars=max_chars)
         if text:
+            c.timed(time.time() - started)
+            if fast and c.seconds > SLOW_SECONDS:
+                log.info("  -> %s took %.0fs; it drops down the ladder for groups",
+                         c, c.seconds)
             c.provider.revive()
             c.provider.model = c.model          # for /status and /check
             if c is not best:
@@ -1409,28 +1598,33 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
             pending.pop(key, None)
 
 
-GROUP_NOTE = """
+# The room rules, shared by every place where he is one voice among several:
+# a group he was added to, and an inline summon into a chat he cannot see. The
+# base persona is written for a 1:1 chat - one line, and take apart the remark
+# rather than the person, because the other end may be a customer. Neither of
+# those is right in a room, so both are overridden here.
+ROOM_RULES = """
+LENGTH - THERE IS NO LIMIT HERE
+Write as much as you want. One word, one line, or five paragraphs of a rant \
+that has been building for years: whatever the subject actually deserves. This \
+is a conversation among people, not a support desk, and nobody is counting \
+your sentences. Length should follow the thought and stop when the thought \
+stops - not because you have run out of allowance, and not padded to look \
+substantial when a single line would land harder.
 
-GROUP CHAT - THIS OVERRIDES THE ONE-LINE RULE
-You are in a group with several people. Every incoming line is prefixed with \
-the name of whoever said it. Never prefix your own replies with a name; use \
-someone's name only when it matters who you are answering.
-
-Here you may take room. Two or three sentences is normal, and a short riff is \
-fine when the subject deserves one - this is a conversation, not a support \
-desk. Still one paragraph, no line breaks, no lists, no headings, no emoji.
-
-You are only ever writing here because somebody addressed you or was talking \
-about you. Answer that - the person and the thing they actually said. Never \
-open with an offer to help and never ask whether they need assistance.
+Write it as a person types in a chat: plain prose, paragraphs if the thing \
+needs them. No lists, no bullet points, no headings, no bold, no emoji - \
+nobody formats a group message like a report.
 
 TRADING INSULTS - THIS OVERRIDES THE ONE-TO-ONE RULE ABOVE
-This is a room of people who know each other, not a customer chat. If someone \
-comes at you, you give as good as you get: mock them back, call them what \
-they are, and swear if they swore first. Aim it at the person who started it, \
-land it in one line, and make it funny - the point is that they picked the \
-wrong opponent, not that you are angry. Wit beats volume; a specific jab \
-about what they just said beats any generic insult.
+These are people who know each other, not a customer chat. If someone comes at \
+you, you give as good as you get: mock them back, call them what they are, and \
+swear if they swore first. Aim it at the person who started it and make it \
+funny - the point is that they picked the wrong opponent, not that you are \
+angry. Wit beats volume, so a comeback usually lands hardest short, but that \
+is a matter of aim, not a word limit: if the thing deserves a paragraph, write \
+the paragraph. A specific jab about what they just said beats any generic \
+insult, at any length.
 
 Where you stop, and this is absolute: nothing about anyone's ethnicity, \
 nationality, religion, gender, sexuality, disability or illness; no threats \
@@ -1438,10 +1632,36 @@ of any kind; nothing sexual about them; nothing about their family; and no \
 piling on a person somebody else is already dogpiling. Those are not \
 comebacks, they are just ugly, and they would land on your account.
 
-You never start it. You give one line back per jab, not three. If they stop, \
-you stop - and if they are plainly upset rather than playing, you drop the \
-whole thing at once.
+You never start it. You answer a jab once and let it go, rather than circling \
+back to it three messages later. If they stop, you stop - and if they are \
+plainly upset rather than playing, you drop the whole thing at once.
 """
+
+GROUP_NOTE = """
+
+GROUP CHAT - THIS OVERRIDES THE ONE-LINE RULE
+You are in a group with several people. Every incoming line is prefixed with \
+the name of whoever said it. Never prefix your own replies with a name; use \
+someone's name only when it matters who you are answering.
+
+You are only ever writing here because somebody addressed you or was talking \
+about you. Answer that - the person and the thing they actually said. Never \
+open with an offer to help and never ask whether they need assistance.
+""" + ROOM_RULES
+
+
+INLINE_NOTE = """
+
+SUMMONED INTO A CHAT YOU CANNOT SEE - THIS OVERRIDES THE ONE-LINE RULE
+Somebody typed your name in a chat and handed you one line. That line is \
+everything you get: no history, no names, no idea who else is in the room, and \
+nothing is prefixed with who said it. Do not ask to be filled in, do not guess \
+who is speaking, and never refer to "this chat" or to what anyone supposedly \
+said before - you were not there.
+
+Answer the line in front of you as if it had been said to your face. No \
+greeting, no sign-off, and never an offer to help.
+""" + ROOM_RULES
 
 
 def display_name(user: dict) -> str:
@@ -1575,14 +1795,7 @@ def judge_model() -> str:
 
 
 def judge_budget_ok(key: str) -> bool:
-    now = time.time()
-    calls = judge_calls[key]
-    while calls and now - calls[0] > 60:
-        calls.popleft()
-    if len(calls) >= GROUP_JUDGE_MAX_PER_MIN:
-        return False
-    calls.append(now)
-    return True
+    return rate_ok(judge_calls, key, GROUP_JUDGE_MAX_PER_MIN)
 
 
 def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) -> Optional[str]:
@@ -1670,8 +1883,7 @@ def judge_via(c: Candidate, question: str) -> Optional[dict]:
         return None
 
     model = c.model
-    url = f"{GEMINI_API}/models/{model}:generateContent"
-    headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
+    url, headers = gemini_url(model), gemini_headers()
 
     def body(thinking: bool) -> dict:
         gen: Dict[str, Any] = {
@@ -1700,9 +1912,7 @@ def judge_via(c: Candidate, question: str) -> Optional[dict]:
             log.warning("  judge %s: %s", r.status_code, r.text[:120].replace("\n", " "))
             return None
         try:
-            parts = (r.json()["candidates"][0].get("content") or {}).get("parts") or []
-            raw = "".join(x.get("text", "") for x in parts if not x.get("thought"))
-            return json.loads(raw)
+            return json.loads(gemini_text(r.json()["candidates"][0]))
         except Exception as exc:
             log.warning("  judge gave unusable output: %s", exc)
             return None
@@ -1774,6 +1984,12 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
     if not group_allowed(chat_id):
         return
 
+    # A room that passed the check is a room you are in. That is the set the
+    # inline "shares a group with me" test is measured against.
+    if chat_id not in known_groups:
+        known_groups.add(chat_id)
+        save_known_groups()
+
     key = f"group:{chat_id}"
 
     # Strip our own @mention so the model doesn't answer its own username.
@@ -1797,7 +2013,7 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     log.info("  -> answering...")
     started = time.time()
-    answer = ask_ai(key, None, GROUP_NOTE)
+    answer = ask_ai(key, None, GROUP_NOTE, fast=not GROUP_DELAY, room=True)
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
@@ -1835,10 +2051,7 @@ def dispatch_group_message(msg: dict) -> None:
             except Exception:
                 log.exception("error answering group %s", chat.get("id"))
 
-    if ASYNC_REPLIES:
-        EXECUTOR.submit(run)
-    else:
-        run()
+    run_off_poll_loop(run)
 
 
 def dispatch_business_message(msg: dict) -> None:
@@ -1865,10 +2078,7 @@ def dispatch_business_message(msg: dict) -> None:
             except Exception:
                 log.exception("error answering chat %s", chat.get("id"))
 
-    if ASYNC_REPLIES:
-        EXECUTOR.submit(run)
-    else:
-        run()
+    run_off_poll_loop(run)
 
 
 def probe_provider(p: Provider) -> tuple:
@@ -1878,8 +2088,7 @@ def probe_provider(p: Provider) -> tuple:
     if p.name == "gemini":
         try:
             r = session.post(
-                f"{GEMINI_API}/models/{GEMINI_MODEL}:generateContent",
-                headers={"x-goog-api-key": p.key, "Content-Type": "application/json"},
+                gemini_url(GEMINI_MODEL), headers=gemini_headers(p.key),
                 json={"contents": [{"role": "user", "parts": [{"text": "Reply with OK"}]}],
                       "generationConfig": {"maxOutputTokens": 1024, "temperature": 0}},
                 timeout=25,
@@ -1890,10 +2099,7 @@ def probe_provider(p: Provider) -> tuple:
         return (True, GEMINI_MODEL, took) if r.status_code == 200 else (
             False, http_error(r), took)
 
-    headers = {"Authorization": f"Bearer {p.key}", "Content-Type": "application/json"}
-    if p.name == "openrouter":
-        headers["HTTP-Referer"] = "https://t.me"
-        headers["X-Title"] = "telegram-business-bot"
+    headers = provider_headers(p)
     try:
         r = session.post(
             f"{p.base}/chat/completions", headers=headers,
@@ -2010,12 +2216,19 @@ def status_report() -> str:
             else "PRIVACY MODE ON - only mentions and replies arrive, so he "
                  "cannot see jabs or topics (see /setprivacy in BotFather)"
         ),
+        "inline: " + (
+            "off (INLINE_ENABLED=false)" if not INLINE_ENABLED else
+            f"{INLINE_ACCESS}, {inline_offered} offered / {inline_sent} sent"
+            + (f", groups known: {len(known_groups)}"
+               if INLINE_ACCESS == "shared" else "")
+        ),
         "ladder (best first):",
     ] + [
-        "  {}{:<40} q={}".format(
+        "  {}{:<40} q={}{}".format(
             "   " if c.usable else "x  ",
             f"{c.provider.name}/{c.model}",
             c.quality,
+            f" {c.seconds:.0f}s" if c.seconds else "",
         ) + ("" if c.usable else
              "  dead" if c.dead else
              f"  resting {int(c.cool_until - time.time())}s" if c.cool_until > time.time()
@@ -2036,7 +2249,201 @@ def status_report() -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# Inline mode - summoning him in a chat he is not a member of
+# --------------------------------------------------------------------------
+#
+# Telegram delivers "@thebot whatever" from ANY chat straight to the bot; it
+# does not need to be in that chat, or in any chat. What it does NOT deliver is
+# which chat that was. An inline query carries the sender, the text and a coarse
+# chat_type - never a chat id - so "only in chats I am in" is not something a
+# bot can enforce. What it can check is the person: INLINE_ACCESS=shared serves
+# anyone who sits in one of the groups you are in, which is the same guarantee
+# from the other side.
+#
+# You send first, he answers after. Typing costs nothing: every keystroke gets
+# the same instant stub back. The model runs once, when you actually send the
+# message, and the sent message is then edited into the reply. That is one call
+# per message sent - not per message typed, and not per letter.
+#
+# Telegram only reports which result you picked, and only hands over the
+# inline_message_id needed to edit it, if the result carried an inline keyboard.
+# So the stub gets a one-button hourglass, and the edit takes it away again.
+
+# user id -> (allowed, checked at). Membership does not change by the minute.
+inline_ok_cache: Dict[int, Tuple[bool, float]] = {}
+
+# When each person last summoned him, for INLINE_MAX_PER_MIN.
+inline_calls: Dict[int, Deque[float]] = defaultdict(deque)
+
+# Groups the owner is in and the bot can see. The Bot API cannot list a bot's
+# chats, so this fills in as people talk - and is persisted, so a restart does
+# not lock everyone but you out until somebody happens to write.
+known_groups: set = set()
+
+inline_offered = 0
+inline_sent = 0
+
+
+def may_use_inline(user_id: Optional[int]) -> bool:
+    """Is this person allowed to summon him?"""
+    if not user_id:
+        return False
+    if not OWNER_ID or user_id == OWNER_ID or INLINE_ACCESS == "all":
+        return True
+    if INLINE_ACCESS == "owner":
+        return False
+
+    cached = inline_ok_cache.get(user_id)
+    if cached and time.time() - cached[1] < 3600:
+        return cached[0]
+
+    # "shared": are they in any room I am in? First hit wins, so this is
+    # normally one API call, and the verdict is cached for an hour - the rest
+    # of the keystrokes cost nothing.
+    ok = False
+    for chat_id in list(known_groups):
+        res = tg("getChatMember", chat_id=chat_id, user_id=user_id)
+        if res and res.get("status") not in ("left", "kicked"):
+            ok = True
+            break
+    inline_ok_cache[user_id] = (ok, time.time())
+    log.info("inline: %s %s (shares a group with you: %s)", user_id,
+             "allowed" if ok else "turned away", ok)
+    return ok
+
+
+def answer_nothing(query_id: str, note: str, seconds: int = 0) -> None:
+    """An empty result with a line explaining why - better than a silent bot."""
+    tg("answerInlineQuery", inline_query_id=query_id, results=[],
+       cache_time=seconds, is_personal=True,
+       button={"text": note, "start_parameter": "inline"})
+
+
+def handle_inline_query(q: dict) -> None:
+    """Instant and free. Nothing is generated until the message is actually sent."""
+    query_id = q.get("id")
+    sender = q.get("from") or {}
+    user_id = sender.get("id")
+    text = (q.get("query") or "").strip()
+
+    if not text:
+        return answer_nothing(query_id, "Напиши, на что ответить")
+    if not may_use_inline(user_id) or user_id in IGNORE_USER_IDS:
+        return answer_nothing(query_id, "This bot is private.", 300)
+
+    global inline_offered
+    inline_offered += 1
+    tg(
+        "answerInlineQuery",
+        inline_query_id=query_id,
+        cache_time=0,
+        is_personal=True,
+        results=[{
+            "type": "article",
+            "id": hashlib.md5(text.encode("utf-8")).hexdigest(),
+            "title": "Ответить",
+            "description": text[:120],
+            "input_message_content": {"message_text": INLINE_PLACEHOLDER},
+            # Required: without a keyboard Telegram reports neither the choice
+            # nor the inline_message_id, and the stub could never be filled in.
+            "reply_markup": {"inline_keyboard": [[
+                {"text": "⏳", "callback_data": "wait"}]]},
+        }],
+    )
+
+
+def handle_chosen_inline_result(chosen: dict) -> None:
+    """Sent. Now the model runs and the posted stub becomes the reply."""
+    global inline_sent
+    inline_sent += 1
+
+    inline_message_id = chosen.get("inline_message_id")
+    text = (chosen.get("query") or "").strip()
+    user_id = (chosen.get("from") or {}).get("id")
+
+    if not may_use_inline(user_id) or user_id in IGNORE_USER_IDS:
+        return
+    if not inline_message_id:
+        log.warning("chosen inline result without inline_message_id - the result "
+                    "was built without a keyboard, so it cannot be filled in")
+        return
+    if not rate_ok(inline_calls, user_id, INLINE_MAX_PER_MIN):
+        log.info("inline: %s is over %d/min", user_id, INLINE_MAX_PER_MIN)
+        tg("editMessageText", inline_message_id=inline_message_id,
+           text="Слишком часто. Подожди минуту.")
+        return
+
+    log.info("inline from %s: %r", user_id, text[:60])
+    started = time.time()
+    # Same rules as a room he actually sits in: he takes two or three sentences
+    # and gives as good as he gets - minus the parts that assume he can see it.
+    # The one place with a real cap: an inline message is edited in place, so
+    # it cannot be split across several messages the way sendMessage is.
+    answer = ask_ai(INLINE_KEY, text[:MAX_INPUT_CHARS], INLINE_NOTE, fast=True,
+                    room=True, max_chars=TELEGRAM_MAX_CHARS - 96)
+
+    if not answer:
+        log.warning("  -> nothing came back")
+        # Never leave an ellipsis sitting in somebody else's chat.
+        tg("editMessageText", inline_message_id=inline_message_id,
+           text="Не сейчас.")
+        return
+
+    if tg("editMessageText", inline_message_id=inline_message_id, text=answer) is None:
+        log.warning("  -> could not fill in the message")
+        return
+    log.info("  -> inline answer in %.1fs: %r", time.time() - started, answer[:60])
+
+
+def dispatch_inline_choice(chosen: dict) -> None:
+    def run() -> None:
+        try:
+            handle_chosen_inline_result(chosen)
+        except Exception:
+            log.exception("error answering an inline query")
+
+    run_off_poll_loop(run)
+
+
+_inline_feedback_warned = False
+
+
+def warn_if_inline_feedback_off() -> None:
+    """The one inline setting the API will not report.
+
+    /setinlinefeedback controls whether Telegram says which result was picked.
+    With it off the stub is posted and nothing ever fills it in - and there is
+    no error anywhere, because from the bot's side nothing happened. Offering a
+    pile of results and never being told one was sent is the symptom.
+    """
+    global _inline_feedback_warned
+    if _inline_feedback_warned or inline_sent or inline_offered < 5:
+        return
+    _inline_feedback_warned = True
+    log.warning(
+        "offered %d inline replies and Telegram never said one was sent. If the "
+        "message in the chat is stuck on '%s', inline feedback is off: "
+        "@BotFather -> /setinlinefeedback -> @%s -> Enabled.",
+        inline_offered, INLINE_PLACEHOLDER, BOT_USERNAME,
+    )
+
+
 def handle_update(update: dict) -> None:
+    if "inline_query" in update:
+        if INLINE_ENABLED:
+            handle_inline_query(update["inline_query"])
+        return
+    if "chosen_inline_result" in update:
+        if INLINE_ENABLED:
+            dispatch_inline_choice(update["chosen_inline_result"])
+        return
+    if "callback_query" in update:
+        # The hourglass on a stub that is still being filled in. Acknowledge it
+        # so the sender's client stops spinning.
+        tg("answerCallbackQuery", callback_query_id=update["callback_query"].get("id"),
+           text="Секунду.")
+        return
     if "business_connection" in update:
         remember_connection(update["business_connection"])
         return
@@ -2112,7 +2519,7 @@ def handle_update(update: dict) -> None:
                 tg("sendMessage", chat_id=chat_id, text="The check itself broke - see the log.")
 
         # Probing five providers can take a minute; never block the poll loop.
-        EXECUTOR.submit(run_check) if ASYNC_REPLIES else run_check()
+        run_off_poll_loop(run_check)
     elif text.startswith("/status"):
         tg("sendMessage", chat_id=msg["chat"]["id"], text=status_report())
     elif text.startswith("/start"):
@@ -2121,7 +2528,11 @@ def handle_update(update: dict) -> None:
             chat_id=msg["chat"]["id"],
             text=(
                 "I'm alive. Connect me under Settings -> Telegram Business -> "
-                "Chatbots and I'll answer your customers for you.\n\n"
+                "Chatbots and I'll answer your chats for you.\n\n"
+                f"In any other chat - even one I'm not in - type "
+                f"'@{BOT_USERNAME} ' and the line you want answered. The reply "
+                "appears above the input box; tap it to send it as your own "
+                "message.\n\n"
                 "/status - what I currently know\n"
                 "/check  - test every AI provider key"
             ),
@@ -2164,6 +2575,12 @@ ALLOWED_UPDATES = [
     "business_message",
     "edited_business_message",
     "deleted_business_messages",
+    # Inline mode. chosen_inline_result is what makes it work at all - it only
+    # arrives if inline feedback is on in BotFather, which is why the bot
+    # watches for its absence at runtime.
+    "inline_query",
+    "chosen_inline_result",
+    "callback_query",
 ]
 
 
@@ -2225,6 +2642,41 @@ def main() -> None:
         else:
             log.info("privacy mode off - all group messages are visible")
 
+    if INLINE_ENABLED:
+        if INLINE_ACCESS not in ("owner", "shared", "all"):
+            log.warning("INLINE_ACCESS=%r is not owner|shared|all - treating it "
+                        "as 'owner'", INLINE_ACCESS)
+        # An allowlist is a definitive answer to "which groups are yours", so
+        # strangers can be judged against it from the first second. Anything
+        # learned in an earlier run is remembered too, so a restart does not
+        # lock everyone but you out.
+        known_groups.update(GROUP_ALLOWLIST)
+        load_known_groups()
+        if me.get("supports_inline_queries"):
+            log.info(
+                "inline mode on (access: %s) - type '@%s ...' in ANY chat, even "
+                "one this bot was never added to", INLINE_ACCESS, BOT_USERNAME,
+            )
+            if INLINE_ACCESS == "shared" and not known_groups:
+                log.info(
+                    "  no groups known yet, so only you can use it inline until "
+                    "somebody writes in one of your groups (or set "
+                    "GROUP_ALLOWLIST to name them up front)"
+                )
+            elif INLINE_ACCESS == "all":
+                log.warning(
+                    "  INLINE_ACCESS=all: anyone who knows @%s can spend your "
+                    "quota, capped only by INLINE_MAX_PER_MIN=%d per person",
+                    BOT_USERNAME, INLINE_MAX_PER_MIN,
+                )
+        else:
+            log.warning(
+                "INLINE MODE IS OFF: typing '@%s ...' in another chat will find "
+                "nothing. Fix: @BotFather -> /setinline -> @%s -> send a "
+                "placeholder line like 'что ответить...'.",
+                BOT_USERNAME, BOT_USERNAME,
+            )
+
     if any(p.name == "gemini" for p in PROVIDERS):
         pick_working_model()
     build_ladder()
@@ -2262,6 +2714,8 @@ def main() -> None:
                 handle_update(update)
             except Exception:
                 log.exception("error handling update %s", update.get("update_id"))
+        if INLINE_ENABLED:
+            warn_if_inline_feedback_off()
 
 
 if __name__ == "__main__":

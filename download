@@ -6,3 +6,5 @@ __pycache__/
 .env.local
 history.json
 history.json.tmp
+groups.json
+groups.json.tmp

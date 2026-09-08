@@ -124,6 +124,23 @@ the next-cleverest one anywhere. A model that answers 404/402/410 is retired for
 the session. As limits reset the ladder climbs back up on its own. `/status`
 prints it with the dead and resting rungs marked.
 
+**Slow models sink — but only where it matters.** The bot times every reply and
+keeps a rolling average per rung. In a group it asks for speed: a rung that
+takes longer than `SLOW_SECONDS` (8) is pushed far down, because a brilliant
+line delivered forty seconds late arrives after the conversation moved on. In a
+1:1 chat it asks for quality: the bot is faking a reading-and-typing pause
+anyway, so a slow model costs nothing there and keeps its place. The same 550B
+model can therefore be first in your DMs and last in a group.
+
+```
+-> openrouter/nvidia/nemotron-3-ultra-550b:free took 30s;
+   it drops down the ladder for groups
+```
+
+Size alone is not treated as quality, either: past ~120B the extra parameters
+buy little for a two-line chat reply and cost a lot of queueing on a free tier,
+so the curve flattens and then turns down.
+
 The group judge walks the *same* ladder from the cheap end: a yes/no verdict
 does not need the good model, and this keeps the clever rungs free for actual
 replies.
@@ -359,6 +376,147 @@ appears in the log as `group -1001234...` the first time anyone writes).
 
 ---
 
+## Step 6c — Inline: call him into a chat he is not in (optional)
+
+Business mode covers your own 1:1 chats. Group mode covers rooms he was added
+to. Inline mode covers everything else: **any** chat — a group he was never
+added to, a channel, someone else's DM, a chat where adding bots is not allowed.
+
+Type his name and the line you want answered, and send it:
+
+```
+@yourbot ну и что ты на это скажешь
+```
+
+The message goes out **as your own** (with a small "via @yourbot" label), shows
+`…` for a second, and fills in with the reply. Typing costs nothing — the model
+runs once, at the moment you send.
+
+### Two settings in @BotFather, and it needs both
+
+| Command | Answer |
+|---|---|
+| `/setinline` | pick your bot, then send a placeholder line, e.g. `что ответить...` |
+| `/setinlinefeedback` | pick your bot, then **Enabled** |
+
+The second one is the one everybody misses. Without it Telegram never reports
+that the message was sent, so the `…` is posted and simply stays there — no
+error in the log, no error on your phone, nothing. The bot watches for exactly
+that pattern:
+
+```
+offered 9 inline replies and Telegram never said one was sent. If the message
+in the chat is stuck on '…', inline feedback is off:
+@BotFather -> /setinlinefeedback -> @yourbot -> Enabled.
+```
+
+Whether inline mode itself is on *is* readable from the API, so that is checked
+at startup:
+
+```
+inline mode on (access: shared) - type '@yourbot ...' in ANY chat, even one
+this bot was never added to
+```
+
+### Why "send first, answer after"
+
+The alternative is to have the reply ready before you tap it — which means
+generating while you type. Telegram re-queries the bot on **every keystroke**,
+so that costs a request per letter unless you bolt on debouncing and a cache,
+and it still has to finish inside Telegram's ~10-second answer window.
+
+Sending first removes all of it. Typing is free; the model runs exactly once
+per message you actually send; there is no window to race. The price is the
+`…` for a second and the `/setinlinefeedback` switch above.
+
+### Who may use it
+
+`INLINE_ACCESS`:
+
+| Value | Who |
+|---|---|
+| `owner` | only you |
+| `shared` *(default)* | you, plus anyone who is in one of the groups you are in |
+| `all` | anybody who knows the username |
+
+**A limit worth knowing:** Telegram never tells a bot *which chat* an inline
+query came from. The update carries the sender, the text, and a coarse
+`chat_type` — no chat id, by design. So "only in chats I am in" cannot be
+enforced against the chat. It can be enforced against the person, which is the
+same guarantee from the other end: under `shared`, someone who shares no room
+with you gets an empty result and costs you nothing. The verdict is cached for
+an hour, so it is one `getChatMember` call per person, not per keystroke.
+
+The list of your groups is learned as people talk in them — the Bot API has no
+way to ask "which chats is this bot in" — and it is **stored**, in Redis when
+that is configured and in `GROUPS_FILE` otherwise, so a restart does not lock
+everyone but you out. `GROUP_ALLOWLIST` seeds it outright. `/status` shows the
+count.
+
+`INLINE_MAX_PER_MIN` (6) caps each person, so an open bot cannot be drained.
+
+### What he can and cannot see
+
+He gets **only the text you typed after his name**. Inline queries carry no
+history, no chat id, not even the name of the chat, so paste in the line you
+want answered rather than expecting him to catch up. He is told he was not
+there and must not pretend otherwise.
+
+There is deliberately **no memory** between inline calls: with no chat id to
+key it on, any memory would be shared across every chat he is summoned into and
+would leak one conversation into the next.
+
+Otherwise he plays by the room rules — see the next section.
+
+---
+
+## Step 6d — One line or three: where the rules differ
+
+The persona is written for a **1:1 chat**, because that is the risky case:
+
+> Answer in ONE line. One sentence, occasionally two short ones.
+> […] you take the remark apart and not the person: whoever is writing may be
+> a customer, and a customer you insulted is a customer lost.
+
+That is the DM behaviour: short, dry, and it never insults the person back.
+
+A **room** — a group he was added to, or an inline summon — overrides both of
+those, because a room is not a support desk:
+
+> LENGTH — THERE IS NO LIMIT HERE
+> Write as much as you want. One word, one line, or five paragraphs of a rant
+> that has been building for years: whatever the subject actually deserves.
+>
+> TRADING INSULTS — THIS OVERRIDES THE ONE-TO-ONE RULE ABOVE
+> These are people who know each other, not a customer chat. If someone comes
+> at you, you give as good as you get […]
+
+**Nothing is truncated anywhere any more.** `REPLY_MAX_CHARS` and
+`ROOM_MAX_CHARS` are both `0`, and `MAX_OUTPUT_TOKENS` is `4096` — length is the
+prompt's business, and cutting at a character count only ever chopped somebody
+off mid-sentence, which reads as a bug rather than as a short answer. Anything
+past Telegram's 4096-character message limit is split across several messages.
+
+That is why your DMs stay short but are no longer *capped*: the persona asks for
+one line, and on the rare occasion he ignores it, the whole thing arrives
+instead of the first 1200 characters. The one real cap left is inline, where the
+reply is edited into a message that already exists and so cannot be split.
+
+What he still may not do in a room is *format* like a machine: no lists, no
+bullet points, no headings, no bold, no emoji. That is about looking like a
+person typing in a chat, not about length.
+
+Both places share the same hard limits: nothing about ethnicity, nationality,
+religion, gender, sexuality, disability, illness or family; no threats; nothing
+sexual; no piling on someone already being dogpiled. He never starts it, gives
+one line back per jab, and drops it the moment someone is actually upset.
+
+So: **one line and no comebacks in your DMs; any length and full comebacks in
+groups and inline.** In the code that is `DEFAULT_PERSONA` versus `ROOM_RULES`,
+which `GROUP_NOTE` and `INLINE_NOTE` both append.
+
+---
+
 ## Step 7 — Make it sound like you
 
 Everything lives in the `PERSONA` env variable. Leave it unset for the built-in
@@ -497,6 +655,10 @@ came through, it stays quiet.
 | Bot doesn't appear in the Chatbots list | Secretary Mode is off in @BotFather (step 2) |
 | Bot can read but replies silently fail | Telegram limits some actions to private chats with a *recent* incoming message — send it a fresh one |
 | `no reply rights` in the log | "Reply to messages" toggle off in Telegram Business settings |
+| Typing `@yourbot ...` in a chat finds nothing | Inline mode is off — `/setinline` in @BotFather (step 6c) |
+| The inline message is posted but stays on `…` forever | Inline feedback is off — `/setinlinefeedback` → Enabled (step 6c) |
+| Inline result is empty, with a "This bot is private." button | `INLINE_ACCESS=shared` and that person shares no known group with you — `/status` shows how many groups are known |
+| Inline works for you but not for anyone else | No groups known yet. Let someone write in one of yours, or set `GROUP_ALLOWLIST` |
 | No `business_message` updates at all | Chat is excluded in the Chatbots screen, or account has no Premium |
 | `gemini 404` | Model name not available to your key — run `list_models.py` |
 | Log stops at `-> answering...`, no reply | Gemini call hanging or starved. Check `MAX_OUTPUT_TOKENS` ≥ 1024 and `GEMINI_THINKING_LEVEL=low` |
