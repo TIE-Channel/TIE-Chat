@@ -634,9 +634,7 @@ math (`INLINE_FORMAT`, on).
 The question keeps its place above the answer, now as a Markdown quote:
 
 ```markdown
->**Дмитрий**
->
->сколько стоит торт
+>**Дмитрий**<br>сколько стоит торт
 
 ## Прайс
 
@@ -645,14 +643,23 @@ The question keeps its place above the answer, now as a Markdown quote:
 | торт | 5000 |
 ```
 
-**That lone `>` is not a blank line and must not be tidied away.** Inside a
-quote, two lines written one under the other are *one paragraph*, and Markdown
-renders the break between them as a space — the name came out on the same line
-as the question. A `>` on its own is what actually ends the line; Telegram's
-own reference spells it out, a `>` line means "continued on the next line" and
-no `>` line means "continued on the same line". The empty line before the
-answer is the same kind of thing: without it the answer is swallowed into the
-quote as a lazy continuation. Neither renders as vertical space.
+**The `<br>` is load-bearing and must not become a newline.** Getting a plain
+line break inside a Markdown quote takes three attempts to get right:
+
+| written as | what you get |
+|---|---|
+| two lines under each other | *one line* — they are one paragraph, and the break renders as a space |
+| a lone `>` line between them | two lines, but a **new paragraph**: they sit a gap apart |
+| `<br>` between them | a plain line break, which is what the HTML version always gave |
+
+Telegram documents `<br>` inside `<blockquote>` in its rich **HTML** style, and
+rich Markdown parses HTML tags for exactly the things Markdown cannot express.
+`INLINE_HEADER_BREAK=paragraph` switches back to the lone `>` if `<br>` ever
+shows up as literal text.
+
+The empty line before the answer is a different thing and also required:
+without it the answer is swallowed into the quote as a lazy continuation. It is
+a block separator and renders as no vertical space at all.
 
 **The name and the question are escaped, the answer is not.** Their words are
 shown as their words — a `*` in the question stays a `*` — while the answer is

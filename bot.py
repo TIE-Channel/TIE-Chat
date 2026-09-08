@@ -195,6 +195,22 @@ INLINE_FORMAT = os.environ.get("INLINE_FORMAT", "true").strip().lower() not in (
     "0", "false", "no",
 )
 
+# How the name is separated from the question inside the quote.
+#
+#   br         "<br>" - a plain line break, the same thing the HTML version
+#              gives. Telegram documents <br> inside <blockquote> in its rich
+#              HTML style, and rich Markdown parses HTML tags for exactly the
+#              things Markdown cannot express - a hard break being one of them.
+#   paragraph  a lone ">" line. Correct Markdown, but it starts a new
+#              PARAGRAPH inside the quote, so it renders with a gap.
+#
+# There is no third option worth having: two lines written one under the other
+# are a single paragraph, and the break between them renders as a space, which
+# is what put the name and the question on the same line to begin with.
+#
+# Switch to "paragraph" if "<br>" ever shows up as literal text.
+INLINE_HEADER_BREAK = os.environ.get("INLINE_HEADER_BREAK", "br").strip().lower()
+
 # How long an inline answer may be. It shares one message with the question,
 # and until rich messages that message was capped at 4096 - now the ceiling is
 # 32768, but a wall of text posted into someone else's chat is still rude, so
@@ -3719,29 +3735,31 @@ def md_escape(text: str) -> str:
 def format_inline_markdown(name: str, question: str, body: str) -> str:
     """The same shape as the HTML version, in Markdown Telegram parses itself.
 
-        >**Дмитрий**
-        >
-        >ну и что ты на это скажешь
+        >**Дмитрий**<br>ну и что ты на это скажешь
 
         Скажу, что вопрос звучит как приглашение на драку.
 
-    THE LONE ">" IS NOT A BLANK LINE - DO NOT TIDY IT AWAY. Inside a quote,
-    two lines written one under the other are one paragraph, and Markdown
-    renders the break between them as a space: the name and the question came
-    out on the same line. A ">" on its own is what actually ends the line.
-    Telegram's own reference spells this out - a ">" line means "continued on
-    the next line", and no ">" line means "continued on the same line".
+    THE "<br>" IS LORD-BEARING - DO NOT REPLACE IT WITH A NEWLINE. Inside a
+    quote, two lines written one under the other are a single paragraph, and
+    Markdown renders the break between them as a SPACE: the name and the
+    question came out on the same line. A lone ">" line does break them, but
+    it starts a new paragraph, so they end up a gap apart instead. "<br>" is
+    the one that gives a plain line break, and Telegram documents it inside
+    <blockquote> in its rich HTML style.
 
-    The empty line before the answer is the same kind of thing: without it the
-    answer is swallowed into the quote as a lazy continuation. Neither renders
-    as vertical space; both are block separators.
+    The empty line before the answer is a different thing and also required:
+    without it the answer is swallowed into the quote as a lazy continuation.
+    It is a block separator and renders as no vertical space at all.
 
-    Only the name and the question are escaped. The answer is the one part
-    that is MEANT to be markup - that is the whole point of doing this.
+    Only the name and the question are escaped, and the tag is added after
+    escaping so it survives. The answer is the one part that is MEANT to be
+    markup - that is the whole point of doing this.
     """
     lines = [f"**{md_escape(name)}**"] + md_escape(question).split("\n")
-    # Every line of the question keeps its own break, for the same reason.
-    quoted = "\n>\n".join(">" + line for line in lines)
+    if INLINE_HEADER_BREAK == "paragraph":
+        quoted = "\n>\n".join(">" + line for line in lines)
+    else:
+        quoted = ">" + "<br>".join(lines)
     return f"{quoted}\n\n{body}"
 
 
