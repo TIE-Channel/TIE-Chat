@@ -388,8 +388,9 @@ symptom to recognise.
    one was missing the answer went to General. Telegram is the only authority
    on whether a thread id is usable, so the bot sends it and lets `sendMessage`
    refuse — on a thread error it re-sends without it rather than losing the
-   answer. Only private chats are excluded, where the field means something
-   else.
+   answer. **Private chats included**: the bot's own chat has threads too, and
+   the API says so in as many words (`message_thread_id` is "for supergroups
+   and private chats only"). Excluding them was the third version of this bug.
 
 2. **In a topic, the answer is a reply to the message that summoned him**
    (`GROUP_QUOTE_IN_TOPICS`, on by default). A reply is anchored to a message,
@@ -697,14 +698,21 @@ date, no "answer in one line" — which is the same treatment as the inline
 so this is a plain assistant sitting in Telegram while Ilya keeps answering
 your customers.
 
-It is a conversation, not a series of one-shots: the thread is kept under its
-own history key (`dm:<chat id>`), capped by `HISTORY_TURNS`, so *"а покороче?"*
-has something to refer back to. It never touches a customer chat or a group.
+It is a conversation, not a series of one-shots: the transcript is kept under
+its own history key, capped by `HISTORY_TURNS`, so *"а покороче?"* has
+something to refer back to. It never touches a customer chat or a group.
+
+**Threads in this chat are separate conversations.** Telegram lets a chat with
+a bot hold several threads, and each gets its own key (`dm:<chat>:<thread>`):
+start a new thread and you start clean, go back to an old one and it remembers
+where you left off. Every reply — answers and command output alike — goes back
+into the thread it was asked in, and `/reset` empties only that thread. A chat
+with no threads behaves exactly as before, under `dm:<chat>`.
 
 | you type | what happens |
 |---|---|
 | anything that is not a command | goes to the model bare, answer comes back |
-| `/reset` | forgets this thread, nothing else |
+| `/reset` | forgets the thread you are in, nothing else |
 | `/status` | ladder, judge order, what Telegram has delivered |
 | `/check` | one real request to every provider key |
 

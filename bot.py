@@ -1071,14 +1071,17 @@ def thread_of(msg: dict) -> Optional[int]:
     rule is now: if the message carries one, use it, and let sendMessage refuse
     it if it cannot be used - send_reply then re-sends without it.
 
-    Only private chats are excluded outright: a 1:1 chat has no threads to
-    speak of, and the field there means something else entirely.
+    Private chats are NOT excluded, though the first version of this excluded
+    them and got it wrong: the bot's own chat has topics too. The API says so
+    in as many words - message_thread_id is "for supergroups and private chats
+    only", and is_topic_message is "True, if the message is sent to a topic in
+    a forum supergroup or a private chat with the bot". So the same rule holds
+    everywhere: if the message came from a thread, the answer goes back to it.
 
-    The General topic carries no `message_thread_id` at all, so it comes back
-    as None and the reply lands in General - which is where it belongs.
+    A chat with no threads, and the General topic of one that has them, carry
+    no `message_thread_id` at all - so this returns None and the answer lands
+    in the main flow, which is where it belongs.
     """
-    if (msg.get("chat") or {}).get("type") == "private":
-        return None
     return msg.get("message_thread_id") or None
 
 
@@ -1827,8 +1830,12 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
 
+    # thread_of is None in a chat without threads, which is every business
+    # chat today - but the rule is the same everywhere, so if Telegram ever
+    # threads these too, the reply is already going back where it came from.
     if not pace_and_send(connection_id, chat_id, user_text, answer,
-                         msg.get("message_id"), cancel, time.time() - started):
+                         msg.get("message_id"), cancel, time.time() - started,
+                         thread_id=thread_of(msg)):
         return
 
     remember(key, "user", user_text)
@@ -2422,15 +2429,22 @@ def dispatch_business_message(msg: dict) -> None:
     run_off_poll_loop(run)
 
 
-def dm_key(chat_id: int) -> str:
-    """Where this chat's transcript lives.
+def dm_key(chat_id: int, thread_id: Optional[int] = None) -> str:
+    """Where this conversation's transcript lives.
+
+    A thread in the bot's own chat is a separate conversation, exactly as a
+    forum topic is, so it gets its own transcript: start a new thread and you
+    start clean, go back to an old one and it remembers. /reset empties the
+    thread you are in and nothing else.
 
     With memory off it is the shared, permanently empty transcript - the same
     one inline answers use. Nothing is ever written to it, so it stays empty,
     and switching the setting off cannot leave an old thread behind to leak
     into the next question.
     """
-    return f"dm:{chat_id}" if DM_CHAT_MEMORY else INLINE_KEY
+    if not DM_CHAT_MEMORY:
+        return INLINE_KEY
+    return f"dm:{chat_id}" + (f":{thread_id}" if thread_id else "")
 
 
 def handle_owner_dm(msg: dict) -> None:
@@ -2444,9 +2458,11 @@ def handle_owner_dm(msg: dict) -> None:
     """
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or msg.get("caption") or "").strip()
-    key = dm_key(chat_id)
+    thread_id = thread_of(msg)
+    key = dm_key(chat_id, thread_id)
 
-    log.info("dm from you: %r", text[:60])
+    log.info("dm from you%s: %r",
+             f" (thread {thread_id})" if thread_id else "", text[:60])
     started = time.time()
     question = text[:MAX_INPUT_CHARS]
 
@@ -2457,7 +2473,7 @@ def handle_owner_dm(msg: dict) -> None:
         remember(key, "user", question)
         question = None
 
-    with Typing(None, chat_id):
+    with Typing(None, chat_id, thread_id):
         # max_chars=0 on purpose: REPLY_MAX_CHARS is a leash on the persona,
         # and there is no persona here. sendMessage splits anything over
         # Telegram's 4096 into several messages by itself.
@@ -2465,11 +2481,12 @@ def handle_owner_dm(msg: dict) -> None:
 
     if not answer:
         log.warning("  -> nothing came back")
-        tg("sendMessage", chat_id=chat_id,
-           text="Ни одна модель не ответила. /check покажет, что с провайдерами.")
+        send_reply(None, chat_id,
+                   "Ни одна модель не ответила. /check покажет, что с провайдерами.",
+                   None, thread_id=thread_id)
         return
 
-    send_reply(None, chat_id, answer, None)
+    send_reply(None, chat_id, answer, None, thread_id=thread_id)
     if DM_CHAT_MEMORY:
         remember(key, "model", answer)
     log.info("  -> answered in %.1fs: %r", time.time() - started, answer[:60])
@@ -2479,9 +2496,10 @@ def dispatch_owner_dm(msg: dict) -> None:
     """Off the poll loop, one at a time per chat - a model call takes seconds
     and the polling thread must not spend them waiting."""
     chat_id = (msg.get("chat") or {}).get("id")
+    thread_id = thread_of(msg)
 
     def run() -> None:
-        with chat_lock(f"dm:{chat_id}"):
+        with chat_lock(f"dm:{chat_id}" + (f":{thread_id}" if thread_id else "")):
             try:
                 handle_owner_dm(msg)
             except Exception:
@@ -3149,58 +3167,59 @@ def handle_update(update: dict) -> None:
     sender_id = (msg.get("from") or {}).get("id")
     is_owner = not OWNER_ID or sender_id == OWNER_ID
 
+    chat_id = msg["chat"]["id"]
+    # The bot's own chat has threads too. Every line the bot writes here -
+    # answers, command output, the refusal below - goes back into the thread
+    # it was asked in, or it turns up in the main flow where nobody is looking.
+    thread_id = thread_of(msg)
+
+    def say(text_out: str) -> None:
+        send_reply(None, chat_id, text_out, None, thread_id=thread_id)
+
     if not is_owner:
         # Somebody else found the bot. Don't hand them diagnostics.
         log.info("DM from %s (not the owner), turned away", sender_id)
         if text.startswith("/"):
-            tg("sendMessage", chat_id=msg["chat"]["id"],
-               text="This bot is private.")
+            say("This bot is private.")
         return
 
     if text.startswith("/check"):
-        chat_id = msg["chat"]["id"]
-        tg("sendMessage", chat_id=chat_id,
-           text=f"Checking {len(PROVIDERS)} provider(s), one real request each...")
+        say(f"Checking {len(PROVIDERS)} provider(s), one real request each...")
 
         def run_check() -> None:
             try:
-                tg("sendMessage", chat_id=chat_id, text=check_providers())
+                say(check_providers())
             except Exception:
                 log.exception("provider check failed")
-                tg("sendMessage", chat_id=chat_id, text="The check itself broke - see the log.")
+                say("The check itself broke - see the log.")
 
         # Probing five providers can take a minute; never block the poll loop.
         run_off_poll_loop(run_check)
     elif text.startswith("/status"):
-        tg("sendMessage", chat_id=msg["chat"]["id"], text=status_report())
+        say(status_report())
     elif text.startswith("/reset"):
-        key = dm_key(msg["chat"]["id"])
+        key = dm_key(chat_id, thread_id)
         had = len(history[key])
         history[key].clear()
         history_seen[key] = time.time()
         with _history_lock:
             dirty_keys.add(key)
         history_dirty.set()
-        tg("sendMessage", chat_id=msg["chat"]["id"],
-           text=f"Забыл {had} реплик. Дальше с чистого листа."
-                if had else "И так пусто.")
+        say(f"Забыл {had} реплик. Дальше с чистого листа."
+            if had else "И так пусто.")
     elif text.startswith("/start"):
-        tg(
-            "sendMessage",
-            chat_id=msg["chat"]["id"],
-            text=(
-                "I'm alive. Connect me under Settings -> Telegram Business -> "
-                "Chatbots and I'll answer your chats for you.\n\n"
-                f"In any other chat - even one I'm not in - type "
-                f"'@{BOT_USERNAME} ' and the line you want answered. The reply "
-                "appears above the input box; tap it to send it as your own "
-                "message.\n\n"
-                "Write to me here and I'll answer you directly - plain "
-                "assistant, no character.\n\n"
-                "/status - what I currently know\n"
-                "/check  - test every AI provider key\n"
-                "/reset  - forget our conversation here"
-            ),
+        say(
+            "I'm alive. Connect me under Settings -> Telegram Business -> "
+            "Chatbots and I'll answer your chats for you.\n\n"
+            f"In any other chat - even one I'm not in - type "
+            f"'@{BOT_USERNAME} ' and the line you want answered. The reply "
+            "appears above the input box; tap it to send it as your own "
+            "message.\n\n"
+            "Write to me here and I'll answer you directly - plain assistant, "
+            "no character. Each thread in this chat is its own conversation.\n\n"
+            "/status - what I currently know\n"
+            "/check  - test every AI provider key\n"
+            "/reset  - forget this thread"
         )
     elif text and DM_CHAT_ENABLED and not text.startswith("/"):
         # Anything that isn't a command: you are talking to him, so answer.
