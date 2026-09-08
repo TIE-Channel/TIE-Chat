@@ -926,18 +926,29 @@ session.headers["User-Agent"] = "tg-business-ai/1.0"
 # --------------------------------------------------------------------------
 
 
-def tg(method: str, **params: Any) -> Optional[dict]:
-    """Call a Telegram Bot API method. Returns the `result` field or None."""
+def tg_raw(method: str, **params: Any) -> dict:
+    """Call a Telegram Bot API method and hand back the whole envelope.
+
+    Only worth using when the caller has to act on *why* something failed - as
+    the forum-topic fallback in send_reply does. Everything else wants tg().
+    """
     try:
         r = session.post(f"{TELEGRAM_API}/{method}", json=params, timeout=70)
         data = r.json()
     except Exception as exc:  # network hiccup, bad JSON, ...
         log.warning("telegram %s failed: %s", method, exc)
-        return None
+        # Nothing reached Telegram, so no message was posted. Said explicitly
+        # because a caller that retries must know it is not double-posting.
+        return {"ok": False, "description": str(exc), "never_sent": True}
     if not data.get("ok"):
         log.warning("telegram %s error: %s", method, data.get("description"))
-        return None
-    return data.get("result")
+    return data
+
+
+def tg(method: str, **params: Any) -> Optional[dict]:
+    """Call a Telegram Bot API method. Returns the `result` field or None."""
+    data = tg_raw(method, **params)
+    return data.get("result") if data.get("ok") else None
 
 
 def resolve_owner(connection_id: str) -> Optional[int]:
@@ -985,9 +996,11 @@ class Typing:
     so it has to be re-sent on a timer rather than set once.
     """
 
-    def __init__(self, connection_id: Optional[str], chat_id: int) -> None:
+    def __init__(self, connection_id: Optional[str], chat_id: int,
+                 thread_id: Optional[int] = None) -> None:
         self.connection_id = connection_id
         self.chat_id = chat_id
+        self.thread_id = thread_id
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -995,6 +1008,10 @@ class Typing:
         params: Dict[str, Any] = {"chat_id": self.chat_id, "action": "typing"}
         if self.connection_id:
             params["business_connection_id"] = self.connection_id
+        if self.thread_id:
+            # Otherwise "typing..." appears in General while the answer is
+            # being written for a topic.
+            params["message_thread_id"] = self.thread_id
         while True:
             tg("sendChatAction", **params)
             if self._stop.wait(4.0):  # re-arm before Telegram's ~5s timeout
@@ -1027,24 +1044,53 @@ def typing_delay(text: str, already_spent: float) -> float:
     return max(0.0, seconds - already_spent)
 
 
+def thread_of(msg: dict) -> Optional[int]:
+    """The forum topic a message was written in, if it was written in one.
+
+    Both halves matter. `message_thread_id` alone also shows up in ordinary
+    supergroups, where it means "this reply chain" and sendMessage will not
+    take it; `is_topic_message` is what marks a real forum topic. The General
+    topic carries neither, so it comes back as None and the reply lands there,
+    which is exactly right.
+    """
+    return msg.get("message_thread_id") if msg.get("is_topic_message") else None
+
+
 def send_reply(
     connection_id: Optional[str],
     chat_id: int,
     text: str,
     reply_to: Optional[int],
     quote: bool = False,
+    thread_id: Optional[int] = None,
 ) -> None:
     # Telegram hard-limits messages to 4096 characters.
     for chunk in [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]:
         params: Dict[str, Any] = {"chat_id": chat_id, "text": chunk}
         if connection_id:
             params["business_connection_id"] = connection_id
+        # In a forum this is not decoration: without it the answer is posted to
+        # General instead of the topic it belongs to, where nobody who asked is
+        # looking.
+        if thread_id:
+            params["message_thread_id"] = thread_id
         # Off by default in 1:1 chats - a person answering their own chat just
         # writes back. In a group, quoting is how anyone knows who you mean.
         if reply_to and (QUOTE_REPLIES or quote):
             params["reply_parameters"] = {"message_id": reply_to}
             reply_to = None  # only the first chunk quotes
-        tg("sendMessage", **params)
+
+        data = tg_raw("sendMessage", **params)
+        if data.get("ok") or not thread_id:
+            continue
+        # The topic was closed or deleted while we were composing. Nothing was
+        # posted, so re-sending is safe - and General beats losing the answer.
+        if "thread" in str(data.get("description") or "").lower():
+            log.warning("  -> topic %s is gone, posting to General instead",
+                        thread_id)
+            params.pop("message_thread_id")
+            thread_id = None
+            tg("sendMessage", **params)
 
 
 def pace_and_send(
@@ -1056,6 +1102,7 @@ def pace_and_send(
     cancel: threading.Event,
     spent: float,
     quote: bool = False,
+    thread_id: Optional[int] = None,
 ) -> bool:
     """Wait like a person would, then send - unless the reply gets called off."""
     if cancel.is_set():
@@ -1067,13 +1114,14 @@ def pace_and_send(
     if not wait_unless_cancelled(cancel, pause):
         return False
 
-    with Typing(connection_id, chat_id):
+    with Typing(connection_id, chat_id, thread_id):
         pause = typing_delay(answer, 0.0)
         log.info("  -> typing %.1fs for %d chars", pause, len(answer))
         if not wait_unless_cancelled(cancel, pause):
             return False
 
-    send_reply(connection_id, chat_id, answer, reply_to, quote=quote)
+    send_reply(connection_id, chat_id, answer, reply_to, quote=quote,
+               thread_id=thread_id)
     log.info("  -> replied: %r", answer[:60])
     return True
 
@@ -1987,7 +2035,14 @@ def judge_model() -> str:
 
 
 def judge_budget_ok(key: str) -> bool:
-    return rate_ok(judge_calls, key, GROUP_JUDGE_MAX_PER_MIN)
+    """The budget is per CHAT, not per topic.
+
+    Transcripts are split by forum topic, but the quota it protects is not:
+    a forum with ten busy topics would otherwise be ten times the judge calls
+    per minute, on a free tier that has one limit for all of them.
+    """
+    return rate_ok(judge_calls, key.split(":", 2)[1] if ":" in key else key,
+                   GROUP_JUDGE_MAX_PER_MIN)
 
 
 def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) -> Optional[str]:
@@ -2213,7 +2268,14 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
     # can use the bot inline without a single membership call.
     allow_inline_for(sender.get("id"), chat_id)
 
-    key = f"group:{chat_id}"
+    # A forum topic is its own room: separate people, separate subject, and a
+    # reply belongs in the topic it was asked in. So it gets its own transcript
+    # - otherwise the judge reads three unrelated conversations as one and the
+    # answers cite whatever was said in a topic nobody here is reading. An
+    # ordinary group, and the General topic, are unchanged: thread_id is None
+    # and the key stays "group:<chat>".
+    thread_id = thread_of(msg)
+    key = f"group:{chat_id}" + (f":{thread_id}" if thread_id else "")
 
     # Strip our own @mention so the model doesn't answer its own username.
     clean = text
@@ -2229,7 +2291,9 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
         log.debug("  -> nothing here for him to answer")
         return
 
-    log.info("group %s | %s: %r  (%s)", chat_id, display_name(sender), clean[:60], reason)
+    log.info("group %s%s | %s: %r  (%s)", chat_id,
+             f" topic {thread_id}" if thread_id else "",
+             display_name(sender), clean[:60], reason)
 
     if REPLY_COOLDOWN and time.time() - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
         log.info("  -> ignored: within REPLY_COOLDOWN")
@@ -2246,10 +2310,10 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
     # 25-second pause just means the conversation has moved on without you.
     if GROUP_DELAY:
         if not pace_and_send(None, chat_id, clean, answer, None,
-                             cancel, time.time() - started):
+                             cancel, time.time() - started, thread_id=thread_id):
             return
     else:
-        send_reply(None, chat_id, answer, None)
+        send_reply(None, chat_id, answer, None, thread_id=thread_id)
         log.info("  -> replied: %r", answer[:60])
 
     remember(key, "model", answer)
@@ -2267,7 +2331,10 @@ def dispatch_group_message(msg: dict) -> None:
     default so that two people addressing him at once both get an answer.
     """
     chat = msg.get("chat") or {}
-    key = f"group:{chat.get('id')}"
+    # Per topic, like the transcript: two topics are two conversations and
+    # neither should wait on the other's model call.
+    thread_id = thread_of(msg)
+    key = f"group:{chat.get('id')}" + (f":{thread_id}" if thread_id else "")
 
     def run() -> None:
         with chat_lock(key):

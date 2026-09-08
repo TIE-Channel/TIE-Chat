@@ -373,6 +373,32 @@ reserved, never chatty.
 It remembers the whole conversation either way, so when you do call on it, it
 knows what was being discussed. Each line it sees is labelled with who said it.
 
+### Forum groups (topics)
+
+If the group has **Topics** turned on, every reply carries the
+`message_thread_id` of the topic it was asked in. Without it Telegram files the
+answer under **General**, where nobody who asked is looking — that is the
+symptom to recognise.
+
+Two rules keep it honest. The bot only sends the field when the incoming
+message is genuinely a topic message (`is_topic_message`), because
+`message_thread_id` also appears in ordinary supergroups meaning "this reply
+chain", and `sendMessage` refuses it there. And if the topic was closed or
+deleted while the answer was being written, Telegram says so, the bot posts to
+General rather than losing the answer, and the log says why.
+
+**Each topic is its own room.** The transcript key becomes
+`group:<chat>:<topic>`, so the judge reads one conversation instead of three
+unrelated ones and the answers stop citing a topic nobody in this one is
+reading. The cooldowns and the chat lock follow the same split, so a slow
+answer in one topic no longer holds up another. The one thing deliberately
+**not** split is the judge budget: `GROUP_JUDGE_MAX_PER_MIN` is counted per
+chat, because a forum with ten busy topics would otherwise be ten times the
+calls against one free-tier limit.
+
+Ordinary groups and the General topic are unchanged — no field, and the old
+`group:<chat>` key.
+
 ### Privacy mode — required for keywords
 
 By default Telegram delivers **only** commands, `@mentions` and replies-to-the-bot
@@ -822,6 +848,7 @@ came through, it stays quiet.
 | Log stops at `-> answering...`, no reply | Gemini call hanging or starved. Check `MAX_OUTPUT_TOKENS` ≥ 1024 and `GEMINI_THINKING_LEVEL=low` |
 | `gemini 200 … but no text (finishReason=MAX_TOKENS)` | Thinking ate the whole budget. The bot retries automatically; raise `MAX_OUTPUT_TOKENS` if it persists |
 | `gemini 429`, replies slow or missing | Free-tier quota, counted **per model**. The bot now switches to a lighter model at once and returns to the primary after `FALLBACK_MINUTES`. If it happens constantly, set `GEMINI_MODEL=gemini-3.5-flash-lite` — lite tiers have far more headroom |
+| In a forum group the answers land in **General**, not in the topic | Fixed — replies now carry `message_thread_id`. If you still see it, the bot is running an older `bot.py`: check the log for `group <id> topic <n>` on an incoming message. |
 | Duplicate replies | Two copies of the bot running on one token |
 | Render: "no open ports detected" | Instance type or start command wrong — it must be a Web Service running `python bot.py` |
 | Render: bot answers, then goes quiet after ~15 min | Free Web Service spun down. Add an uptime pinger |
