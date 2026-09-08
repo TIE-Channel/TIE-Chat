@@ -440,15 +440,36 @@ was answering is gone from the chat and the reply reads like a non sequitur to
 everyone else. The question is therefore carried inside the message:
 
 ```
-Дмитрий:
+│ Дмитрий
 │ ну и что ты на это скажешь
-AI:
-│ Скажу, что вопрос звучит как приглашение на драку.
+Скажу, что вопрос звучит как приглашение на драку.
 ```
 
-Both labels bold, both texts in real Telegram quote blocks — the two halves are
-the same kind of thing, so they look the same. No blank lines: the quote blocks
-supply the separation on their own.
+The name is bold and lives *inside* the quote with the question — they are one
+utterance, and splitting them across two blocks made the message look like a
+form. The answer sits plainly underneath: it is the part being read, so nothing
+decorates it and nothing labels it as coming from a machine.
+
+**There is no font size in Telegram bot messages.** No markup makes the letters
+bigger; the only thing that renders large is a message of nothing but emoji. So
+`INLINE_BLOCK` changes how much a block *stands out*, not how big it is:
+
+| Value | What it looks like |
+|---|---|
+| `quote` *(default)* | quote block with a vertical bar |
+| `expandable` | the same, collapsed behind "show more" past a few lines — good when answers run long |
+| `pre` | a code panel: filled background, monospace, copy button. The heaviest-looking option, but monospace Cyrillic reads oddly and the copy button is noise |
+| `bold` | no block, just heavier text — the closest thing to "bigger" |
+| `plain` | nothing |
+
+`INLINE_BLOCK_ANSWER` is `plain` by default — the answer gets no block at all.
+Set it to any of the values above to set it off too. The character budget
+adapts to whichever tags the chosen styles use.
+
+**Em dashes become hyphens** everywhere — all three modes. Models reach for `—`
+constantly and almost nobody types one on a phone, so it is one of the surest
+tells that a machine wrote the line. Handled in `plain_dashes()`, which also
+covers en, figure and horizontal dashes and the minus sign.
 
 The name is taken from whoever *asked*, not whoever taps the button (anyone in
 the chat can press it), with the first letter capitalised and the rest

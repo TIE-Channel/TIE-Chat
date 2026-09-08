@@ -128,8 +128,20 @@ INLINE_PLACEHOLDER = os.environ.get("INLINE_PLACEHOLDER", "…")
 INLINE_SHOW_QUESTION = os.environ.get(
     "INLINE_SHOW_QUESTION", "true").strip().lower() not in ("0", "false", "no")
 
-# What the bot's own line is labelled with.
-INLINE_AI_LABEL = os.environ.get("INLINE_AI_LABEL", "AI")
+# How each half is set off. Telegram has NO font size for bot messages - none
+# of these makes the letters bigger, they only change how much the block
+# stands out:
+#   quote       a quote block with a vertical bar (the default)
+#   expandable  the same, collapsed behind "show more" past a few lines
+#   pre         a code panel: filled background, monospace, copy button. The
+#               heaviest-looking option, but monospace Cyrillic reads oddly
+#   bold        no block at all, just heavier text
+#   plain       nothing
+INLINE_BLOCK = os.environ.get("INLINE_BLOCK", "quote").strip().lower()
+
+# The answer sits plainly under the quoted question. Same values as
+# INLINE_BLOCK if you would rather set it off too.
+INLINE_BLOCK_ANSWER = os.environ.get("INLINE_BLOCK_ANSWER", "plain").strip().lower()
 
 # Per-person ceiling, so an open inline bot cannot be drained in a minute.
 INLINE_MAX_PER_MIN = int(os.environ.get("INLINE_MAX_PER_MIN", "6"))
@@ -1254,6 +1266,18 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
+DASHES = re.compile("[\u2012-\u2015\u2212]")   # figure/en/em/horizontal bar, minus
+
+
+def plain_dashes(text: str) -> str:
+    """Every flavour of long dash down to a plain hyphen.
+
+    Models reach for em dashes constantly and almost nobody types one on a
+    phone, so they are one of the surest tells that a machine wrote the line.
+    """
+    return DASHES.sub("-", text)
+
+
 def trim_reply(text: str, limit: Optional[int] = None) -> str:
     """Last-resort length guard, cutting at a sentence end where possible.
 
@@ -1262,6 +1286,7 @@ def trim_reply(text: str, limit: Optional[int] = None) -> str:
     number is the inline reply, which is edited into an existing message and so
     cannot spill into a second one.
     """
+    text = plain_dashes(text)
     limit = REPLY_MAX_CHARS if limit is None else limit
     if limit <= 0 or len(text) <= limit:
         return text
@@ -2530,6 +2555,19 @@ def speaker_name(user: dict) -> str:
     return name[:1].upper() + name[1:]
 
 
+def wrap_block(escaped: str, style: str) -> str:
+    """Set a chunk of already-escaped text off from the rest of the message."""
+    if style == "expandable":
+        return f"<blockquote expandable>{escaped}</blockquote>"
+    if style == "pre":
+        return f"<pre>{escaped}</pre>"
+    if style == "bold":
+        return f"<b>{escaped}</b>"
+    if style == "plain":
+        return escaped
+    return f"<blockquote>{escaped}</blockquote>"
+
+
 def shrink_to(text: str, room: int) -> str:
     """Cut `text` until its ESCAPED form fits `room`, ending with an ellipsis.
 
@@ -2545,29 +2583,28 @@ def shrink_to(text: str, room: int) -> str:
 
 
 def format_inline(name: str, question: str, body: str) -> tuple:
-    """Who asked, what they asked, and the answer. Returns (text, parse_mode).
+    """Who asked and what they asked, then the answer. Returns (text, mode).
 
-        Дмитрий:
+        | Дмитрий
         | ну и что ты на это скажешь
-        AI:
-        | Скажу, что вопрос звучит как приглашение на драку.
+        Скажу, что вопрос звучит как приглашение на драку.
 
-    Both labels bold, both texts in Telegram quote blocks - the two halves are
-    the same kind of thing, so they look the same. No blank lines: the quote
-    blocks supply the separation on their own.
+    The name and the question share one block - they are one utterance, and
+    splitting them across two blocks made the message look like a form. The
+    answer sits plainly underneath: it is the part being read, so it gets no
+    decoration competing with it, and no label announcing a machine wrote it.
     """
-    label = html.escape(INLINE_AI_LABEL)
+    esc_body = html.escape(body)
     if not INLINE_SHOW_QUESTION:
-        return f"<b>{label}:</b>\n<blockquote>{html.escape(body)}</blockquote>", "HTML"
+        return wrap_block(esc_body, INLINE_BLOCK_ANSWER), "HTML"
 
-    head = f"<b>{html.escape(name)}:</b>"
-    mid = f"<b>{label}:</b>"
-    quote = "<blockquote></blockquote>"
-
-    # All four parts share one message, and Telegram's 4096-character ceiling
-    # is the only thing that shortens anything.
-    budget = TELEGRAM_MAX_CHARS - len(head) - len(mid) - 2 * len(quote) - 4
-    esc_q, esc_body = html.escape(question), html.escape(body)
+    esc_name = f"<b>{html.escape(name)}</b>"
+    # All of it shares one message, and Telegram's 4096-character ceiling is
+    # the only thing that shortens anything.
+    overhead = (len(esc_name) + 2 + len(wrap_block("", INLINE_BLOCK))
+                + len(wrap_block("", INLINE_BLOCK_ANSWER)))
+    budget = TELEGRAM_MAX_CHARS - overhead
+    esc_q = html.escape(question)
 
     if len(esc_q) + len(esc_body) > budget:
         # The question keeps up to half the room, plus whatever the answer does
@@ -2575,16 +2612,14 @@ def format_inline(name: str, question: str, body: str) -> tuple:
         # trimming it there would be cutting the wrong thing.
         q_room = max(budget - len(esc_body), budget // 2)
         if len(esc_q) > q_room:
-            question = shrink_to(question, q_room)
-            esc_q = html.escape(question)
+            esc_q = html.escape(shrink_to(question, q_room))
             log.info("  -> question trimmed to fit Telegram's 4096 limit")
         if len(esc_body) > budget - len(esc_q):
-            body = shrink_to(body, budget - len(esc_q))
-            esc_body = html.escape(body)
+            esc_body = html.escape(shrink_to(body, budget - len(esc_q)))
             log.info("  -> answer trimmed to fit Telegram's 4096 limit")
 
-    return (f"{head}\n<blockquote>{esc_q}</blockquote>\n"
-            f"{mid}\n<blockquote>{esc_body}</blockquote>"), "HTML"
+    quoted = wrap_block(f"{esc_name}\n{esc_q}", INLINE_BLOCK)
+    return f"{quoted}\n{wrap_block(esc_body, INLINE_BLOCK_ANSWER)}", "HTML"
 
 
 def edit_inline(inline_message_id: str, name: str, question: str,
@@ -2597,7 +2632,7 @@ def edit_inline(inline_message_id: str, name: str, question: str,
     # Some character upset the parser. The answer matters more than the styling.
     log.warning("  -> formatted edit refused, retrying as plain text")
     return tg("editMessageText", inline_message_id=inline_message_id,
-              text=f"{name}:\n{question}\n{INLINE_AI_LABEL}:\n{body}") is not None
+              text=f"{name}\n{question}\n{body}") is not None
 
 
 def handle_inline_query(q: dict) -> None:
