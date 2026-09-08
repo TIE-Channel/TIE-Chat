@@ -1062,6 +1062,11 @@ NOT_A_CHAT_MODEL = (
     "guard", "whisper", "tts", "embed", "rerank", "moderation", "safety",
     "ocr", "asr", "transcribe", "diffusion", "image", "vision", "audio",
     "speech", "reward", "classifier",
+    # Groq's "compound" systems are agents with built-in web search and code
+    # execution, not plain chat models. They score near zero on the name
+    # heuristic, which put them at the very bottom of the ladder - and the
+    # bottom is exactly where the judge starts looking.
+    "compound",
 )
 
 
@@ -2062,8 +2067,13 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
     sender = msg.get("from") or {}
     text = (msg.get("text") or msg.get("caption") or "").strip()
 
+    # Every group message is traceable at DEBUG. At INFO this would flood a
+    # busy room, but when the bot "does nothing" it is the first thing to look
+    # at - set LOG_LEVEL=DEBUG and every message shows up with its verdict.
+    log.debug("group %s | %s: %r", chat_id, display_name(sender), text[:60])
+
     if not text or sender.get("is_bot") or sender.get("id") in IGNORE_USER_IDS:
-        return
+        return log.debug("  -> skipped: empty, from a bot, or an ignored user")
     if not group_allowed(chat_id):
         return
 
@@ -2089,6 +2099,7 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     reason = group_trigger(msg, text, key)
     if not reason:
+        log.debug("  -> nothing here for him to answer")
         return
 
     log.info("group %s | %s: %r  (%s)", chat_id, display_name(sender), clean[:60], reason)
@@ -2692,6 +2703,60 @@ def start_health_server() -> None:
 # Main loop
 # --------------------------------------------------------------------------
 
+# Telegram allows exactly one getUpdates consumer per token. A second one -
+# the previous Render deploy still shutting down, a forgotten local run, a
+# duplicated service - takes the updates away from this one, which then sees
+# nothing at all: no messages, no errors, nothing in the log to explain it.
+# That is worth saying out loud, once, instead of a warning every three
+# seconds that reads like a network hiccup.
+_conflict_since = 0.0
+
+
+def poll_updates(offset: int) -> Optional[list]:
+    """One getUpdates, with the "somebody else is polling" case spelled out."""
+    global _conflict_since
+    try:
+        r = session.post(
+            f"{TELEGRAM_API}/getUpdates", timeout=70,
+            json={"offset": offset, "timeout": 50,
+                  "allowed_updates": ALLOWED_UPDATES},
+        )
+        data = r.json()
+    except Exception as exc:
+        log.warning("getUpdates failed: %s", exc)
+        return None
+
+    if data.get("ok"):
+        if _conflict_since:
+            log.warning("the other instance is gone after %.0fs - this one is "
+                        "receiving messages again", time.time() - _conflict_since)
+            _conflict_since = 0.0
+        return data.get("result") or []
+
+    description = str(data.get("description") or "")
+    if "conflict" in description.lower():
+        if not _conflict_since:
+            _conflict_since = time.time()
+            log.error(
+                "ANOTHER INSTANCE OF THIS BOT IS RUNNING. Telegram delivers "
+                "each message to ONE poller, and it is not this one - which is "
+                "why nothing appears here however much you write. Usually the "
+                "previous deploy that has not shut down yet (give it a minute), "
+                "a second Render service on the same TELEGRAM_BOT_TOKEN, or a "
+                "copy still running on your laptop. Two bots on one token can "
+                "never both work; stop one."
+            )
+        else:
+            # Already said it. Keep the log readable while it resolves itself.
+            log.info("still waiting for the other instance to stop (%.0fs)",
+                     time.time() - _conflict_since)
+        time.sleep(10)
+        return None
+
+    log.warning("getUpdates error: %s", description)
+    return None
+
+
 ALLOWED_UPDATES = [
     "message",
     "business_connection",
@@ -2838,7 +2903,7 @@ def main() -> None:
 
     log.info("polling for business messages...")
     while True:
-        updates = tg("getUpdates", offset=offset, timeout=50, allowed_updates=ALLOWED_UPDATES)
+        updates = poll_updates(offset)
         if updates is None:
             time.sleep(3)
             continue

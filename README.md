@@ -687,6 +687,7 @@ came through, it stays quiet.
 
 | Symptom | Cause |
 |---|---|
+| Nothing at all in the log, however much you write, and `Conflict: terminated by other getUpdates request` | **Two instances on one token.** Telegram hands each message to exactly one poller and it is not this one. Usually the previous Render deploy still shutting down — wait a minute. If it persists: a second Render service on the same `TELEGRAM_BOT_TOKEN`, or a copy still running on your laptop. Stop one. |
 | Bot doesn't appear in the Chatbots list | Secretary Mode is off in @BotFather (step 2) |
 | Bot can read but replies silently fail | Telegram limits some actions to private chats with a *recent* incoming message — send it a fresh one |
 | `no reply rights` in the log | "Reply to messages" toggle off in Telegram Business settings |
