@@ -42,7 +42,11 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
 HISTORY_TURNS = int(os.environ.get("HISTORY_TURNS", "20"))
 
 # Minimum seconds between two auto-replies in the same chat (anti-spam).
-REPLY_COOLDOWN = float(os.environ.get("REPLY_COOLDOWN", "2"))
+# 0 = off, which is the default. It existed to stop a burst of messages
+# turning into a burst of replies, but a 1:1 chat already drops the older
+# draft when a newer message arrives, and in a room two people addressing him
+# in the same breath both deserve an answer. Set a number to bring it back.
+REPLY_COOLDOWN = float(os.environ.get("REPLY_COOLDOWN", "0") or 0)
 
 # Max characters of a customer message we forward to the model.
 MAX_INPUT_CHARS = int(os.environ.get("MAX_INPUT_CHARS", "4000"))
@@ -118,6 +122,16 @@ INLINE_PLACEHOLDER = os.environ.get("INLINE_PLACEHOLDER", "…")
 
 # Per-person ceiling, so an open inline bot cannot be drained in a minute.
 INLINE_MAX_PER_MIN = int(os.environ.get("INLINE_MAX_PER_MIN", "6"))
+
+# How long "this person shares a group with you" is trusted. Membership does
+# not change by the hour, and re-deriving it costs one getChatMember per group,
+# so the answer is kept for days and stored in Redis - it then survives a
+# restart, and everyone who could use the bot inline yesterday still can today.
+INLINE_MEMBER_DAYS = int(os.environ.get("INLINE_MEMBER_DAYS", "7"))
+
+# A "no" is deliberately short-lived: somebody who joins one of your groups
+# tomorrow must not stay locked out for the rest of the week.
+INLINE_MISS_MINUTES = int(os.environ.get("INLINE_MISS_MINUTES", "15"))
 
 # One shared, permanently empty transcript. Inline answers carry no context:
 # there is no chat id to key one on, and a memory shared across every chat he
@@ -568,6 +582,26 @@ def save_known_groups() -> None:
             os.replace(tmp, GROUPS_FILE)
         except Exception as exc:
             log.warning("could not save the group list: %s", exc)
+
+
+def save_shared_member(user_id: int, chat_id: int) -> None:
+    """Remember that this person sits in one of your groups, for a week."""
+    if not redis_on():
+        return
+    redis_pipeline([["SET", f"{REDIS_PREFIX}:member:{user_id}", str(chat_id),
+                     "EX", str(INLINE_MEMBER_DAYS * 86400)]])
+
+
+def load_shared_member(user_id: int) -> Optional[int]:
+    """Which of your groups this person was last seen in, or None."""
+    if not redis_on():
+        return None
+    got = redis_pipeline([["GET", f"{REDIS_PREFIX}:member:{user_id}"]])
+    raw = (got or [None])[0]
+    try:
+        return int(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
 
 
 def load_known_groups() -> None:
@@ -1238,7 +1272,11 @@ class Candidate:
         if fast:
             penalty = 0 if t < 4 else 40 if t < 8 else 110 if t < 15 else 220
         else:
-            penalty = 0 if t < 10 else 25 if t < 25 else 90
+            # In a 1:1 chat the bot is faking a reading-and-typing pause of up
+            # to TYPING_MAX anyway, so a slow model costs the reader nothing.
+            # The discount here is only a tiebreak between rungs of similar
+            # quality; it must never outrank a genuinely cleverer model.
+            penalty = 0 if t < 10 else 15 if t < 25 else 45
         return self.quality - penalty
 
     @property
@@ -1253,12 +1291,25 @@ class Candidate:
 LADDER: List[Candidate] = []
 
 
+def ladder_order(fast: bool = False) -> List[Candidate]:
+    """Every rung, cleverest first. The one ranking the whole bot agrees on.
+
+    Quality is discounted by measured latency, so `fast` - a room, where a
+    brilliant answer forty seconds late lands after the conversation moved on -
+    reshuffles the top without changing the principle: always start with the
+    best model still standing and walk down only as the good ones run out.
+    """
+    return sorted(LADDER, key=lambda c: -c.rank(fast))
+
+
 def build_ladder() -> None:
     """Ask every provider what it serves, then rank the lot by quality.
 
     The point is to answer with the best model available anywhere, not with
-    whatever the first provider happens to offer. When the clever ones are out
-    of quota the bot walks down the rungs on its own.
+    whatever the first provider happens to offer. Everything that picks a model
+    afterwards - replies in every mode, and the group judge - walks this same
+    list through ladder_order(), cleverest first, stepping down only as the
+    good rungs run out of quota.
     """
     global LADDER
     rungs: List[Candidate] = []
@@ -1358,15 +1409,6 @@ def openai_call(
     return text, 200
 
 
-def openai_chat(p: Provider, system: str, messages: List[dict], max_tokens: int,
-                json_mode: bool = False, timeout: Optional[int] = None,
-                model: Optional[str] = None) -> Optional[str]:
-    """Thin wrapper for callers that only care whether it worked."""
-    text, _ = openai_call(p, model or p.model, system, messages,
-                          max_tokens, json_mode, timeout)
-    return text
-
-
 def gemini_call(model: str, system: str, contents: List[dict],
                 max_tokens: int, thinking: bool = True,
                 max_chars: Optional[int] = None) -> tuple:
@@ -1455,7 +1497,7 @@ def ask_ai(
         gem_contents.append({"role": "user", "parts": [{"text": user_text}]})
     oai_messages = openai_turns(key, user_text)
 
-    order = sorted(LADDER, key=lambda c: -c.rank(fast))
+    order = ladder_order(fast)
     best = order[0]
     for c in order:
         if cancel is not None and cancel.is_set():
@@ -1570,7 +1612,7 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
         return skip("no text (sticker, photo, voice note)")
 
     key = f"{connection_id}:{chat_id}"
-    if time.time() - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
+    if REPLY_COOLDOWN and time.time() - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
         return skip("within REPLY_COOLDOWN of the last reply")
 
     user_text = text[:MAX_INPUT_CHARS]
@@ -1786,12 +1828,30 @@ JUDGE_SCHEMA = {
 }
 
 
-def judge_model() -> str:
-    """Whichever cheap rung the judge would reach for right now."""
+def judge_order() -> List[Candidate]:
+    """The rungs the judge may use - the DUMBEST first, climbing up.
+
+    Deliberately the opposite direction from replies. A verdict is a yes/no, so
+    the cheap rungs are good enough for it, and every judge call spent on a
+    clever model is one the actual answers no longer have. It climbs only when
+    a rung turns out unable to produce a usable verdict at all.
+
+    GROUP_JUDGE_MODEL, when set to a model that is actually on the ladder, is
+    tried before everything else.
+    """
+    order = sorted((c for c in LADDER if c.usable and not c.bad_judge),
+                   key=lambda c: c.quality)
     if GROUP_JUDGE_MODEL:
-        return GROUP_JUDGE_MODEL
-    usable = [c for c in LADDER if c.usable and not c.bad_judge]
-    return repr(min(usable, key=lambda c: c.quality)) if usable else "none"
+        pinned = [c for c in order if c.model == GROUP_JUDGE_MODEL]
+        if pinned:
+            order = pinned + [c for c in order if c not in pinned]
+    return order
+
+
+def judge_model() -> str:
+    """Whichever rung the judge would reach for right now."""
+    order = judge_order()
+    return repr(order[0]) if order else "none"
 
 
 def judge_budget_ok(key: str) -> bool:
@@ -1818,19 +1878,25 @@ def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) ->
         f"Should he say something now?"
     )
 
-    # Judging is a yes/no, so it climbs the ladder from the cheap end and leaves
-    # the clever models for the actual replies.
-    for c in sorted((x for x in LADDER if x.usable and not x.bad_judge),
-                    key=lambda x: x.quality):
-        verdict = judge_via(c, question)
+    # Same ladder as replies, walked the other way: cheapest rung first, and it
+    # only climbs when one turns out no good at producing a verdict.
+    for c in judge_order():
+        verdict, outcome = judge_via(c, question)
         if verdict is not None:
             reason = str(verdict.get("reason", ""))[:80]
             if verdict.get("speak"):
                 return f"context: {reason}"
             log.info("  staying quiet - %s", reason)
             return ""
-        c.bad_judge = True
-        log.info("  judge: %s no good for verdicts, trying a lower rung", c)
+        if outcome == "unusable":
+            # It answered and still could not produce a verdict. It will do the
+            # same next time, so stop asking it - for good.
+            c.bad_judge = True
+            log.info("  judge: %s cannot produce verdicts, dropping it", c)
+        else:
+            # Quota, network, a 5xx. Nothing to do with its judgement; skip it
+            # this once and let the cooldown decide when it comes back.
+            log.info("  judge: %s unavailable right now, trying the next rung", c)
     return None
 
 
@@ -1860,27 +1926,43 @@ JUDGE_JSON_HINT = ('\n\nAnswer with JSON and nothing else - no prose, no code '
                    'fences: {"speak": true, "reason": "a few words"}')
 
 
-def judge_via(c: Candidate, question: str) -> Optional[dict]:
-    """Run the speak/stay-quiet decision on one rung. None = it failed."""
+def judge_via(c: Candidate, question: str) -> tuple:
+    """Run the speak/stay-quiet decision on one rung.
+
+    Returns (verdict, outcome). The outcome matters as much as the verdict:
+
+      "ok"          - got a usable verdict
+      "unusable"    - the model answered, but cannot produce a verdict at all
+                      (prose instead of JSON, empty output). Worth remembering:
+                      it will do the same thing next time.
+      "unavailable" - the call itself did not land: network, 429, 5xx. Says
+                      nothing about the model's ability to judge, so it must
+                      NOT be held against it - the rung is simply skipped now
+                      and tried again on the next message.
+    """
     p = c.provider
     if p.name != "gemini":
         # Strict JSON mode is the good path, but several free models cannot
         # honour it and answer 400. Falling back to plain text plus a tolerant
         # parser is far better than losing the judge entirely.
         modes = (False,) if p.no_json else (True, False)
+        answered = False
         for strict in modes:
-            raw = openai_chat(
-                p, JUDGE_PROMPT + JUDGE_JSON_HINT,
+            raw, status = openai_call(
+                p, c.model, JUDGE_PROMPT + JUDGE_JSON_HINT,
                 [{"role": "user", "content": question}],
-                max_tokens=600, json_mode=strict, timeout=20, model=c.model,
+                max_tokens=600, json_mode=strict, timeout=20,
             )
             if not raw:
+                if status:
+                    note_failure(c, status)      # a 429 here rests it properly
                 continue
+            answered = True
             verdict = parse_json_loose(raw)
             if verdict is not None:
-                return verdict
+                return verdict, "ok"
             log.warning("  judge: %s gave unparseable output", p.name)
-        return None
+        return None, ("unusable" if answered else "unavailable")
 
     model = c.model
     url, headers = gemini_url(model), gemini_headers()
@@ -1905,18 +1987,19 @@ def judge_via(c: Candidate, question: str) -> Optional[dict]:
             r = session.post(url, headers=headers, json=body(thinking), timeout=20)
         except Exception as exc:
             log.warning("  judge call failed: %s", exc)
-            return None
+            return None, "unavailable"
         if r.status_code == 400 and thinking and "think" in r.text.lower():
             continue
         if r.status_code != 200:
             log.warning("  judge %s: %s", r.status_code, r.text[:120].replace("\n", " "))
-            return None
+            note_failure(c, r.status_code)
+            return None, "unavailable"
         try:
-            return json.loads(gemini_text(r.json()["candidates"][0]))
+            return json.loads(gemini_text(r.json()["candidates"][0])), "ok"
         except Exception as exc:
             log.warning("  judge gave unusable output: %s", exc)
-            return None
-    return None
+            return None, "unusable"
+    return None, "unavailable"
 
 
 def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
@@ -1989,6 +2072,9 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
     if chat_id not in known_groups:
         known_groups.add(chat_id)
         save_known_groups()
+    # Everyone who talks here demonstrably shares this room with you, so they
+    # can use the bot inline without a single membership call.
+    allow_inline_for(sender.get("id"), chat_id)
 
     key = f"group:{chat_id}"
 
@@ -2007,7 +2093,7 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     log.info("group %s | %s: %r  (%s)", chat_id, display_name(sender), clean[:60], reason)
 
-    if time.time() - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
+    if REPLY_COOLDOWN and time.time() - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
         log.info("  -> ignored: within REPLY_COOLDOWN")
         return
 
@@ -2039,7 +2125,8 @@ def dispatch_group_message(msg: dict) -> None:
 
     In a group other people keep talking; that is the normal state of a room,
     not somebody correcting themselves. The chat lock still keeps replies in
-    order, and REPLY_COOLDOWN stops it answering twice in a row.
+    order; REPLY_COOLDOWN would space the replies out, but it is off by
+    default so that two people addressing him at once both get an answer.
     """
     chat = msg.get("chat") or {}
     key = f"group:{chat.get('id')}"
@@ -2222,6 +2309,11 @@ def status_report() -> str:
             + (f", groups known: {len(known_groups)}"
                if INLINE_ACCESS == "shared" else "")
         ),
+        "judge (cheapest first): " + (
+            ", ".join(f"{c.provider.name}/{c.model}" for c in judge_order()[:3])
+            or "nothing usable") + (
+            f"   [{sum(1 for c in LADDER if c.bad_judge)} dropped as unable "
+            f"to judge]" if any(c.bad_judge for c in LADDER) else ""),
         "ladder (best first):",
     ] + [
         "  {}{:<40} q={}{}".format(
@@ -2233,7 +2325,7 @@ def status_report() -> str:
              "  dead" if c.dead else
              f"  resting {int(c.cool_until - time.time())}s" if c.cool_until > time.time()
              else "  provider parked")
-        for c in LADDER[:10]
+        for c in ladder_order()[:10]
     ] + [
         f"uptime: {int((time.time() - STARTED_AT) / 60)} min",
         f"business connections known: {len(owner_of_connection)}",
@@ -2285,8 +2377,30 @@ inline_offered = 0
 inline_sent = 0
 
 
+def allow_inline_for(user_id: int, chat_id: int) -> None:
+    """Record that this person shares a group with you.
+
+    Called for free whenever somebody speaks in one of your groups - we already
+    know the room is yours by then, so no getChatMember is needed at all. That
+    means the people who actually talk are warm in the cache before they ever
+    try to summon him.
+    """
+    if not user_id or user_id == OWNER_ID:
+        return
+    if inline_ok_cache.get(user_id, (False, 0))[0]:
+        return                                   # already known, don't re-write
+    inline_ok_cache[user_id] = (True, time.time() + INLINE_MEMBER_DAYS * 86400)
+    save_shared_member(user_id, chat_id)
+
+
 def may_use_inline(user_id: Optional[int]) -> bool:
-    """Is this person allowed to summon him?"""
+    """Is this person allowed to summon him?
+
+    "shared" means: do they sit in any room you sit in. A yes is kept for
+    INLINE_MEMBER_DAYS and mirrored into Redis, so it survives a restart and
+    the whole group keeps working; a no is kept for minutes, so somebody who
+    joins tomorrow is not locked out until next week.
+    """
     if not user_id:
         return False
     if not OWNER_ID or user_id == OWNER_ID or INLINE_ACCESS == "all":
@@ -2294,23 +2408,32 @@ def may_use_inline(user_id: Optional[int]) -> bool:
     if INLINE_ACCESS == "owner":
         return False
 
+    now = time.time()
     cached = inline_ok_cache.get(user_id)
-    if cached and time.time() - cached[1] < 3600:
+    if cached and now < cached[1]:
         return cached[0]
 
-    # "shared": are they in any room I am in? First hit wins, so this is
-    # normally one API call, and the verdict is cached for an hour - the rest
-    # of the keystrokes cost nothing.
-    ok = False
+    # Redis first: another instance, or this one before the last redeploy, may
+    # already have paid the API calls for this person.
+    seen_in = load_shared_member(user_id)
+    if seen_in is not None:
+        inline_ok_cache[user_id] = (True, now + INLINE_MEMBER_DAYS * 86400)
+        return True
+
+    # Otherwise ask Telegram, one group at a time. First hit wins, so this is
+    # normally a single call - and only once a week per person.
     for chat_id in list(known_groups):
         res = tg("getChatMember", chat_id=chat_id, user_id=user_id)
         if res and res.get("status") not in ("left", "kicked"):
-            ok = True
-            break
-    inline_ok_cache[user_id] = (ok, time.time())
-    log.info("inline: %s %s (shares a group with you: %s)", user_id,
-             "allowed" if ok else "turned away", ok)
-    return ok
+            allow_inline_for(user_id, chat_id)
+            log.info("inline: %s shares group %s with you - allowed for %d days",
+                     user_id, chat_id, INLINE_MEMBER_DAYS)
+            return True
+
+    inline_ok_cache[user_id] = (False, now + INLINE_MISS_MINUTES * 60)
+    log.info("inline: %s shares no group with you - turned away for %d min",
+             user_id, INLINE_MISS_MINUTES)
+    return False
 
 
 def answer_nothing(query_id: str, note: str, seconds: int = 0) -> None:
@@ -2617,8 +2740,7 @@ def main() -> None:
             "your Telegram user id.", BOT_USERNAME,
         )
     if GROUPS_ENABLED:
-        log.info("group trigger mode: %s%s", GROUP_TRIGGER,
-                 f" (judge: {judge_model()})" if GROUP_TRIGGER == "context" else "")
+        log.info("group trigger mode: %s", GROUP_TRIGGER)
         # Telegram only delivers ordinary group messages to a bot whose privacy
         # mode is off. Without that the bot literally never sees the text, so
         # keyword triggers and reply-all cannot fire - and nothing appears in
@@ -2680,6 +2802,18 @@ def main() -> None:
     if any(p.name == "gemini" for p in PROVIDERS):
         pick_working_model()
     build_ladder()
+
+    # Only now does the ladder exist, so this is the first point at which the
+    # judge's rung can be named or GROUP_JUDGE_MODEL can be checked at all.
+    if GROUPS_ENABLED and GROUP_TRIGGER == "context":
+        log.info("group judge starts on %s and climbs only if it has to",
+                 judge_model())
+        if GROUP_JUDGE_MODEL and not any(c.model == GROUP_JUDGE_MODEL for c in LADDER):
+            log.warning(
+                "GROUP_JUDGE_MODEL=%r is not on the ladder, so it is ignored "
+                "and the judge just starts at the top. Check the spelling "
+                "against the ladder printed above.", GROUP_JUDGE_MODEL,
+            )
 
     if bool(UPSTASH_URL) != bool(UPSTASH_TOKEN):
         log.warning(

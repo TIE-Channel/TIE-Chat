@@ -141,9 +141,34 @@ Size alone is not treated as quality, either: past ~120B the extra parameters
 buy little for a two-line chat reply and cost a lot of queueing on a free tier,
 so the curve flattens and then turns down.
 
-The group judge walks the *same* ladder from the cheap end: a yes/no verdict
-does not need the good model, and this keeps the clever rungs free for actual
-replies.
+**One ladder, walked from both ends.** Replies in all three modes use
+`ladder_order()` — cleverest rung first, stepping down as the good ones run out
+of quota. The **judge** walks the same ladder the other way: dumbest rung
+first, climbing only when one turns out unable to produce a usable verdict. A
+yes/no verdict does not need the clever model, and every judge call spent on
+one is a call the actual answers no longer have.
+
+The judge sees **every rung** — all models from all providers, same list as
+replies. A rung leaves that list only for a reason it will not recover from:
+answering with prose instead of a verdict. A 429, a timeout or a 5xx is
+*transient*, so it is skipped for that one message and tried again on the next
+— it used to be treated as "this model cannot judge" and dropped for the rest
+of the session, which quietly shrank the judge's ladder over a long uptime.
+
+`/status` prints both directions:
+
+```
+judge (cheapest first): groq/llama-3.1-8b-instant, gemini/gemini-3.5-flash-lite,
+  groq/gemma2-9b-it
+ladder (best first):
+     groq/llama-3.3-70b-versatile             q=165  1s
+     openrouter/meta-llama/llama-3.3-70b-instruct:free  q=165
+```
+
+`GROUP_JUDGE_MODEL` pins a model to try first. It used to be documented but
+silently ignored — it only changed the label in `/status`. Now it actually
+reorders the judge's ladder, and if the name is not on the ladder the bot says
+so at startup instead of pretending.
 
 **A provider that keeps failing gets parked.** Three failures in a row and it
 is skipped entirely for ten minutes (`PARK_AFTER_FAILURES`, `PARK_MINUTES`) —
@@ -453,6 +478,16 @@ that is configured and in `GROUPS_FILE` otherwise, so a restart does not lock
 everyone but you out. `GROUP_ALLOWLIST` seeds it outright. `/status` shows the
 count.
 
+**Membership is cached for a week.** Once someone is known to share a group
+with you, that verdict lives in Redis under `<prefix>:member:<user id>` for
+`INLINE_MEMBER_DAYS` (7) — so it survives a redeploy, and the people who could
+use the bot inline last week still can today without a single API call. Most of
+the cache fills in for *free*: anyone who writes in one of your groups is
+recorded on the spot, because the bot has already established that the room is
+yours. A **no** is deliberately cheap to forget — `INLINE_MISS_MINUTES` (15) —
+so somebody who joins one of your groups tomorrow is not locked out until next
+week.
+
 `INLINE_MAX_PER_MIN` (6) caps each person, so an open bot cannot be drained.
 
 ### What he can and cannot see
@@ -546,7 +581,7 @@ Other knobs, all optional (see `.env.example`):
 | `HISTORY_FILE` | `history.json` | fallback file; empty = memory only |
 | `HISTORY_SAVE_EVERY` | `20` | seconds between saves (a burst is batched into one write) |
 | `HISTORY_MAX_CHATS` | `300` | liveliest chats kept in the file |
-| `REPLY_COOLDOWN` | `2` | seconds between replies in one chat |
+| `REPLY_COOLDOWN` | `0` | seconds between replies in one chat; off by default |
 | `IGNORE_USER_IDS` | — | user IDs that never get an auto-reply |
 | `QUOTE_REPLIES` | `false` | `true` makes replies quote the customer's message instead of arriving as plain ones |
 | `READ_MIN` / `READ_MAX` | `3` / `12` | silent pause before the typing indicator appears — picking up and unlocking the phone |
