@@ -2530,32 +2530,61 @@ def speaker_name(user: dict) -> str:
     return name[:1].upper() + name[1:]
 
 
+def shrink_to(text: str, room: int) -> str:
+    """Cut `text` until its ESCAPED form fits `room`, ending with an ellipsis.
+
+    Escaping is what makes this fiddly: one "<" becomes four characters, so
+    cutting by raw length can still overflow.
+    """
+    if room <= 1:
+        return "…"
+    cut = text
+    while cut and len(html.escape(cut)) + 1 > room:
+        cut = cut[:int(len(cut) * 0.9)]
+    return cut.rstrip() + "…"
+
+
 def format_inline(name: str, question: str, body: str) -> tuple:
     """Who asked, what they asked, and the answer. Returns (text, parse_mode).
 
-        Дмитрий
-        > ну и что ты на это скажешь
-        AI: Скажу, что вопрос звучит как приглашение на драку.
+        Дмитрий:
+        | ну и что ты на это скажешь
+        AI:
+        | Скажу, что вопрос звучит как приглашение на драку.
 
-    The name and the label are bold, the question sits in a real Telegram
-    quote block, and the answer is plain so it stays the easiest thing to read.
-    No blank lines - the quote block supplies the separation by itself.
+    Both labels bold, both texts in Telegram quote blocks - the two halves are
+    the same kind of thing, so they look the same. No blank lines: the quote
+    blocks supply the separation on their own.
     """
+    label = html.escape(INLINE_AI_LABEL)
     if not INLINE_SHOW_QUESTION:
-        return html.escape(body), "HTML"
+        return f"<b>{label}:</b>\n<blockquote>{html.escape(body)}</blockquote>", "HTML"
 
-    head = f"<b>{html.escape(name)}</b>"
-    tail = f"<b>{html.escape(INLINE_AI_LABEL)}:</b> {html.escape(body)}"
-    # All three parts share one message. Only Telegram's own 4096-character
-    # ceiling can shorten the question, and only by as much as it takes to fit.
-    room = TELEGRAM_MAX_CHARS - len(head) - len(tail) - 40
-    q = question
-    while q and len(html.escape(q)) > room:
-        q = q[:int(len(q) * 0.9)]
-    if len(q) < len(question):
-        q = q.rstrip() + "…"
-        log.info("  -> question trimmed to fit Telegram's 4096 limit")
-    return f"{head}\n<blockquote>{html.escape(q)}</blockquote>\n{tail}", "HTML"
+    head = f"<b>{html.escape(name)}:</b>"
+    mid = f"<b>{label}:</b>"
+    quote = "<blockquote></blockquote>"
+
+    # All four parts share one message, and Telegram's 4096-character ceiling
+    # is the only thing that shortens anything.
+    budget = TELEGRAM_MAX_CHARS - len(head) - len(mid) - 2 * len(quote) - 4
+    esc_q, esc_body = html.escape(question), html.escape(body)
+
+    if len(esc_q) + len(esc_body) > budget:
+        # The question keeps up to half the room, plus whatever the answer does
+        # not use. So a short question next to a runaway answer is left alone -
+        # trimming it there would be cutting the wrong thing.
+        q_room = max(budget - len(esc_body), budget // 2)
+        if len(esc_q) > q_room:
+            question = shrink_to(question, q_room)
+            esc_q = html.escape(question)
+            log.info("  -> question trimmed to fit Telegram's 4096 limit")
+        if len(esc_body) > budget - len(esc_q):
+            body = shrink_to(body, budget - len(esc_q))
+            esc_body = html.escape(body)
+            log.info("  -> answer trimmed to fit Telegram's 4096 limit")
+
+    return (f"{head}\n<blockquote>{esc_q}</blockquote>\n"
+            f"{mid}\n<blockquote>{esc_body}</blockquote>"), "HTML"
 
 
 def edit_inline(inline_message_id: str, name: str, question: str,
@@ -2568,7 +2597,7 @@ def edit_inline(inline_message_id: str, name: str, question: str,
     # Some character upset the parser. The answer matters more than the styling.
     log.warning("  -> formatted edit refused, retrying as plain text")
     return tg("editMessageText", inline_message_id=inline_message_id,
-              text=f"{name}\n{question}\n{INLINE_AI_LABEL}: {body}") is not None
+              text=f"{name}:\n{question}\n{INLINE_AI_LABEL}:\n{body}") is not None
 
 
 def handle_inline_query(q: dict) -> None:

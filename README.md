@@ -439,23 +439,27 @@ parameters. So without help, the moment the placeholder is replaced the line he
 was answering is gone from the chat and the reply reads like a non sequitur to
 everyone else. The question is therefore carried inside the message:
 
-> **Дмитрий**
-> > ну и что ты на это скажешь
->
-> **AI:** Скажу, что вопрос звучит как приглашение на драку.
+```
+Дмитрий:
+│ ну и что ты на это скажешь
+AI:
+│ Скажу, что вопрос звучит как приглашение на драку.
+```
 
-Bold name, the question in a real Telegram quote block, bold label, plain
-answer — the answer stays the easiest thing to read. No blank lines: the quote
-block supplies the separation on its own.
+Both labels bold, both texts in real Telegram quote blocks — the two halves are
+the same kind of thing, so they look the same. No blank lines: the quote blocks
+supply the separation on their own.
 
 The name is taken from whoever *asked*, not whoever taps the button (anyone in
 the chat can press it), with the first letter capitalised and the rest
 untouched, so `МАКС` stays `МАКС`.
 
-The question goes in **whole**. The only thing that can shorten it is Telegram's
-own 4096-character ceiling on the entire message, and even then only by as much
-as it takes to fit — the answer is what has to survive, so it keeps a floor of
-600 characters and the question yields. If some character upsets Telegram's
+Both go in **whole**. The only thing that shortens either is Telegram's
+4096-character ceiling on the entire message, and then whichever part actually
+overflowed is the one that gives ground: the question keeps up to half the room
+plus whatever the answer does not use, so a two-word question next to a runaway
+answer is left alone. Trimming is escape-aware — one `<` becomes four
+characters once escaped, so cutting by raw length could still overflow. If some character upsets Telegram's
 parser the whole thing is re-sent as plain text, because the answer matters more
 than the styling. `INLINE_SHOW_QUESTION=false` drops everything but the answer;
 `INLINE_AI_LABEL` changes the `AI` label.
