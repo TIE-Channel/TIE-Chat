@@ -3720,20 +3720,28 @@ def format_inline_markdown(name: str, question: str, body: str) -> str:
     """The same shape as the HTML version, in Markdown Telegram parses itself.
 
         >**Дмитрий**
+        >
         >ну и что ты на это скажешь
 
         Скажу, что вопрос звучит как приглашение на драку.
 
-    The blank line is syntax, not spacing: without it Markdown swallows the
-    answer into the quote as a lazy continuation. A block element follows a
-    block element, so nothing empty is rendered between them.
+    THE LONE ">" IS NOT A BLANK LINE - DO NOT TIDY IT AWAY. Inside a quote,
+    two lines written one under the other are one paragraph, and Markdown
+    renders the break between them as a space: the name and the question came
+    out on the same line. A ">" on its own is what actually ends the line.
+    Telegram's own reference spells this out - a ">" line means "continued on
+    the next line", and no ">" line means "continued on the same line".
+
+    The empty line before the answer is the same kind of thing: without it the
+    answer is swallowed into the quote as a lazy continuation. Neither renders
+    as vertical space; both are block separators.
 
     Only the name and the question are escaped. The answer is the one part
     that is MEANT to be markup - that is the whole point of doing this.
     """
-    quoted = "\n".join(">" + line for line in
-                        [f"**{md_escape(name)}**"]
-                        + md_escape(question).split("\n"))
+    lines = [f"**{md_escape(name)}**"] + md_escape(question).split("\n")
+    # Every line of the question keeps its own break, for the same reason.
+    quoted = "\n>\n".join(">" + line for line in lines)
     return f"{quoted}\n\n{body}"
 
 
