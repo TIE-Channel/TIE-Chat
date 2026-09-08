@@ -380,12 +380,29 @@ If the group has **Topics** turned on, every reply carries the
 answer under **General**, where nobody who asked is looking — that is the
 symptom to recognise.
 
-Two rules keep it honest. The bot only sends the field when the incoming
-message is genuinely a topic message (`is_topic_message`), because
-`message_thread_id` also appears in ordinary supergroups meaning "this reply
-chain", and `sendMessage` refuses it there. And if the topic was closed or
-deleted while the answer was being written, Telegram says so, the bot posts to
-General rather than losing the answer, and the log says why.
+The topic is taken from the incoming message when **either** signal says
+forum: the message marked `is_topic_message`, or the chat marked `is_forum`.
+Either alone is enough on purpose — clients do not always set
+`is_topic_message` (a reply written inside a topic is the usual case), and
+demanding it sent the answer to General, which is the exact bug this exists to
+prevent. A `message_thread_id` with *neither* signal is an ordinary
+supergroup's reply chain, not a topic, and `sendMessage` refuses it there — so
+that one is ignored.
+
+If the topic was closed or deleted while the answer was being written, Telegram
+says so, the bot posts to General rather than losing the answer, and the log
+says why.
+
+The first message from each forum is logged in full, so this is diagnosable
+from outside:
+
+```
+group -1002... is a forum: is_forum=True message_thread_id=42
+  is_topic_message=None -> answering in topic 42
+```
+
+If that line says `-> answering in General` while you asked inside a topic,
+Telegram sent neither signal — send the log line and it can be widened again.
 
 **Each topic is its own room.** The transcript key becomes
 `group:<chat>:<topic>`, so the judge reads one conversation instead of three

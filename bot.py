@@ -583,6 +583,10 @@ judge_calls: Dict[str, Deque[float]] = defaultdict(deque)
 # chat_id -> (is one of ours, when we checked)
 group_ok_cache: Dict[int, tuple] = {}
 
+# Forums we have already described in the log, so the diagnostic line above
+# appears once per room rather than on every message.
+forums_seen: set = set()
+
 # key -> when this chat last had anything said in it, for pruning on save
 history_seen: Dict[str, float] = {}
 history_dirty = threading.Event()
@@ -1047,13 +1051,23 @@ def typing_delay(text: str, already_spent: float) -> float:
 def thread_of(msg: dict) -> Optional[int]:
     """The forum topic a message was written in, if it was written in one.
 
-    Both halves matter. `message_thread_id` alone also shows up in ordinary
-    supergroups, where it means "this reply chain" and sendMessage will not
-    take it; `is_topic_message` is what marks a real forum topic. The General
-    topic carries neither, so it comes back as None and the reply lands there,
-    which is exactly right.
+    `message_thread_id` on its own is not enough to act on: in an ordinary
+    supergroup it also appears, meaning "this reply chain", and sendMessage
+    will not take it there. What makes it a topic is either flag - the message
+    marked `is_topic_message`, or the chat itself marked `is_forum`. Requiring
+    `is_topic_message` alone was too strict: clients do not always set it (a
+    reply inside a topic is the common case), and the reply then quietly went
+    to General, which is the one symptom this whole thing exists to avoid.
+
+    The General topic carries no `message_thread_id` at all, so it comes back
+    as None and the reply lands in General - which is where it belongs.
     """
-    return msg.get("message_thread_id") if msg.get("is_topic_message") else None
+    thread = msg.get("message_thread_id")
+    if not thread:
+        return None
+    if msg.get("is_topic_message") or (msg.get("chat") or {}).get("is_forum"):
+        return thread
+    return None
 
 
 def send_reply(
@@ -2277,6 +2291,18 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
     thread_id = thread_of(msg)
     key = f"group:{chat_id}" + (f":{thread_id}" if thread_id else "")
 
+    # The first message from each forum shows exactly what Telegram sent and
+    # what was made of it. "answer went to General instead of the topic" is
+    # otherwise invisible from outside, and this line settles it in one look.
+    if (chat.get("is_forum") or msg.get("message_thread_id")) \
+            and chat_id not in forums_seen:
+        forums_seen.add(chat_id)
+        log.info("group %s is a forum: is_forum=%s message_thread_id=%s "
+                 "is_topic_message=%s -> answering in %s",
+                 chat_id, chat.get("is_forum"), msg.get("message_thread_id"),
+                 msg.get("is_topic_message"),
+                 f"topic {thread_id}" if thread_id else "General")
+
     # Strip our own @mention so the model doesn't answer its own username.
     clean = text
     if BOT_USERNAME:
@@ -2292,7 +2318,8 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
         return
 
     log.info("group %s%s | %s: %r  (%s)", chat_id,
-             f" topic {thread_id}" if thread_id else "",
+             f" topic {thread_id}" if thread_id
+             else " General" if chat.get("is_forum") else "",
              display_name(sender), clean[:60], reason)
 
     if REPLY_COOLDOWN and time.time() - last_reply_at.get(key, 0) < REPLY_COOLDOWN:
