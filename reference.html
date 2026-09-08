@@ -611,6 +611,16 @@ message in the chat is stuck on '…', inline feedback is off:
       <caption>Только чат с ботом</caption>
       <thead><tr><th>Переменная</th><th>По умолчанию</th><th>Что делает</th></tr></thead>
       <tbody>
+        <tr><td><span class="var">RAW_CONTEXT</span></td><td class="def">true</td>
+          <td>Класть ли блок фактов (время, кто спрашивает, где вы) перед вопросом в режимах «Ответить», «Коротко» и в этом чате. Выключено - запрос уходит совсем голым, как раньше.</td></tr>
+        <tr><td><span class="var">OWNER_LOCATION</span></td><td class="def empty">пусто</td>
+          <td>Где вы, словами, когда пин не присылали. Например <code>Berlin, Germany</code>. Подставляется только в ваши ответы.</td></tr>
+        <tr><td><span class="var">PROFILE_HOURS</span></td><td class="def">24</td>
+          <td>Как часто перечитывать ваш профиль через <code>getChat</code>: био, адрес, часы работы, день рождения. Это публичная половина - идёт во все режимы.</td></tr>
+        <tr><td><span class="var">CONTEXT_PRIVATE_EVERYWHERE</span></td><td class="def">false</td>
+          <td>Слать ли пин и заметку <code>/ctx</code> ещё и туда, где ответ читают другие - в группу и в клиентский чат. По умолчанию нет.</td></tr>
+        <tr><td><span class="var">LOCATION_TTL_HOURS</span></td><td class="def">12</td>
+          <td>Сколько часов присланный пин считается «где я сейчас». Вчерашний хуже, чем никакого: выглядит текущим, а это не так.</td></tr>
         <tr><td><span class="var">DM_CHAT_ENABLED</span></td><td class="def">true</td>
           <td>Отвечать ли на обычный текст в личке бота. Выключено — команды
           <code>/status</code>, <code>/check</code>, <code>/reset</code>
@@ -622,6 +632,44 @@ message in the chat is stuck on '…', inline feedback is off:
       </tbody>
     </table>
   </div>
+  <p class="note"><b>Блок фактов - во всех режимах.</b> Все три инлайн-варианта,
+  группа, клиентский чат и этот - каждый получает перед вопросом одно и то же.
+  Только факты: указаний, как отвечать, там нет, поэтому голые режимы остаются
+  голыми, а персонаж - персонажем.</p>
+  <pre>Current date and time: Tuesday, 08 September 2026, 16:14 (Europe/Berlin, UTC+0200).
+Asking: Дмитрий (@dmigo, Telegram language ru, Telegram Premium).
+Asked in: your own chat with the bot.
+Your business address: Berlin, Torstrasse 1.
+Your opening hours: Mon 10:00-18:00 (Europe/Berlin).
+Your Telegram bio: делаю ботов.
+Your birthday: 3 April 1990.
+Their location: 52.5201, 13.405 - live, updating.
+They also said: сижу на macbook, до пятницы в Праге</pre>
+  <p class="note"><b>Две половины, и разница существенная.</b> Био, адрес и часы
+  работы вы <em>опубликовали</em> сами - их и так видно в профиле, поэтому они
+  идут во все режимы, включая клиентский чат, где как раз и полезны: на «вы
+  сегодня открыты» приходит настоящий ответ, а не выдуманный. Пин и заметка
+  <code>/ctx</code> не опубликованы, поэтому уходят только туда, где ответ
+  читаете вы один: этот чат и ваш собственный инлайн-вызов. В группе и в
+  клиентском чате читает кто-то ещё, а модель, которой сказали координаты, может
+  их произнести вслух. <code>CONTEXT_PRIVATE_EVERYWHERE=true</code> снимает это
+  ограничение.</p>
+  <p class="note"><b>Потолок честно:</b> данных об устройстве Telegram боту не
+  даёт вообще. Ни батареи, ни приложений, ни календаря, ни часов с телефона, ни
+  локации - пока её сами не пришлёте. В объекте Message таких полей просто нет.
+  Поэтому блок собран из того, что существует: время из <code>BOT_TZ</code>; имя,
+  <code>@username</code>, язык интерфейса и Premium из апдейта; откуда спросили;
+  ваш профиль через <code>getChat</code> - био, адрес, часы работы, день рождения
+  (перечитывается раз в <code>PROFILE_HOURS</code>); присланный пин (живая
+  локация обновляется сама через <code>edited_message</code>, протухшая старше
+  <code>LOCATION_TTL_HOURS</code> отбрасывается); <code>OWNER_LOCATION</code> как
+  запасной вариант и произвольная строка через <code>/ctx</code>. Последнее - и
+  есть честная замена «прочитай мой компьютер»: бот не может, поэтому вы ему
+  говорите. <code>/where</code> печатает обе половины ровно как они уходят.</p>
+  <p class="note"><b>Пин и заметка - только ваши.</b> Чужой инлайн-вопрос
+  получает время и своё имя, но никогда - где вы. Это та самая строка, из-за
+  которой <code>INLINE_ACCESS=shared</code> не превращается в утечку.
+  <code>RAW_CONTEXT=false</code> выключает блок целиком.</p>
   <p class="note"><b>Треды и здесь.</b> Telegram разрешает держать в чате с
   ботом несколько тредов, и каждый - отдельный разговор со своим ключом
   <code>dm:&lt;чат&gt;:&lt;тред&gt;</code>: новый тред начинается с чистого
@@ -672,7 +720,7 @@ message in the chat is stuck on '…', inline feedback is off:
     <div class="stat"><b>0</b><span>предупреждений pyflakes</span></div>
     <div class="stat"><b>0</b><span>функций без вызова</span></div>
     <div class="stat"><b>0</b><span>переменных-призраков в .env</span></div>
-    <div class="stat"><b>10</b><span>наборов тестов зелёные</span></div>
+    <div class="stat"><b>11</b><span>наборов тестов зелёные</span></div>
   </div>
   <h3>Удалено как мёртвое</h3>
   <div class="removed">

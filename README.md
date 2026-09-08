@@ -711,10 +711,66 @@ with no threads behaves exactly as before, under `dm:<chat>`.
 
 | you type | what happens |
 |---|---|
-| anything that is not a command | goes to the model bare, answer comes back |
+| anything that is not a command | goes to the model, answer comes back |
+| a shared location | remembered as where you are, for `LOCATION_TTL_HOURS` |
+| `/ctx <line>` | a line about you the model is given every time |
+| `/where` | prints the exact context block the model is given |
 | `/reset` | forgets the thread you are in, nothing else |
 | `/status` | ladder, judge order, what Telegram has delivered |
 | `/check` | one real request to every provider key |
+
+### What the model is told about the here and now
+
+**Every mode** — all three inline styles, the group, the business chat and
+this one — now gets a block of **facts** in front of the question. Facts only:
+never instructions about how to answer, so the raw modes stay raw and the
+character stays the character.
+
+```
+The following is true right now, supplied by their Telegram client. Use it
+only when the question calls for it; do not mention it otherwise.
+Current date and time: Tuesday, 08 September 2026, 16:14 (Europe/Berlin, UTC+0200).
+Asking: Дмитрий (@dmigo, Telegram language ru, Telegram Premium).
+Asked in: your own chat with the bot.
+Your business address: Berlin, Torstrasse 1.
+Your opening hours: Mon 10:00-18:00 (Europe/Berlin).
+Your Telegram bio: делаю ботов.
+Your birthday: 3 April 1990.
+Their location: 52.5201, 13.405 - live, updating.
+They also said: сижу на macbook, до пятницы в Праге
+```
+
+**The ceiling, plainly: Telegram gives a bot no device data at all.** No
+battery, no installed apps, no OS, no calendar, no clock from your phone, and
+no location unless you deliberately share one — the Bot API's Message object
+simply has no such fields. Everything above is what genuinely exists:
+
+| Fact | Where it comes from |
+|---|---|
+| Time, with the offset | `BOT_TZ` |
+| Who is asking | name, `@username`, `language_code`, `is_premium` — straight off the update |
+| Where they are asking from | your own chat / the named group and topic / a customer chat / an inline summon Telegram will not name |
+| Bio, business address, opening hours, birthday | `getChat` on your own profile, read once every `PROFILE_HOURS` (24) |
+| Your location | a pin shared in the bot's chat — a **live** one keeps itself current via `edited_message`; older than `LOCATION_TTL_HOURS` (12) it is dropped rather than passed off as current. `OWNER_LOCATION="Berlin, Germany"` is the fallback |
+| Anything else | `/ctx <line>`, kept in Redis |
+
+`/ctx` is the honest substitute for "read my computer": the bot cannot, so you
+tell it once. `/where` prints the exact block, both halves.
+
+**Two halves, and the difference matters.** Your bio, business address and
+opening hours are *published* — anyone can read them off your profile — so
+they go into every mode, including the customer chat, which is where they are
+most useful: a customer asking "when are you open" gets the real answer instead
+of an invented one. Your **pin** and your **`/ctx` note** are not published, so
+they go only where you alone read the answer: this chat, and your own inline
+summon. In a group or a customer chat somebody else reads it, and a model told
+your coordinates can repeat them out loud. `CONTEXT_PRIVATE_EVERYWHERE=true`
+sends them there too if that is what you want.
+
+`RAW_CONTEXT=false` turns the whole block off. Note that the character's own
+date line is replaced by this block, not doubled — and the character is not
+told the timezone by name, because naming his city only makes him talk about
+his city.
 
 Two settings, both in `.env.example`: `DM_CHAT_ENABLED=false` turns the chat off
 and leaves the commands working; `DM_CHAT_MEMORY=false` makes every message

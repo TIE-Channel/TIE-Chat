@@ -191,6 +191,44 @@ DM_CHAT_MEMORY = os.environ.get("DM_CHAT_MEMORY", "true").strip().lower() not in
     "0", "false", "no",
 )
 
+# --- what the raw modes are told about the here and now -------------------
+# "Ответить", "Коротко" and this chat send the question with no character
+# wrapped around it - which also meant no date, no place, nothing. A plain
+# assistant that does not know what day it is answers "when is the next
+# Monday" wrongly, so a short block of FACTS (not instructions, not a persona)
+# goes in front of the question in exactly those modes.
+#
+# Be clear about the ceiling: Telegram gives a bot no device data at all. No
+# battery, no apps, no calendar, no clock from the phone, and no location
+# unless it is deliberately shared. What is really available is below.
+RAW_CONTEXT = os.environ.get("RAW_CONTEXT", "true").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# Where you are, in words, when you have not shared a pin. Something like
+# "Berlin, Germany" - used verbatim, and only for you.
+OWNER_LOCATION = os.environ.get("OWNER_LOCATION", "").strip()
+
+# How long a shared pin counts as "where you are now". A location from
+# yesterday is worse than none: it reads as current and is not.
+LOCATION_TTL_HOURS = int(os.environ.get("LOCATION_TTL_HOURS", "12"))
+
+# Some of what the bot knows about you is published by you already - your bio,
+# your business address and opening hours, your birthday. Telegram serves all
+# of that from getChat, so it costs one call a day and it is the same thing
+# anyone can read off your profile. That half goes into EVERY mode.
+#
+# The other half is not published: the pin you shared with the bot and your
+# /ctx note. In your own chat and your own inline summon nobody else reads the
+# answer, so it goes in. In a group or a customer chat somebody else does, and
+# a model told your coordinates can repeat them - so by default it does not.
+# Set this to true if you want it everywhere regardless.
+CONTEXT_PRIVATE_EVERYWHERE = os.environ.get(
+    "CONTEXT_PRIVATE_EVERYWHERE", "").strip().lower() in ("1", "true", "yes")
+
+# How long the profile read from getChat is kept before asking again.
+PROFILE_HOURS = int(os.environ.get("PROFILE_HOURS", "24"))
+
 # Optional: comma-separated Telegram user IDs that are never auto-answered.
 IGNORE_USER_IDS = {
     int(x) for x in os.environ.get("IGNORE_USER_IDS", "").replace(" ", "").split(",") if x
@@ -598,6 +636,15 @@ group_ok_cache: Dict[int, tuple] = {}
 # appears once per room rather than on every message.
 forums_seen: set = set()
 
+# The last pin you shared, and the free-text note set with /ctx. Both are
+# yours alone and are never shown to anybody else's question.
+owner_location: Dict[str, Any] = {}
+owner_note: str = ""
+
+# What getChat says about you, and when we last asked.
+owner_card: Dict[str, Any] = {}
+owner_card_at: float = 0.0
+
 # key -> when this chat last had anything said in it, for pruning on save
 history_seen: Dict[str, float] = {}
 history_dirty = threading.Event()
@@ -666,6 +713,220 @@ def save_known_groups() -> None:
             os.replace(tmp, GROUPS_FILE)
         except Exception as exc:
             log.warning("could not save the group list: %s", exc)
+
+
+def save_context() -> None:
+    """Keep your pin and your /ctx note across a redeploy."""
+    if not redis_on():
+        return
+    blob = json.dumps({"location": owner_location, "note": owner_note})
+    redis_pipeline([["SET", f"{REDIS_PREFIX}:context", blob]])
+
+
+def load_context() -> None:
+    global owner_note
+    if not redis_on():
+        return
+    got = redis_pipeline([["GET", f"{REDIS_PREFIX}:context"]])
+    raw = (got or [None])[0]
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return
+    owner_location.update(data.get("location") or {})
+    owner_note = str(data.get("note") or "")
+    if owner_location or owner_note:
+        log.info("context restored: %s%s",
+                 "a shared location" if owner_location else "no location",
+                 f", note {owner_note[:40]!r}" if owner_note else "")
+
+
+def remember_location(msg: dict) -> bool:
+    """Store a pin you shared - a plain location, a venue, or a live one.
+
+    Live locations arrive later as edited_message updates carrying the same
+    payload, so the same function handles the first one and every move after.
+    """
+    loc = msg.get("location") or (msg.get("venue") or {}).get("location")
+    if not loc or loc.get("latitude") is None:
+        return False
+    owner_location.clear()
+    owner_location.update({
+        "lat": round(float(loc["latitude"]), 4),
+        "lon": round(float(loc["longitude"]), 4),
+        "at": time.time(),
+        # live_period is only present while a live location is running
+        "live": bool(loc.get("live_period")),
+        "place": (msg.get("venue") or {}).get("title") or "",
+    })
+    save_context()
+    return True
+
+
+def hhmm(minutes: Any) -> str:
+    """Telegram counts opening hours in minutes from Monday 00:00."""
+    try:
+        m = int(minutes) % (24 * 60)
+        return f"{m // 60:02d}:{m % 60:02d}"
+    except Exception:
+        return "?"
+
+
+def read_profile(card: dict) -> Dict[str, str]:
+    """Pull the human-readable bits out of a ChatFullInfo.
+
+    Every field is optional and the shapes have changed before, so nothing is
+    assumed: anything missing or shaped unexpectedly is simply left out rather
+    than crashing the answer it was meant to improve.
+    """
+    out: Dict[str, str] = {}
+    if card.get("bio"):
+        out["bio"] = str(card["bio"])[:300]
+
+    b = card.get("birthdate") or {}
+    if b.get("day") and b.get("month"):
+        MONTHS = ("January", "February", "March", "April", "May", "June", "July",
+                  "August", "September", "October", "November", "December")
+        try:
+            out["birthday"] = f"{int(b['day'])} {MONTHS[int(b['month']) - 1]}" + (
+                f" {b['year']}" if b.get("year") else "")
+        except Exception:
+            pass
+
+    loc = card.get("business_location") or {}
+    if loc.get("address"):
+        out["address"] = str(loc["address"])[:200]
+
+    hours = card.get("business_opening_hours") or {}
+    spans = hours.get("opening_hours") or []
+    if spans:
+        DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+        parts = []
+        for span in spans[:14]:
+            try:
+                day = DAYS[int(span["opening_minute"]) // (24 * 60) % 7]
+                parts.append(f"{day} {hhmm(span['opening_minute'])}"
+                             f"-{hhmm(span['closing_minute'])}")
+            except Exception:
+                continue
+        if parts:
+            out["hours"] = ", ".join(parts) + (
+                f" ({hours['time_zone_name']})" if hours.get("time_zone_name") else "")
+
+    intro = (card.get("business_intro") or {})
+    if intro.get("title") or intro.get("message"):
+        out["intro"] = " - ".join(
+            str(intro[k]) for k in ("title", "message") if intro.get(k))[:200]
+    return out
+
+
+def owner_profile() -> Dict[str, str]:
+    """Your own public profile, straight from Telegram, asked for once a day.
+
+    Bio, birthday, business address, opening hours: you published all of it
+    yourself, so this is not prying - it is the bot reading the same profile
+    card everybody else can see, and it is exactly what a customer asking
+    "where are you / when are you open" needs it to know.
+    """
+    global owner_card_at
+    if not OWNER_ID:
+        return {}
+    if owner_card and time.time() - owner_card_at < PROFILE_HOURS * 3600:
+        return owner_card
+    owner_card_at = time.time()          # set first: a failure must not retry-loop
+    card = tg("getChat", chat_id=OWNER_ID)
+    if card:
+        fresh = read_profile(card)
+        owner_card.clear()
+        owner_card.update(fresh)
+        log.info("profile read from Telegram: %s",
+                 ", ".join(fresh) if fresh else "nothing filled in")
+    return owner_card
+
+
+def context_block(user: Optional[dict] = None, private: bool = True,
+                  where: str = "", plain: bool = True) -> str:
+    """Everything the bot can truthfully say about the here and now.
+
+    Facts only - never instructions about how to answer. Two halves:
+
+      public   the time, who is asking and from where, and your own profile as
+               Telegram serves it (bio, business address, opening hours,
+               birthday). You published that; a customer asking "when are you
+               open" should get the real answer. Goes into every mode.
+      private  the pin you shared and your /ctx note. Nobody published those.
+               They go in where you alone read the answer, and elsewhere only
+               if CONTEXT_PRIVATE_EVERYWHERE says so.
+
+    `plain` is the raw modes: they get the timezone spelled out, because a
+    plain assistant reasoning about "next Monday" needs the offset. The
+    character does not - naming his city only makes him talk about his city.
+    """
+    if not RAW_CONTEXT:
+        return ""
+
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(BOT_TZ))
+        zone = f" ({BOT_TZ}, UTC{now:%z})"
+    except Exception:
+        now, zone = datetime.now(), ""
+
+    lines = [f"Current date and time: {now:%A, %d %B %Y, %H:%M}"
+             f"{zone if plain else ''}."]
+
+    if user:
+        bits = []
+        if user.get("username"):
+            bits.append("@" + str(user["username"]))
+        if user.get("language_code"):
+            bits.append("Telegram language " + str(user["language_code"]))
+        if user.get("is_premium"):
+            bits.append("Telegram Premium")
+        lines.append(f"Asking: {display_name(user)}"
+                     + (" (" + ", ".join(bits) + ")" if bits else "") + ".")
+    if where:
+        lines.append(f"Asked in: {where}.")
+
+    # Your own profile card. Public by construction - it is what your profile
+    # shows anyone - so it goes everywhere, including a customer chat, which is
+    # the one place it is most obviously useful.
+    card = owner_profile()
+    mine = not user or not OWNER_ID or user.get("id") == OWNER_ID
+    label = "Your" if mine else "The bot owner's"
+    if card.get("address"):
+        lines.append(f"{label} business address: {card['address']}.")
+    if card.get("hours"):
+        lines.append(f"{label} opening hours: {card['hours']}.")
+    if card.get("intro"):
+        lines.append(f"{label} business intro: {card['intro']}.")
+    if card.get("bio"):
+        lines.append(f"{label} Telegram bio: {card['bio']}.")
+    if card.get("birthday") and mine:
+        lines.append(f"Your birthday: {card['birthday']}.")
+
+    # The unpublished half.
+    if mine and (private or CONTEXT_PRIVATE_EVERYWHERE):
+        fresh = (owner_location.get("at", 0)
+                 > time.time() - LOCATION_TTL_HOURS * 3600)
+        if owner_location and fresh:
+            mins = int((time.time() - owner_location["at"]) / 60)
+            when = "live, updating" if owner_location.get("live") else (
+                "shared just now" if mins < 2 else f"shared {mins} min ago")
+            place = owner_location.get("place")
+            lines.append(f"Their location: {owner_location['lat']}, "
+                         f"{owner_location['lon']}"
+                         + (f" ({place})" if place else "") + f" - {when}.")
+        elif OWNER_LOCATION:
+            lines.append(f"Their location: {OWNER_LOCATION}.")
+        if owner_note:
+            lines.append(f"They also said: {owner_note}")
+
+    return ("The following is true right now, supplied by their Telegram "
+            "client. Use it only when the question calls for it; do not "
+            "mention it otherwise.\n" + "\n".join(lines))
 
 
 def save_shared_member(user_id: int, chat_id: int) -> None:
@@ -1661,6 +1922,9 @@ def ask_ai(
     room: bool = False,
     max_chars: Optional[int] = None,
     raw: bool = False,
+    who: Optional[dict] = None,
+    private: bool = False,
+    where: str = "",
 ) -> Optional[str]:
     """Answer with the best model still available, walking down the ladder.
 
@@ -1683,8 +1947,16 @@ def ask_ai(
     # question, or a single instruction like "one short sentence". Everything
     # mechanical still applies; the length cap and the punctuation cleanup are
     # about what Telegram and a phone keyboard can do, not about how to behave.
-    system = (extra_system.strip() if raw
-              else PERSONA + SYSTEM_SUFFIX + extra_system + now_line())
+    # The same facts reach every mode. What differs is how they are wrapped:
+    # raw has nothing else in its system prompt, the character has everything
+    # else. `private` decides whether the unpublished half - your pin, your
+    # /ctx note - is included; see context_block.
+    facts = context_block(who, private=private, where=where, plain=raw)
+    if raw:
+        system = "\n\n".join(p for p in (facts, extra_system.strip()) if p)
+    else:
+        system = (PERSONA + SYSTEM_SUFFIX + extra_system
+                  + (f"\n{facts}\n" if facts else now_line()))
     gem_contents = [{"role": h["role"], "parts": [{"text": h["text"]}]}
                     for h in history[key]]
     if user_text is not None:
@@ -1825,7 +2097,8 @@ def handle_business_message(msg: dict, cancel: Optional[threading.Event] = None)
     # Generate first, while the chat still looks untouched - as far as the other
     # side is concerned the phone is still face down on a table somewhere.
     started = time.time()
-    answer = ask_ai(key, user_text, cancel=cancel)
+    answer = ask_ai(key, user_text, cancel=cancel, who=sender,
+                    where="a 1:1 chat on your business account")
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
@@ -2351,7 +2624,11 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     log.info("  -> answering...")
     started = time.time()
-    answer = ask_ai(key, None, GROUP_NOTE, fast=not GROUP_DELAY, room=True)
+    answer = ask_ai(key, None, GROUP_NOTE, fast=not GROUP_DELAY, room=True,
+                    who=sender,
+                    where='the group "{}"{}'.format(
+                        chat.get("title") or chat_id,
+                        f", topic {thread_id}" if thread_id else ""))
     if not answer:
         log.warning("  -> Gemini returned nothing, no reply sent")
         return
@@ -2477,7 +2754,9 @@ def handle_owner_dm(msg: dict) -> None:
         # max_chars=0 on purpose: REPLY_MAX_CHARS is a leash on the persona,
         # and there is no persona here. sendMessage splits anything over
         # Telegram's 4096 into several messages by itself.
-        answer = ask_ai(key, question, "", raw=True, max_chars=0)
+        answer = ask_ai(key, question, "", raw=True, max_chars=0,
+                        who=msg.get("from"), private=True,
+                        where="your own chat with the bot")
 
     if not answer:
         log.warning("  -> nothing came back")
@@ -2655,6 +2934,16 @@ def status_report() -> str:
             + (f", groups known: {len(known_groups)}, "
                f"people cleared: {sum(1 for v in inline_ok_cache.values() if v[0])}"
                if INLINE_ACCESS == "shared" else "")
+        ),
+        "every mode is told: " + (
+            "nothing (RAW_CONTEXT=false)" if not RAW_CONTEXT else
+            "the time"
+            + (", your profile (" + ", ".join(owner_card) + ")"
+               if owner_card else ", no profile filled in")
+            + (", your live pin" if owner_location.get("live") else
+               ", your pin" if owner_location else
+               f", {OWNER_LOCATION}" if OWNER_LOCATION else ", no place")
+            + (f", and: {owner_note[:40]}" if owner_note else "")
         ),
         "this chat: " + (
             "off (DM_CHAT_ENABLED=false)" if not DM_CHAT_ENABLED else
@@ -3057,6 +3346,11 @@ def fill_inline_message(inline_message_id: Optional[str], text: str,
     answer = ask_ai(INLINE_KEY, text[:MAX_INPUT_CHARS],
                     extra if raw else INLINE_NOTE + extra,
                     fast=True, room=True, raw=raw,
+                    who={"id": user_id, "first_name": name},
+                    # Only your own summon is private. Somebody else's inline
+                    # question is read by a chat you cannot even see.
+                    private=bool(OWNER_ID) and user_id == OWNER_ID,
+                    where="some other chat - Telegram does not say which",
                     max_chars=max(600, TELEGRAM_MAX_CHARS - len(text) - 200))
 
     if not answer:
@@ -3113,6 +3407,16 @@ def handle_update(update: dict) -> None:
         if INLINE_ENABLED:
             dispatch_inline(handle_callback_query, update["callback_query"])
         return
+    if "edited_message" in update:
+        # The only edit worth reading: a live location moving. Everything else
+        # in the bot's own chat is you fixing a typo, which needs no answer.
+        edited = update["edited_message"]
+        if (not OWNER_ID or (edited.get("from") or {}).get("id") == OWNER_ID) \
+                and remember_location(edited):
+            log.info("live location moved to %s, %s",
+                     owner_location["lat"], owner_location["lon"])
+        return
+
     if "business_connection" in update:
         remember_connection(update["business_connection"])
         return
@@ -3183,7 +3487,40 @@ def handle_update(update: dict) -> None:
             say("This bot is private.")
         return
 
-    if text.startswith("/check"):
+    # A pin you dropped. Telegram never volunteers where you are, so this is
+    # the only way the raw modes can know - and it is worth a word back, or you
+    # cannot tell whether it landed.
+    if remember_location(msg):
+        say("Записал: {}, {}{}. Держится {} ч - потом снова буду знать только "
+            "время.".format(owner_location["lat"], owner_location["lon"],
+                            " (live)" if owner_location["live"] else "",
+                            LOCATION_TTL_HOURS))
+        return
+
+    if text.startswith("/ctx"):
+        global owner_note
+        rest = text[4:].strip()
+        if rest in ("-", "off", "clear", "стоп"):
+            owner_note = ""
+            save_context()
+            say("Заметку убрал.")
+        elif rest:
+            owner_note = rest[:400]
+            save_context()
+            say(f"Буду держать в виду: {owner_note}")
+        else:
+            say(f"Сейчас держу в виду: {owner_note}" if owner_note else
+                "Пусто. /ctx <текст> - что мне держать в виду в каждом ответе "
+                "(город, чем занят, какой ноутбук). /ctx - убрать.")
+    elif text.startswith("/where"):
+        block = context_block(msg.get("from"), private=True,
+                              where="your own chat with the bot")
+        public = context_block(msg.get("from"), private=False,
+                               where='the group "..."')
+        say(block + "\n\n--- а в группе и в клиентском чате то же самое без "
+            "последних строк:\n\n" + public if block else
+            "RAW_CONTEXT выключен - в модель ничего из этого не уходит.")
+    elif text.startswith("/check"):
         say(f"Checking {len(PROVIDERS)} provider(s), one real request each...")
 
         def run_check() -> None:
@@ -3219,7 +3556,11 @@ def handle_update(update: dict) -> None:
             "no character. Each thread in this chat is its own conversation.\n\n"
             "/status - what I currently know\n"
             "/check  - test every AI provider key\n"
-            "/reset  - forget this thread"
+            "/reset  - forget this thread\n"
+            "/ctx    - a line about you I keep in mind every time\n"
+            "/where  - exactly what I tell the model about the here and now\n\n"
+            "Share a location (paperclip -> Location) and I will use it until "
+            "it goes stale. A live location keeps itself up to date."
         )
     elif text and DM_CHAT_ENABLED and not text.startswith("/"):
         # Anything that isn't a command: you are talking to him, so answer.
@@ -3319,6 +3660,9 @@ def poll_updates(offset: int) -> Optional[list]:
 
 ALLOWED_UPDATES = [
     "message",
+    # Live locations arrive as edits to the message that started them - this
+    # is the only way to follow a pin as it moves.
+    "edited_message",
     "business_connection",
     "business_message",
     "edited_business_message",
@@ -3399,6 +3743,7 @@ def main() -> None:
         # lock everyone but you out.
         known_groups.update(GROUP_ALLOWLIST)
         load_known_groups()
+        load_context()
         if me.get("supports_inline_queries"):
             log.info(
                 "inline mode on (access: %s) - type '@%s ...' in ANY chat, even "
