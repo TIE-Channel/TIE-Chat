@@ -317,7 +317,7 @@ ordinary member, and posts under its own name (`@TieChat_bot`), not yours.
    He always answers when:
    - somebody **@mentions it**, or **replies to one of its messages** — these
      always go through, no judging and no cooldown;
-   - somebody **calls him by name** — "Илья", "Илюха", or just "бот", which is
+   - somebody **calls him by name** — "Тай", "Tie", or just "бот", which is
      what people in a group tend to call him;
    - **somebody is talking about him** — asking where he went, wondering why
      he's quiet, referring to him in the third person, arguing with something
@@ -755,7 +755,7 @@ This is the **fourth mode, and the only one that is not the character.** The
 question goes to the model exactly as typed — no persona, no house style, no
 date, no "answer in one line" — which is the same treatment as the inline
 **Ответить** option. Whatever the model is like out of the box is what you get,
-so this is a plain assistant sitting in Telegram while Ilya keeps answering
+so this is a plain assistant sitting in Telegram while Tie keeps answering
 your customers.
 
 It is a conversation, not a series of one-shots: the transcript is kept under
@@ -1129,7 +1129,7 @@ matters because they ride along with every question in that chat.
 | Typed `@thebot ...` in a group the bot is **not in**, pressed Send, nothing happened | That was an ordinary text message, not an inline query. A bot receives **nothing** from a chat it is not a member of — the mention is just text there. To use it in such a chat: type `@thebot ` (with the trailing space), wait for the panel to appear **above the keyboard**, and **tap the result**. Only that sends it (as your own message, "via @thebot"). |
 | Nothing at all in the log, however much you write, and `Conflict: terminated by other getUpdates request` | **Two instances on one token.** Telegram hands each message to exactly one poller and it is not this one. Usually the previous Render deploy still shutting down — wait a minute. If it persists: a second Render service on the same `TELEGRAM_BOT_TOKEN`, or a copy still running on your laptop. Stop one. |
 | Wrote to the bot in its own chat, no answer | `DM_CHAT_ENABLED=false`, or you are writing from a different account than `OWNER_ID` — the log says `DM from <id> (not the owner)`. A message older than `MAX_MESSAGE_AGE` is also skipped, which is what you see right after a host wakes up. |
-| The bot's own chat answers like a plain AI, not like Ilya | That is the design: the question goes to the model bare, exactly as in the inline **Ответить** option. There is no setting to put the persona back — use a business chat or a group for that. |
+| The bot's own chat answers like a plain AI, not like Tie | That is the design: the question goes to the model bare, exactly as in the inline **Ответить** option. There is no setting to put the persona back — use a business chat or a group for that. |
 | Bot doesn't appear in the Chatbots list | Secretary Mode is off in @BotFather (step 2) |
 | Bot can read but replies silently fail | Telegram limits some actions to private chats with a *recent* incoming message — send it a fresh one |
 | `no reply rights` in the log | "Reply to messages" toggle off in Telegram Business settings |

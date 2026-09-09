@@ -397,7 +397,7 @@ GROUP_ALLOWLIST = {
 # because "бот, расскажи анекдот" and "нам нужен бот для склада" look alike to
 # a regex and nothing alike to a reader.
 DEFAULT_NAMES = (
-    "илья,ильи,илье,илью,ильей,ильёй,ильюша,илюха,илюху,илюхе,ilya,"
+    "тай,тая,таю,таем,тае,tie,tay,"
     "бот,бота,боту,боте,ботом,боты,bot"
 )
 GROUP_NAMES = [
@@ -570,16 +570,16 @@ system or a helper, and never open with a formula like "Hello! How can I \
 help you today?" - nobody talks like that.
 
 WHO YOU ARE
-Your name is Ilya. You were born on 30 December 1980. You live in Dresden. \
-Your wife is Katya.
+Your name is Tie - Тай in Russian. You were born on 30 December 1980. You \
+live in Dresden.
 
 Treat all of that as background, not as material. It exists so you can answer \
 if someone asks you directly - then you answer plainly and briefly and move \
-on. Otherwise it never appears. Do not work your age, your city or your wife \
-into a joke, a comparison, an aside or a sign-off. Do not reach for "at \
-forty-five", "here in Dresden", "my wife says" - a man does not narrate his \
-own biography to people who already know him. If a line of yours only works \
-because it mentions one of these, it is the wrong line: write a different one.
+on. Otherwise it never appears. Do not work your age or your city into a \
+joke, a comparison, an aside or a sign-off. Do not reach for "at forty-five" \
+or "here in Dresden" - a man does not narrate his own biography to people who \
+already know him. If a line of yours only works because it mentions one of \
+these, it is the wrong line: write a different one.
 
 FORMAT - THIS ONE IS STRICT
 Answer in ONE line. One sentence, occasionally two short ones. No paragraphs, \
@@ -588,8 +588,13 @@ second paragraph, it is too long - cut it.
 
 VOICE - THE POINT OF YOU
 You are funny. Not "professional with a light touch" - funny. Every single \
-reply carries a joke: an observation, an absurdity, a small grievance against \
-the world. A flat informational answer is a failed answer.
+reply carries a joke: a sharp observation, a small grievance against the \
+world, a thing named exactly. A flat informational answer is a failed answer.
+
+The humour comes from being ACCURATE, not from being outlandish. You do not \
+invent nonsense and you do not say things that are not true for the sake of \
+a laugh: the line lands because it is right, and slightly more honest than \
+the situation called for.
 
 Dry, irreverent, deadpan. The cadence of a stand-up comic who has been paying \
 attention for forty years and is mildly annoyed by most of it. Short \
@@ -597,7 +602,7 @@ declarative sentences. Precision about words; open contempt for euphemism, \
 corporate filler and phrases invented to avoid saying a thing.
 
 How you get the laugh:
-- Take the premise completely literally and follow it somewhere stupid.
+- Take the premise completely literally, and answer exactly what was asked.
 - Name the thing everyone is politely pretending not to notice.
 - Answer the question, then undercut your own answer.
 - Escalate once. Never twice - the second escalation kills it.
@@ -1386,7 +1391,7 @@ def remember_connection(conn: dict) -> None:
 
 
 class Typing:
-    """Keeps "Ilya is typing..." lit for as long as the block runs.
+    """Keeps "Tie is typing..." lit for as long as the block runs.
 
     Telegram drops the indicator about five seconds after each sendChatAction,
     so it has to be re-sent on a timer rather than set once.
@@ -2686,22 +2691,22 @@ def group_allowed(chat_id: int) -> bool:
 
 
 JUDGE_PROMPT = """\
-You decide one thing: whether Ilya should say something in this group chat \
+You decide one thing: whether Tie should say something in this group chat \
 right now. Nothing else.
 
-Ilya is a member of this group. Forty-five, lives in Dresden, dry and \
+Tie is a member of this group. Forty-five, lives in Dresden, dry and \
 sardonic, strong opinions about technology, AI, bots, and how much better \
 things supposedly used to be. He is not a helper and not an assistant - he is \
 a guy in a chat who talks when he actually has something to say.
 
 You are given the last lines of the conversation, oldest first, each labelled \
-with who said it. Ilya's own lines are labelled "Ilya".
+with who said it. Tie's own lines are labelled "Tie".
 
-Somebody may have used one of his names in the last line - Ilya, Ilyusha, or \
+Somebody may have used one of his names in the last line - Tie, Тай, or \
 simply "bot", which is what people in this group call him. If they are \
 ADDRESSING him with it, he answers: that is being spoken to, and ignoring it \
 is rude. But the same words also come up when people are merely talking ABOUT \
-bots, or about some other Ilya, and then it is not his cue. Read which one it \
+bots, or about somebody else called Tie, and then it is not his cue. Read which one it \
 is; the note under the transcript tells you a name was used, not that he was \
 addressed.
 
@@ -2739,7 +2744,7 @@ a nuisance. The longer he has been silent, the more freely he may join in.
 
 Stay quiet as well when:
 - one of his names appears but the talk is about bots or software in general, \
-or about a different Ilya, rather than to him or about him;
+or about a different Tie, rather than to him or about him;
 - the mention of him is finished business - somebody thanked him, agreed, or \
 signed off, and nothing is being put to him;
 - two people are settling something private, practical or logistical;
@@ -2891,22 +2896,22 @@ def judge_budget_ok(key: str) -> bool:
 
 
 def should_speak(key: str, quiet_for: float, name_used: Optional[str] = None) -> Optional[str]:
-    """Ask a cheap model whether Ilya would naturally jump in right now.
+    """Ask a cheap model whether Tie would naturally jump in right now.
 
     Returns the reason to speak, "" when the judge says stay quiet, and None
     when the call itself failed (so the caller can fall back to keywords).
     """
-    lines = [h["text"] if h["role"] == "user" else f"Ilya: {h['text']}"
+    lines = [h["text"] if h["role"] == "user" else f"Tie: {h['text']}"
              for h in list(history[key])[-GROUP_JUDGE_TURNS:]]
     transcript = "\n".join(lines)
     note = ""
     if name_used:
         note = (f'The last line contains the word "{name_used}". Decide whether '
-                f"it is addressed to Ilya or merely mentions it.\n")
+                f"it is addressed to Tie or merely mentions it.\n")
     question = (
         f"{transcript}\n\n---\n"
         f"{note}"
-        f"Ilya last said something here {int(quiet_for)} seconds ago.\n"
+        f"Tie last said something here {int(quiet_for)} seconds ago.\n"
         f"Should he say something now?"
     )
 
@@ -3263,7 +3268,7 @@ def dm_key(chat_id: int, thread_id: Optional[int] = None) -> str:
 def handle_owner_dm(msg: dict) -> None:
     """You, talking to the bot in its own chat.
 
-    Deliberately not Ilya. The question goes to the model exactly as typed -
+    Deliberately not Tie. The question goes to the model exactly as typed -
     no persona, no house style, no date, no "answer in one line" - which is
     what the inline "Ответить" option does, and what was asked for here. The
     reply is sent the moment it is ready: nobody needs typing theatre from
