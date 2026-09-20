@@ -456,6 +456,39 @@ GROUP_JUDGE_RECENT_TURNS = int(os.environ.get("GROUP_JUDGE_RECENT_TURNS", "6"))
 # pause just means the conversation has moved on without you.
 GROUP_DELAY = os.environ.get("GROUP_DELAY", "").strip().lower() in ("1", "true", "yes")
 
+# Does the character come along into a group he was added to?
+#
+# Off. The persona is written for a chat that is his: your business account,
+# where the voice IS the product. A group is somebody else's room, he is one
+# member among several, and a bot performing a personality at people who only
+# wanted an answer is the thing everyone mutes. So when he is added to a
+# group he answers as himself-without-the-act: plainly, accurately, only when
+# asked, and with nothing to prove.
+#
+# Turning it on gives a group the same character as the business chat - the
+# room rules, the jokes, the insult-trading. It is the old behaviour, kept
+# because a chat of friends is exactly where it belongs.
+#
+# This covers the group ONLY. The business chat and the inline summon are
+# untouched by it, and your own chat with the bot was already raw.
+GROUP_PERSONA = os.environ.get("GROUP_PERSONA", "").strip().lower() in (
+    "1", "true", "yes",
+)
+
+# What he calls himself in a group when the character is off.
+#
+# Not "Тай" - that name belongs to the character, and it is not mentioned to
+# him here at all. Without the character he is a bot in somebody's group, so
+# that is what he is told he is, and it is the whole of what he knows about
+# himself. He still needs a name, because the transcript hands him lines
+# addressed to him and he has to read them as his; a plain word does that job
+# and needs no glossary of inflections, which an invented name would.
+#
+# GROUP_NAMES below is a separate thing: that is what the TRIGGER listens for,
+# and it can go on containing the character's name without the answer knowing
+# anything about it. Only used when GROUP_PERSONA is off.
+GROUP_BOT_NAME = os.environ.get("GROUP_BOT_NAME", "Бот").strip()
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -2637,6 +2670,70 @@ open with an offer to help and never ask whether they need assistance.
 """ + ROOM_RULES
 
 
+# The same room with the character taken out of it: what the model is told
+# when GROUP_PERSONA is off. It is not GROUP_NOTE with the jokes deleted -
+# it is a different brief. Nothing here overrides a persona, because there is
+# no persona in the prompt at all: `raw=True` means these lines and the facts
+# block are the entire system prompt.
+GROUP_RAW_NOTE = """\
+You are in a group chat on Telegram, as one of its members. Every incoming \
+line is prefixed with the name of whoever said it. Never prefix your own \
+replies with a name; use someone's name only when it matters which of them \
+you are answering.
+
+You are writing only because somebody addressed you or asked you something. \
+Answer that - the person, and the thing they actually said. No greeting, no \
+sign-off, no offer to help, and never ask whether they need anything else.
+
+Answer plainly and accurately. There is no character to keep up here: you are \
+not the room's entertainment, you have no opinions to air, and you do not \
+perform. Do not comment on the conversation, do not add a closing remark, and \
+do not try to be funny. If you do not know something, say so rather than \
+filling the gap.
+
+Write it as a person types in a chat: plain prose, paragraphs if the thing \
+needs them. No lists, no bullet points, no headings, no bold, no emoji - \
+nobody formats a group message like a report. Only the punctuation a phone \
+keyboard puts within reach: hyphen, not an em dash; straight quotes; three \
+dots, not an ellipsis character.
+
+Length follows the answer. One line if one line is the answer; several \
+paragraphs if the question genuinely needs them; nothing padded to look \
+thorough and nothing cut short to look brisk.
+
+Answer in the language the person wrote to you in.
+
+If somebody is rude to you, do not play along and do not answer in kind. \
+Answer whatever was actually asked and leave the rest alone.
+"""
+
+
+def group_raw_note() -> str:
+    """GROUP_RAW_NOTE with his name in this room pinned to the top.
+
+    His name here is GROUP_BOT_NAME - "Бот" - and nothing else: not the
+    character's name, not its inflections, not the name Telegram happens to
+    show on his messages. He needs it only so that being addressed reads as
+    being addressed; Russian inflections of a common noun he already knows
+    ("боту", "ботом") need no spelling out, which is exactly why the name is a
+    word and not an invented one. Built at call time because GROUP_BOT_NAME
+    and the handle are both settled after import.
+    """
+    if not GROUP_BOT_NAME:
+        return GROUP_RAW_NOTE
+
+    line = (f"Your name in this group is {GROUP_BOT_NAME}. You are a bot here, "
+            f"and that is the whole of it: no other name, no character, no "
+            f"back story. ")
+    if BOT_USERNAME:
+        line += f"Your Telegram handle is @{BOT_USERNAME}. "
+    line += ("When somebody uses either of those they are talking TO you, so "
+             "answer them. The same words also come up in passing, about bots "
+             "in general - read which it is, and do not treat every mention "
+             "as an address.")
+    return line + "\n\n" + GROUP_RAW_NOTE
+
+
 INLINE_NOTE = """
 
 SUMMONED INTO A CHAT YOU CANNOT SEE - THIS OVERRIDES THE ONE-LINE RULE
@@ -2696,6 +2793,10 @@ def group_allowed(chat_id: int) -> bool:
     return ok
 
 
+# Whether to speak at all is decided by a separate cheap model, and this is
+# what it is told. Deliberately unchanged by GROUP_PERSONA: who speaks is one
+# question, whether to speak at all is another, and this one was tuned against
+# a real room. GROUP_PERSONA only takes the character out of the ANSWER.
 JUDGE_PROMPT = """\
 You decide one thing: whether Tie should say something in this group chat \
 right now. Nothing else.
@@ -3170,7 +3271,13 @@ def handle_group_message(msg: dict, cancel: Optional[threading.Event] = None) ->
 
     log.info("  -> answering...")
     started = time.time()
-    answer = ask_ai(key, None, GROUP_NOTE, fast=not GROUP_DELAY, room=True,
+    # GROUP_PERSONA off is the default: raw=True drops PERSONA and the house
+    # style entirely, and GROUP_RAW_NOTE plus the facts block become the whole
+    # system prompt. The history, the judge budget and the threading are the
+    # same either way - only the voice changes.
+    answer = ask_ai(key, None,
+                    GROUP_NOTE if GROUP_PERSONA else group_raw_note(),
+                    fast=not GROUP_DELAY, room=True, raw=not GROUP_PERSONA,
                     who=sender,
                     where='the group "{}"{}'.format(
                         chat.get("title") or chat_id,
@@ -3460,6 +3567,8 @@ def check_providers() -> str:
 def status_report() -> str:
     lines = [
         f"locked to owner: {OWNER_ID or 'NO - anyone can use this bot'}",
+        "in groups: " + ("the character, room rules and all"
+                         if GROUP_PERSONA else "no character - plain answers"),
         f"group trigger: {GROUP_TRIGGER}"
         + (f" via {judge_model()}" if GROUP_TRIGGER == "context" else "")
         + (", may join topics" if GROUP_JOIN_TOPICS else ", only when addressed"),
@@ -4365,8 +4474,10 @@ def main() -> None:
         sees_everything = bool(me.get("can_read_all_group_messages"))
         BOT_SEES_ALL_GROUP_MESSAGES = sees_everything
         log.info(
-            "groups: on, replying when @%s is mentioned, replied to, called by "
-            "name, or talked about%s", BOT_USERNAME,
+            "groups: on, %s, replying when @%s is mentioned, replied to, "
+            "called by name, or talked about%s",
+            "as the character" if GROUP_PERSONA else "with no character",
+            BOT_USERNAME,
             "; and to every message (reply-all)" if GROUP_REPLY_ALL
             else "; may also join topics" if GROUP_JOIN_TOPICS else "",
         )

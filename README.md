@@ -311,17 +311,14 @@ Telegram Business only covers 1:1 chats. For a group the bot joins as an
 ordinary member, and posts under its own name (`@TieChat_bot`), not yours.
 
 1. Add the bot to the group like any other member.
-2. That's it. He always answers when the room involves him, and may join a
-   conversation that isn't about him when he has something worth adding.
-
-   He always answers when:
+2. That's it. It answers when somebody in the room puts something to it:
    - somebody **@mentions it**, or **replies to one of its messages** — these
      always go through, no judging and no cooldown;
-   - somebody **calls him by name** — "Тай", "Tie", or just "бот", which is
-     what people in a group tend to call him;
-   - **somebody is talking about him** — asking where he went, wondering why
-     he's quiet, referring to him in the third person, arguing with something
-     he said.
+   - somebody **calls it by name** — "Тай", "Tie", or just "бот", which is
+     what people in a group tend to call it;
+   - **somebody is talking about it** — asking where it went, wondering why
+     it's quiet, referring to it in the third person, arguing with something
+     it said.
 
    Beyond that, a second cheap model reads the last dozen lines and decides
    whether he has a reason to join in: he knows something about the subject,
@@ -329,20 +326,65 @@ ordinary member, and posts under its own name (`@TieChat_bot`), not yours.
    the room is joking and a line would land. Being merely interested is
    explicitly *not* a reason — everyone could have an opinion, that isn't one.
 
-   The judge is also told how many seconds he has been quiet and instructed to
+   The judge is also told how many seconds it has been quiet and instructed to
    weigh it: two uninvited lines in a row is where a chat member becomes a
    nuisance. That replaces the old fixed cooldown with something that can read
    the room. Set `GROUP_JOIN_TOPICS=false` to go back to answering only when
    addressed or discussed.
+
+### No character in a group
+
+**`GROUP_PERSONA=false`, the default.** The character does not come along.
+
+The persona is written for a chat that is *yours* — your business account,
+where the voice is the product. A group is somebody else's room, the bot is one
+member among several, and a bot performing a personality at people who only
+wanted an answer is the thing everyone mutes. So in a group it answers as
+itself-without-the-act: plainly, accurately, only when asked, no jokes, no
+opinions, nothing to prove, and "I don't know" instead of filling the gap.
+Technically it is the same `raw=True` path your own chat with the bot uses —
+no persona and no house style in the system prompt at all, just a short group
+brief and the facts block.
+
+**Here its name is "Бот"** (`GROUP_BOT_NAME`) and its `@handle`, and that is
+the entire self-description: no other name, no character, no back story. Тай
+is not mentioned to it at all — that name belongs to the character.
+
+A name it does need, because the transcript hands it lines addressed to it and
+it has to read them as its own. A plain word does that job with no glossary:
+"боту", "ботом", "bot" all follow from "Бот" without being spelled out, which
+an invented name would have needed. It is also told the opposite — the same
+word comes up in passing, and not every mention is an address.
+
+`GROUP_NAMES` is a **separate** thing: that is what the trigger listens for,
+and it can go on containing Тай and its inflections while the answering model
+knows nothing about them.
+
+**The judge is untouched by this.** Who speaks is one question; whether to
+speak at all is another, and that one was tuned against a real room. So the
+same brief decides it either way: he answers when addressed, discussed,
+replied to or needled, and may join a conversation that isn't about him when
+he has something worth adding. `GROUP_PERSONA` takes the character out of the
+**answer**, not out of the decision to give one.
+
+**`GROUP_PERSONA=true`** puts the character back: the room rules, the length
+freedom and the insult-trading. That is the old behaviour, and a chat of
+friends is exactly where it belongs.
+
+This switch covers the group **only**. Your business chat and the inline summon
+keep the character either way, and your own chat with the bot was always raw.
+`/status` says which of the two is live.
 
 There is no keyword list any more — the judge does that job better. A name in
 the text is not a trigger on its own either, it is a *signal handed to the
 judge*: "бот, расскажи анекдот" gets an answer, "нам нужен бот для склада" does
 not, and a regex cannot tell those apart.
 
-Replies land as ordinary messages, not quoted — he is talking to the room, not
-filing a ticket. In a group he is also allowed to write more than one line:
-two or three sentences, or a short riff when the subject deserves it.
+Replies land as ordinary messages, not quoted — it is talking to the room, not
+filing a ticket. There is no one-line rule in a group either: the length
+follows the answer, one line if one line is the answer and several paragraphs
+if the question genuinely needs them. No lists, headings or bold in either
+mode — nobody formats a group message like a report.
 
 **Group replies go out immediately** — no read pause, no typing indicator. That
 pacing exists for a 1:1 chat, where somebody is visibly answering *you*; in a
@@ -751,12 +793,12 @@ Open `@yourbot` and write to it. It answers you, and only you: `OWNER_ID` is
 checked the same way it is everywhere else, and anyone else who finds the bot
 gets one line saying it is private.
 
-This is the **fourth mode, and the only one that is not the character.** The
-question goes to the model exactly as typed — no persona, no house style, no
-date, no "answer in one line" — which is the same treatment as the inline
-**Ответить** option. Whatever the model is like out of the box is what you get,
-so this is a plain assistant sitting in Telegram while Tie keeps answering
-your customers.
+This is the **fourth mode.** The question goes to the model exactly as typed —
+no persona, no house style, no date, no "answer in one line" — which is the
+same treatment as the inline **Ответить** option, and the same `raw=True` path
+a group takes when `GROUP_PERSONA` is off. Whatever the model is like out of
+the box is what you get, so this is a plain assistant sitting in Telegram while
+Tie keeps answering your customers.
 
 It is a conversation, not a series of one-shots: the transcript is kept under
 its own history key, capped by `HISTORY_TURNS`, so *"а покороче?"* has
@@ -988,6 +1030,8 @@ Other knobs, all optional (see `.env.example`):
 | `OWNER_ID` | — | **your Telegram user id — set this**, see "Locking it to you" below |
 | `GROUP_AUTO_LEAVE` | `false` | `true` makes the bot leave groups you are not in, instead of ignoring them |
 | `GROUPS_ENABLED` | `true` | answer in group chats the bot has been added to |
+| `GROUP_PERSONA` | `false` | `true` brings the character into group answers; off = plain, accurate ones. Does not affect the judge |
+| `GROUP_BOT_NAME` | `Бот` | what it calls itself in a group when the character is off — all it is told about itself. `GROUP_NAMES` (the trigger) is separate |
 | `GROUP_REPLY_ALL` | `false` | `true` answers every group message, not just mentions and replies |
 | `GROUP_ALLOWLIST` | — | comma-separated group chat IDs; empty means all groups |
 | `GROUP_TRIGGER` | `context` | `context` (model judges) or `all` |
