@@ -392,14 +392,18 @@ GROUP_ALLOWLIST = {
 }
 
 # Names people call him by in the room. Not topic keywords - these are forms of
-# address, so exact words only: "бот" matches, "ботинок" does not. Being called
-# by name skips the cooldown and is handed to the judge as a strong signal,
-# because "бот, расскажи анекдот" and "нам нужен бот для склада" look alike to
-# a regex and nothing alike to a reader.
-DEFAULT_NAMES = (
-    "тай,тая,таю,таем,тае,tie,tay,"
-    "бот,бота,боту,боте,ботом,боты,bot"
-)
+# address, so exact whole words only, in any case: "бот", "Бот" and "БОТ" all
+# match, "ботинок" and "бота" do not. \b in the pattern is what does that, and
+# it is why no inflections are listed: "боту" is a different word and, in a
+# room where people also talk ABOUT bots, one more way to be summoned by
+# accident. Two words is deliberately the whole list.
+#
+# Under GROUP_TRIGGER=context a name is not the answer on its own - it is a
+# signal handed to the judge, because "бот, расскажи анекдот" and "нам нужен
+# бот для склада" look alike to a regex and nothing alike to a reader. Under
+# "addressed" there is no judge, so the name IS the answer and a short, exact
+# list is what keeps that honest.
+DEFAULT_NAMES = "бот,bot"
 GROUP_NAMES = [
     n.strip().lower()
     for n in os.environ.get("GROUP_NAMES", DEFAULT_NAMES).split(",")
@@ -407,12 +411,24 @@ GROUP_NAMES = [
 ]
 
 # How he decides to speak up in a group:
-#   context - a cheap second model reads the last few lines and judges whether
-#             he would naturally jump in
-#   all     - every single message
-GROUP_TRIGGER = os.environ.get("GROUP_TRIGGER", "context").strip().lower()
-if GROUP_TRIGGER == "keywords":       # retired - the judge does this better
-    GROUP_TRIGGER = "context"
+#
+#   addressed - only when somebody actually asks him: an @mention, a reply to
+#               one of his messages, or one of GROUP_NAMES in the text. No
+#               second model, no guessing, no cost - and no line he was not
+#               asked for. This is the default.
+#   context   - the old behaviour: a cheap second model reads the last few
+#               lines and judges whether he would naturally jump in. It also
+#               tells "бот, расскажи анекдот" from "нам нужен бот для склада",
+#               which "addressed" cannot - there, both get an answer.
+#   all       - every single message.
+#
+# Unknown values fall back to "addressed" rather than starting a bot that
+# silently ignores the room or answers all of it.
+GROUP_TRIGGER = os.environ.get("GROUP_TRIGGER", "addressed").strip().lower()
+if GROUP_TRIGGER == "keywords":       # retired - it is what "addressed" is now
+    GROUP_TRIGGER = "addressed"
+if GROUP_TRIGGER not in ("addressed", "context", "all"):
+    GROUP_TRIGGER = "addressed"
 
 # The judge runs on its own model - a lite one is plenty and has its own quota.
 GROUP_JUDGE_MODEL = os.environ.get("GROUP_JUDGE_MODEL", "").strip()
@@ -2753,13 +2769,21 @@ def display_name(user: dict) -> str:
     return name or user.get("username") or f"user{user.get('id')}"
 
 
+# A whole word, in any case, and not glued to another one with a hyphen.
+#
+# Plain \b would fire on "чат-бот", "телеграм-бот" and "бот-помощник", which
+# are people discussing bots, not addressing one. With no judge left to catch
+# that, the pattern has to: (?<![\w-]) and (?![\w-]) reject a neighbouring
+# hyphen as firmly as a neighbouring letter. "бот, скажи" and "бот - скажи"
+# are unaffected, because a space is neither.
 NAME_PATTERN = re.compile(
-    r"\b(?:" + "|".join(re.escape(n) for n in GROUP_NAMES) + r")\b", re.I | re.U
+    r"(?<![\w-])(?:" + "|".join(re.escape(n) for n in GROUP_NAMES) + r")(?![\w-])",
+    re.I | re.U,
 ) if GROUP_NAMES else None
 
 
 def called_by_name(text: str) -> Optional[str]:
-    """Did somebody use one of his names? Exact words only, no stemming."""
+    """Did somebody use one of his names? Whole words only, no stemming."""
     if not NAME_PATTERN:
         return None
     m = NAME_PATTERN.search(text)
@@ -3158,11 +3182,23 @@ def group_trigger(msg: dict, text: str, key: str) -> Optional[str]:
     if BOT_USERNAME and f"@{BOT_USERNAME}".lower() in text.lower():
         return "mentioned"
 
+    name = called_by_name(text)
+
+    # "addressed": being asked is the whole of it. A name in the text is the
+    # answer, not a signal handed on to somebody else, and a message with no
+    # name in it is the room talking among themselves. Nothing below this line
+    # runs, so a group costs exactly one call per answer and none otherwise.
+    #
+    # What this gives up is the one thing the judge was good at: "бот,
+    # расскажи анекдот" and "нам нужен бот для склада" are the same string to
+    # a regex. In this mode both get an answer. GROUP_TRIGGER=context is the
+    # way back.
+    if GROUP_TRIGGER != "context":
+        return f"called {name!r}" if name else None
+
     # A name skips every guard below - but the judge still decides, because
     # "бот, расскажи анекдот" and "нам нужен бот для склада" look identical to
     # a regex and nothing alike to a reader.
-    name = called_by_name(text)
-
     since = time.time() - last_interjection.get(key, 0)
     if not name:
         if GROUP_COOLDOWN and since < GROUP_COOLDOWN:
@@ -3570,8 +3606,11 @@ def status_report() -> str:
         "in groups: " + ("the character, room rules and all"
                          if GROUP_PERSONA else "no character - plain answers"),
         f"group trigger: {GROUP_TRIGGER}"
-        + (f" via {judge_model()}" if GROUP_TRIGGER == "context" else "")
-        + (", may join topics" if GROUP_JOIN_TOPICS else ", only when addressed"),
+        + (f" via {judge_model()}"
+           + (", may join topics" if GROUP_JOIN_TOPICS else ", only when addressed")
+           if GROUP_TRIGGER == "context" else
+           " - mention, reply or name only, no judge" if GROUP_TRIGGER == "addressed"
+           else ""),
         "parked: " + (", ".join(
             f"{p.name} ({int(p.parked_until - time.time())}s)"
             for p in PROVIDERS if p.parked) or "none"),
@@ -3617,6 +3656,7 @@ def status_report() -> str:
             + (", remembering the thread" if DM_CHAT_MEMORY else ", one-shot")
         ),
         "judge (cheapest first): " + (
+            "not used in this mode" if GROUP_TRIGGER != "context" else
             ", ".join(f"{c.provider.name}/{c.model}" for c in judge_order()[:3])
             or "nothing usable") + (
             f"   [{sum(1 for c in LADDER if c.bad_judge)} dropped as unable "
@@ -4474,12 +4514,15 @@ def main() -> None:
         sees_everything = bool(me.get("can_read_all_group_messages"))
         BOT_SEES_ALL_GROUP_MESSAGES = sees_everything
         log.info(
-            "groups: on, %s, replying when @%s is mentioned, replied to, "
-            "called by name, or talked about%s",
+            "groups: on, %s, replying when @%s is mentioned, replied to "
+            "or called by name%s",
             "as the character" if GROUP_PERSONA else "with no character",
             BOT_USERNAME,
-            "; and to every message (reply-all)" if GROUP_REPLY_ALL
-            else "; may also join topics" if GROUP_JOIN_TOPICS else "",
+            "; and to every message (reply-all)"
+            if GROUP_REPLY_ALL or GROUP_TRIGGER == "all"
+            else "; the judge also decides when he may join in"
+            if GROUP_TRIGGER == "context" else
+            "; and at no other time - no judge",
         )
         if not sees_everything:
             log.warning(

@@ -143,10 +143,11 @@ so the curve flattens and then turns down.
 
 **One ladder, walked from both ends.** Replies in all four modes use
 `ladder_order()` — cleverest rung first, stepping down as the good ones run out
-of quota. The **judge** walks the same ladder the other way: dumbest rung
-first, climbing only when one turns out unable to produce a usable verdict. A
-yes/no verdict does not need the clever model, and every judge call spent on
-one is a call the actual answers no longer have.
+of quota. The **judge** (only under `GROUP_TRIGGER=context`; see step 6b) walks
+the same ladder the other way: dumbest rung first, climbing only when one turns
+out unable to produce a usable verdict. A yes/no verdict does not need the
+clever model, and every judge call spent on one is a call the actual answers no
+longer have.
 
 The judge sees **every rung** — all models from all providers, same list as
 replies. A rung leaves that list only for a reason it will not recover from:
@@ -311,26 +312,39 @@ Telegram Business only covers 1:1 chats. For a group the bot joins as an
 ordinary member, and posts under its own name (`@TieChat_bot`), not yours.
 
 1. Add the bot to the group like any other member.
-2. That's it. It answers when somebody in the room puts something to it:
-   - somebody **@mentions it**, or **replies to one of its messages** — these
-     always go through, no judging and no cooldown;
-   - somebody **calls it by name** — "Тай", "Tie", or just "бот", which is
-     what people in a group tend to call it;
-   - **somebody is talking about it** — asking where it went, wondering why
-     it's quiet, referring to it in the third person, arguing with something
-     it said.
+2. That's it. **It speaks only when it is asked**, and there are exactly three
+   ways to ask (`GROUP_TRIGGER=addressed`, the default):
+   - somebody **@mentions it**;
+   - somebody **replies to one of its messages**;
+   - somebody **calls it by name** — `бот` or `bot`, in any case, as a whole
+     word. That is the entire list (`GROUP_NAMES`).
 
-   Beyond that, a second cheap model reads the last dozen lines and decides
-   whether he has a reason to join in: he knows something about the subject,
-   somebody said something plainly wrong, a question is hanging unanswered, or
-   the room is joking and a line would land. Being merely interested is
-   explicitly *not* a reason — everyone could have an opinion, that isn't one.
+   Anything else is the room talking among themselves, and it stays out of it.
+   No second model deciding whether it might have something to add, no
+   cooldown to tune, no cost when nobody is asking: a group costs exactly one
+   API call per answer and nothing at all otherwise.
 
-   The judge is also told how many seconds it has been quiet and instructed to
-   weigh it: two uninvited lines in a row is where a chat member becomes a
-   nuisance. That replaces the old fixed cooldown with something that can read
-   the room. Set `GROUP_JOIN_TOPICS=false` to go back to answering only when
-   addressed or discussed.
+   The honest trade: *"бот, расскажи анекдот"* and *"нам нужен бот для склада"*
+   are the same string to a regex, and in this mode **both get an answer**.
+   The judge existed to tell them apart.
+
+### Bringing the judge back
+
+`GROUP_TRIGGER=context` restores it. A second cheap model then reads the last
+dozen lines and decides: is this an address or just talk about bots, is
+somebody discussing it or needling it, and — if `GROUP_JOIN_TOPICS=true` — has
+it got something genuinely worth adding to a conversation that isn't about it.
+Being merely interested is explicitly *not* a reason. It is told how many
+seconds it has been quiet and told to weigh that, since two uninvited lines in
+a row is where a chat member becomes a nuisance.
+
+That is better judgement at the price of a second API call per candidate
+message, plus the chance of a line nobody asked for. The whole `GROUP_JUDGE_*`
+family and `GROUP_JOIN_TOPICS` only do anything in this mode; `/status` says
+`not used in this mode` otherwise.
+
+`GROUP_TRIGGER=all` is the third option: answer every message. It burns quota
+fast in a busy room.
 
 ### No character in a group
 
@@ -351,14 +365,15 @@ the entire self-description: no other name, no character, no back story. Тай
 is not mentioned to it at all — that name belongs to the character.
 
 A name it does need, because the transcript hands it lines addressed to it and
-it has to read them as its own. A plain word does that job with no glossary:
-"боту", "ботом", "bot" all follow from "Бот" without being spelled out, which
-an invented name would have needed. It is also told the opposite — the same
-word comes up in passing, and not every mention is an address.
+it has to read them as its own. A plain word does that job with no glossary —
+a model does not have to be told that "боту" is a form of "Бот", which an
+invented name would have required. It is also told the opposite: the same word
+comes up in passing, and not every mention is an address.
 
 `GROUP_NAMES` is a **separate** thing: that is what the trigger listens for,
-and it can go on containing Тай and its inflections while the answering model
-knows nothing about them.
+and it is stricter than the prompt — it fires on `бот`/`bot` as whole words
+only, so "боту напиши" never summons it even though it would understand the
+word perfectly well if it did.
 
 **The judge is untouched by this.** Who speaks is one question; whether to
 speak at all is another, and that one was tuned against a real room. So the
@@ -375,10 +390,19 @@ This switch covers the group **only**. Your business chat and the inline summon
 keep the character either way, and your own chat with the bot was always raw.
 `/status` says which of the two is live.
 
-There is no keyword list any more — the judge does that job better. A name in
-the text is not a trigger on its own either, it is a *signal handed to the
-judge*: "бот, расскажи анекдот" gets an answer, "нам нужен бот для склада" does
-not, and a regex cannot tell those apart.
+The name list is deliberately short: **`бот` and `bot`**, and nothing else.
+Any case works — "бот", "Бот", "БОТ", "bot", "Bot", "BOT" — but it must be the
+whole word. "ботинок" does not fire, and neither do the inflections "бота",
+"боту", "ботом": those are different words, and in a room where people also
+talk *about* bots, every extra form is one more way to be summoned by
+accident. Hyphenated compounds are out too — "чат-бот", "телеграм-бот",
+"бот-помощник" — since a hyphen counts as glue, not as a space.
+
+Under `context` a name is not a trigger on its own anyway: it is a *signal
+handed to the judge*, which is how "бот, расскажи анекдот" gets an answer and
+"нам нужен бот для склада" does not. Under `addressed` the name **is** the
+answer, which is exactly why the list is two words long. Add your own with
+`GROUP_NAMES` if you want more.
 
 Replies land as ordinary messages, not quoted — it is talking to the room, not
 filing a ticket. There is no one-line rule in a group either: the length
@@ -396,21 +420,22 @@ other people talking is the normal state of a room, not somebody correcting
 themselves. (In 1:1 chats it still does.)
 
 There is no cooldown by default (`GROUP_COOLDOWN=0`) — there is nothing to
-ration when he only answers people who addressed him. Set it above zero if you
-want enforced silence between his replies anyway.
+ration when it only answers people who addressed it. It only applies under
+`context`, and only to messages with no name in them. Set it above zero if you
+want enforced silence between replies anyway.
 
-**Cost control**, because the judge is a second API call: it never runs on
-`@mentions` or replies (already unambiguous), never on messages under
-`GROUP_JUDGE_MIN_CHARS`, never more than `GROUP_JUDGE_MAX_PER_MIN` times a
-minute per group, and — the big one — never when the message has no name in it
-*and* he hasn't appeared in the last `GROUP_JUDGE_RECENT_TURNS` lines, since
-nobody can be referring to a man who isn't in the conversation. It also runs on a lite
-model with its own quota. In practice a busy group costs a handful of small
-calls a minute, not one per message.
+**Cost control under `context`**, because the judge is a second API call: it
+never runs on `@mentions` or replies (already unambiguous), never on messages
+under `GROUP_JUDGE_MIN_CHARS`, never more than `GROUP_JUDGE_MAX_PER_MIN` times
+a minute per group, and — the big one — never when the message has no name in
+it *and* it hasn't appeared in the last `GROUP_JUDGE_RECENT_TURNS` lines, since
+nobody can be referring to somebody who isn't in the conversation. It also runs
+on a lite model with its own quota. In practice a busy group costs a handful of
+small calls a minute, not one per message. Under `addressed` it costs none.
 
-If the judge call fails, the fallback is deliberately narrow: he answers if he
-was called by name, and stays quiet otherwise. A Gemini hiccup makes him
-reserved, never chatty.
+If a judge call fails, the fallback is deliberately narrow: it answers if it
+was called by name, and stays quiet otherwise. A hiccup makes it reserved,
+never chatty.
 
 It remembers the whole conversation either way, so when you do call on it, it
 knows what was being discussed. Each line it sees is labelled with who said it.
@@ -1034,15 +1059,15 @@ Other knobs, all optional (see `.env.example`):
 | `GROUP_BOT_NAME` | `Бот` | what it calls itself in a group when the character is off — all it is told about itself. `GROUP_NAMES` (the trigger) is separate |
 | `GROUP_REPLY_ALL` | `false` | `true` answers every group message, not just mentions and replies |
 | `GROUP_ALLOWLIST` | — | comma-separated group chat IDs; empty means all groups |
-| `GROUP_TRIGGER` | `context` | `context` (model judges) or `all` |
-| `GROUP_JUDGE_MODEL` | auto (lite) | model used for the speak/stay-quiet decision |
-| `GROUP_JUDGE_TURNS` | `12` | how many recent lines the judge sees |
-| `GROUP_JUDGE_MIN_CHARS` | `10` | shorter messages are never judged |
-| `GROUP_JUDGE_MAX_PER_MIN` | `8` | ceiling on judge calls per group per minute |
-| `GROUP_NAMES` | built-in list | names he answers to; exact words, no stemming |
-| `GROUP_COOLDOWN` | `0` | enforced silence between his group replies; 0 = none |
-| `GROUP_JOIN_TOPICS` | `true` | may join conversations that aren't about him |
-| `GROUP_JUDGE_RECENT_TURNS` | `6` | only with `GROUP_JOIN_TOPICS=false`: how recently he must have spoken for an unnamed message to be judged |
+| `GROUP_TRIGGER` | `addressed` | `addressed` (mention, reply or name — no judge), `context` (a model judges) or `all` |
+| `GROUP_NAMES` | `бот,bot` | names it answers to; whole words, any case, no stemming, no hyphenated compounds |
+| `GROUP_JUDGE_MODEL` | auto (lite) | *`context` only:* model used for the speak/stay-quiet decision |
+| `GROUP_JUDGE_TURNS` | `12` | *`context` only:* how many recent lines the judge sees |
+| `GROUP_JUDGE_MIN_CHARS` | `10` | *`context` only:* shorter messages are never judged |
+| `GROUP_JUDGE_MAX_PER_MIN` | `8` | *`context` only:* ceiling on judge calls per group per minute |
+| `GROUP_COOLDOWN` | `0` | *`context` only:* enforced silence between group replies; 0 = none |
+| `GROUP_JOIN_TOPICS` | `true` | *`context` only:* may join conversations that aren't about it |
+| `GROUP_JUDGE_RECENT_TURNS` | `6` | *`context` only,* and only with `GROUP_JOIN_TOPICS=false`: how recently it must have spoken for an unnamed message to be judged |
 | `GROUP_DELAY` | `false` | `true` applies the 1:1 read/typing pauses in groups as well |
 | `MAX_MESSAGE_AGE` | `3600` | ignore messages older than this (seconds) when waking from sleep |
 | `TEMPERATURE` | `1.0` | lower = drier and more predictable |
