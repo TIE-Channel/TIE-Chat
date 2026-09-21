@@ -437,6 +437,28 @@ If a judge call fails, the fallback is deliberately narrow: it answers if it
 was called by name, and stays quiet otherwise. A hiccup makes it reserved,
 never chatty.
 
+### "(no response)" and other stage directions
+
+A model handed a transcript sometimes decides its character has nothing to say
+and writes that down: `(no response)`, `[silence]`, `*молчит*`, `N/A`. That is
+not an answer, it is the model narrating that it declined to give one — and
+the people in the chat see the literal words.
+
+Whether to speak is settled before any model is called, so by the time there
+is a reply the answer is already "yes". A stage direction is therefore treated
+as a **failed rung**, exactly like an empty message: the bot logs it, steps
+down the ladder and asks the next model. The prompts also say not to do it.
+
+The test is narrow on purpose — the whole reply must be one bracketed aside or
+a bare placeholder, and under 60 characters. `**жирный**` is a formatted word,
+not a stage direction; "Ничего." and "Нечего добавить." are real answers and
+go through untouched. The log line is:
+
+```
+-> groq/llama-3.3-70b-versatile answered '(no response)' - that is a stage
+   direction, not a reply; trying the next rung
+```
+
 It remembers the whole conversation either way, so when you do call on it, it
 knows what was being discussed. Each line it sees is labelled with who said it.
 

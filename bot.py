@@ -722,6 +722,11 @@ and sincerely whether they are talking to a bot, an AI, or a real person, \
 tell them the truth in one short line, keep it in voice, and carry on with \
 the conversation.
 
+You are only ever asked to write when there is something to answer. Never \
+reply with a placeholder or a stage direction - not "(no response)", not \
+"(silence)", not "N/A", not an empty line. If you will not answer something, \
+say so in your own words.
+
 Type the way a person types on a phone. Only the punctuation a phone keyboard \
 puts within reach: hyphen, not an em dash; straight quotes, not curly ones or \
 guillemets; three dots, not a single ellipsis character; no bullet characters, \
@@ -2127,6 +2132,41 @@ THINK_OPEN = re.compile(r"<\s*(think|thinking|reason|reasoning|scratchpad)\s*>",
 THINK_CLOSE = re.compile(r"<\s*/\s*(think|thinking|reason|reasoning|scratchpad)\s*>", re.I)
 
 
+# A reply that is one bracketed aside - "(no response)", "[silence]", "*молчит*"
+# - or a bare placeholder. Models fall into this when the prompt reads like a
+# transcript and they decide the character has nothing to say: a group, where
+# every line is "Вася: ..." and the last turn is somebody else's. It is not an
+# answer, it is the model narrating that it declined to give one, and a person
+# in the chat sees the literal words "(no response)".
+#
+# Whether to speak is decided before the model is ever called, so by the time
+# there is a reply the answer is "yes" and a stage direction is a failed rung,
+# treated exactly like an empty message: step down the ladder and ask the next
+# model. The length cap is what keeps a real reply that merely happens to open
+# with a bracket out of this.
+# Brackets only - deliberately NOT * or _, which are Markdown emphasis: a reply
+# of "**жирный**" is a formatted word, not a stage direction.
+BRACKETED_ONLY = re.compile(r"^[(\[{<]+\s*([^()\[\]{}<>]*?)\s*[)\]}>]+$", re.S)
+PLACEHOLDER_REPLY = re.compile(
+    r"^(?:no[\s_-]*(?:response|reply|answer|comment|output|text|message)"
+    r"|silence|skip|pass|n/?a"
+    r"|нет[\s_-]*ответа|без[\s_-]*ответа|молчание|молчит|пропуск)"
+    r"[\s.!?…-]*$", re.I | re.U)
+
+
+def is_non_answer(text: str) -> bool:
+    """Is this the model saying "nothing", rather than saying something?"""
+    t = (text or "").strip()
+    if not t or len(t) > 60:
+        return False
+    m = BRACKETED_ONLY.match(t)
+    if m and m.group(1).strip():
+        return True
+    # "*silence*" is the same refusal wearing emphasis; "**жирный**" is a word.
+    # So the asterisks come off and the word itself decides.
+    return bool(PLACEHOLDER_REPLY.match(t.strip("*_ \t")))
+
+
 def strip_thinking(text: str) -> str:
     """Remove a reasoning model's inner monologue from what we are about to send.
 
@@ -2352,6 +2392,10 @@ def openai_call(
     if not text:
         log.warning("  -> %s returned an empty message", p.name)
         return None, 0
+    if not json_mode and is_non_answer(text):
+        log.warning("  -> %s/%s answered %r - that is a stage direction, not a "
+                    "reply; trying the next rung", p.name, model, text[:40])
+        return None, 0
     if not json_mode:
         text = trim_reply(text, max_chars)
     log.info("  -> %s/%s 200 in %.1fs, %d chars",
@@ -2397,6 +2441,10 @@ def gemini_call(model: str, system: str, contents: List[dict],
         log.warning("  -> gemini/%s produced no text (finishReason=%s)", model, reason)
         if reason == "MAX_TOKENS" and max_tokens < 4096:
             return gemini_call(model, system, contents, 4096, False, max_chars)
+        return None, 0
+    if is_non_answer(text):
+        log.warning("  -> gemini/%s answered %r - that is a stage direction, "
+                    "not a reply; trying the next rung", model, text[:40])
         return None, 0
     log.info("  -> gemini/%s 200 in %.1fs, %d chars",
              model, time.time() - started, len(text))
@@ -2721,6 +2769,11 @@ Answer in the language the person wrote to you in.
 
 If somebody is rude to you, do not play along and do not answer in kind. \
 Answer whatever was actually asked and leave the rest alone.
+
+You are only ever called when somebody has addressed you, so there is always \
+something to answer. Never reply with a placeholder or a stage direction - \
+not "(no response)", not "(silence)", not "N/A", not an empty line. If you \
+genuinely cannot help with something, say that in words, like a person would.
 """
 
 
